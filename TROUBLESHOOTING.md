@@ -1,0 +1,426 @@
+# Astroquad 트러블슈팅 및 개발 판단 로그
+
+최종 업데이트: 2026-04-27
+
+범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석, 해결 방법, 설계 판단을 보고서용 개발로그로 정리한다.
+
+## 1. GCS가 온보드 telemetry를 수신하지 못함
+
+### 증상
+
+Raspberry Pi에서 `uav_onboard`를 실행하면 다음처럼 telemetry가 정상 송신되는 것처럼 보였다.
+
+```text
+sent TELEMETRY seq=1 timestamp_ms=...
+sent TELEMETRY seq=2 timestamp_ms=...
+...
+```
+
+하지만 Windows GCS에서는 다음 메시지만 반복되었다.
+
+```text
+telemetry timeout after 2000 ms
+```
+
+### 원인
+
+초기 `uav-onboard/config/network.toml`의 GCS 목적지 IP가 고정 IP로 설정되어 있었다.
+
+```toml
+[gcs]
+ip = "192.168.1.100"
+```
+
+실제 노트북 IP는 네트워크마다 바뀌기 때문에, Pi가 존재하지 않거나 잘못된 IP로 UDP telemetry를 보내고 있었다.
+
+### 해결
+
+기본 목적지를 local broadcast로 변경했다.
+
+```toml
+[gcs]
+ip = "255.255.255.255"
+telemetry_port = 14550
+video_port = 5600
+```
+
+또한 UDP sender에서 broadcast 송신을 허용하도록 `SO_BROADCAST`를 설정했다.
+
+### 결과
+
+GCS를 먼저 실행하고 Pi에서 `uav_onboard --config config --count 10`을 실행하면 GCS에서 증가하는 `seq`를 가진 telemetry를 수신할 수 있게 되었다.
+
+## 2. Windows에서 OpenCV가 없어 `uav_gcs_video`가 빌드되지 않음
+
+### 증상
+
+Windows 로컬 빌드에서 다음 CMake warning이 발생했다.
+
+```text
+OpenCV was not found; uav_gcs_video will not be built.
+```
+
+그 결과 영상 수신 실행 파일이 생성되지 않았다.
+
+### 원인
+
+개발 환경은 MinGW/Ninja/g++ 조합이었다. OpenCV가 설치되어 있지 않았고, Windows에서 OpenCV를 설치하더라도 Visual Studio용 prebuilt OpenCV와 MinGW ABI가 맞지 않을 수 있었다.
+
+### 해결
+
+GCS 영상 창 backend를 두 경로로 분리했다.
+
+- OpenCV가 있으면 `src/ui/VideoWindow.cpp` 사용
+- Windows에서 OpenCV가 없으면 `src/ui/VideoWindowWin32.cpp` 사용
+
+Win32 fallback backend는 Windows Imaging Component(WIC)로 JPEG를 decode하고, Win32/GDI로 화면을 그린다.
+
+### 결과
+
+OpenCV가 없는 Windows 환경에서도 `uav_gcs_video.exe`와 `uav_gcs_vision_debug.exe`를 빌드할 수 있게 되었다.
+
+## 3. Pi에서 `video_streamer --source rpicam`이 시작되지 않음
+
+### 증상
+
+Pi에서 카메라는 인식되었다.
+
+```text
+rpicam-hello --list-cameras
+0 : ov5647 ...
+```
+
+하지만 `video_streamer` 실행 시 다음 오류가 발생했다.
+
+```text
+failed to open rpicam source: failed to start rpicam-vid
+```
+
+### 원인
+
+`RpicamMjpegSource`가 Linux에서도 `popen(command, "rb")`를 사용하고 있었다. Windows `_popen`에서는 `"rb"`가 자연스럽지만, POSIX `popen()`은 `"r"` 또는 `"w"`만 보장한다.
+
+Pi에서 간단한 확인 결과 `"rb"` 모드가 invalid argument로 실패하는 것을 확인했다.
+
+### 해결
+
+플랫폼별 pipe read mode를 분리했다.
+
+- Windows: `"rb"`
+- Linux/POSIX: `"r"`
+
+또한 `rpicam-vid`의 stderr를 `/tmp/astroquad_rpicam_vid.log`로 분리하고, `--verbose 0`을 추가했다.
+
+### 결과
+
+Pi에서 `rpicam-vid` 기반 MJPEG frame을 읽고 UDP로 송신할 수 있게 되었다.
+
+```text
+sent video frame id=1 bytes=14952
+sent video frame id=2 bytes=15038
+sent video frame id=3 bytes=14999
+```
+
+## 4. `--count` 테스트 종료 후 `rpicam-vid` abort 로그가 보임
+
+### 증상
+
+`video_streamer --source rpicam --count 5`는 지정된 frame 수를 정상 송신했지만, `rpicam-vid`가 다음과 비슷한 로그를 남겼다.
+
+```text
+Received signal 13
+terminate called after throwing an instance of 'std::runtime_error'
+what(): failed to write output bytes
+Aborted
+```
+
+### 원인
+
+`video_streamer`가 지정된 frame 수를 읽은 뒤 pipe를 닫으면, stdout으로 MJPEG를 계속 쓰던 `rpicam-vid`가 SIGPIPE를 받고 종료한다. 이는 송신 실패라기보다는 테스트 종료 방식의 부작용이다.
+
+### 해결
+
+사용자 콘솔이 혼란스럽지 않도록 `rpicam-vid` stderr를 `/tmp/astroquad_rpicam_vid.log`로 분리했다.
+
+### 결과
+
+터미널에는 송신 결과 중심의 로그만 보이게 되었다. `/tmp/astroquad_rpicam_vid.log`에는 SIGPIPE 종료 기록이 남을 수 있지만, `video_streamer`가 정상 종료하고 `sent video frame ...`이 출력되면 정상 테스트로 본다.
+
+## 5. Broadcast 영상 스트리밍이 불안정함
+
+### 증상
+
+노트북 IP를 직접 지정하면 영상 수신이 안정적이었다.
+
+```bash
+./build/video_streamer --source rpicam --config config --gcs-ip 172.20.10.4
+```
+
+하지만 `255.255.255.255` broadcast로 영상 frame 자체를 보내면 frame 누락이 많거나 영상이 불안정했다.
+
+### 원인
+
+640x480 MJPEG frame은 대략 14-31 KB 수준이고, UDP payload를 1200 byte로 제한했기 때문에 frame 하나가 여러 UDP packet으로 분할된다. 이 중 packet 하나만 유실되어도 해당 JPEG frame은 완성되지 않는다.
+
+Wi-Fi 환경에서는 broadcast packet이 낮은 전송률로 처리되거나 손실될 수 있다.
+
+실제 측정 결과:
+
+| 목적지 | 송신 frame | 완성 수신 frame | 완성률 |
+|---|---:|---:|---:|
+| `255.255.255.255` broadcast | 10 | 4 | 40% |
+| 노트북 IP unicast | 10 | 10 | 100% |
+
+### 해결
+
+영상 본문은 broadcast로 계속 보내지 않고, GCS discovery 후 unicast로 전송하도록 변경했다.
+
+동작 방식:
+
+1. GCS가 UDP `5601`로 `AQGCS1 video_port=5600` beacon을 broadcast한다.
+2. 온보드 `video_streamer` 또는 `vision_debug_node`가 시작 시 3초간 beacon을 기다린다.
+3. beacon을 받으면 송신자 IP를 GCS IP로 사용한다.
+4. 실제 영상은 해당 IP로 unicast 송신한다.
+5. discovery 실패 시 기존 broadcast 주소로 fallback한다.
+
+### 결과
+
+Pi에서 매번 노트북 IP를 직접 입력하지 않아도 자동으로 GCS IP를 찾고, 실제 영상은 unicast로 보내게 되었다.
+
+```text
+discovering GCS video receiver for 3000 ms...
+discovered GCS video receiver at <laptop-ip>:5600
+```
+
+## 6. GCS 영상 창이 중간중간 검은색으로 깜빡임
+
+### 증상
+
+영상이 수신되기는 하지만 GCS 영상 창이 중간중간 검은 화면으로 깜빡였다.
+
+### 원인
+
+두 가지가 겹쳤다.
+
+1. 일정 시간 complete frame을 받지 못하면 `showStatus("waiting for video stream...")`가 호출되어 기존 frame 대신 검은 status 화면이 표시되었다.
+2. Windows fallback 창에서 GDI paint 과정 중 배경 erase와 frame redraw가 분리되어 flicker가 보일 수 있었다.
+
+UDP 특성상 incomplete frame drop은 정상적으로 발생할 수 있으므로, frame 하나가 빠질 때마다 검은 화면으로 돌아가면 사용자 경험이 나빠진다.
+
+### 해결
+
+GCS 표시 정책을 변경했다.
+
+- 첫 frame을 받기 전에는 waiting 화면을 표시한다.
+- 한 번이라도 frame을 받은 뒤에는 timeout이 발생해도 마지막 complete frame을 유지한다.
+- JPEG decode 실패 시 화면을 지우지 않고 stderr warning만 출력한다.
+- Win32 fallback backend에서 memory DC에 먼저 그리고 `BitBlt`로 한 번에 복사하는 double buffering을 적용했다.
+- `WM_ERASEBKGND`를 처리해 배경 erase로 인한 flicker를 줄였다.
+
+### 결과
+
+일시적인 UDP frame drop이 있어도 마지막 정상 frame이 유지되므로 검은색 깜빡임이 줄었다.
+
+## 7. OpenCV `camera_preview`와 Pi CSI camera 경로 차이
+
+### 증상
+
+초기 OpenCV `VideoCapture` 기반 `camera_preview`에서 frame read가 실패했다.
+
+```text
+frame read failed at index 0: failed to read a non-empty camera frame
+```
+
+### 원인
+
+Pi CSI camera는 Raspberry Pi OS/libcamera 환경에서 OpenCV V4L2 경로로 항상 안정적으로 열리는 것이 아니다. 반면 `rpicam-hello`, `rpicam-vid`, `rpicam-still`은 libcamera/rpicam 경로를 사용하므로 정상 동작했다.
+
+### 해결
+
+실시간 Pi camera 경로는 OpenCV `VideoCapture`가 아니라 `rpicam-vid --codec mjpeg -o -` stdout을 읽는 방식으로 확정했다.
+
+### 결과
+
+`RpicamMjpegSource` 기반 `video_streamer`와 `vision_debug_node`가 Pi camera frame을 안정적으로 읽는다.
+
+## 8. ArUco detector 빌드 시 OpenCV enum 이름 차이 발생
+
+### 증상
+
+로컬에서는 OpenCV가 없어 해당 target이 skip되었지만, Pi에서 빌드할 때 다음 오류가 발생했다.
+
+```text
+error: 'PREDEFINED_DICTIONARY_NAME' in namespace 'cv::aruco' does not name a type
+```
+
+### 원인
+
+Pi에 설치된 OpenCV 4.10.0 header에서는 ArUco dictionary enum type이 `cv::aruco::PredefinedDictionaryType`이었다. 코드에서는 다른 OpenCV 버전에서 쓰이는 이름인 `PREDEFINED_DICTIONARY_NAME`을 사용하고 있었다.
+
+### 해결
+
+`ArucoDetector.cpp`의 dictionary mapping type을 Pi OpenCV 4.10.0에 맞게 수정했다.
+
+```cpp
+cv::aruco::PredefinedDictionaryType dictionaryFromName(const std::string& name)
+```
+
+### 결과
+
+Pi에서 `onboard_vision`, `aruco_detector_tester`, `vision_debug_node`가 모두 빌드되었다.
+
+## 9. `uav_gcs_vision_debug.exe`가 packet을 받지 못함
+
+### 증상
+
+Pi는 GCS beacon을 정상 발견했다.
+
+```text
+discovered GCS video receiver at 192.168.0.69:5600
+```
+
+하지만 `uav_gcs_vision_debug` 콘솔에는 telemetry packet이 계속 0개로 표시되었다.
+
+```text
+[marker] no telemetry packets yet packets=0 dropped=0
+```
+
+### 원인
+
+Windows Defender Firewall에 `uav_gcs_vision_debug.exe` inbound rule이 생성되어 있었지만, Action이 `Block`이었다. 기존 `uav_gcs.exe`, `uav_gcs_video.exe`는 Allow였기 때문에 새 실행 파일만 막힌 상태였다.
+
+### 해결
+
+관리자 권한에서 `uav_gcs_vision_debug.exe` inbound UDP rule을 Allow로 변경해야 한다.
+
+예시:
+
+```powershell
+Set-NetFirewallRule -DisplayName 'uav_gcs_vision_debug.exe' -Direction Inbound -Action Allow -Profile Private,Public
+```
+
+또는 Windows 보안 앱에서 해당 실행 파일의 Public/Private network 접근을 허용한다.
+
+### 결과
+
+방화벽이 허용된 실행 파일 경로로 테스트했을 때 GCS가 Pi에서 보낸 telemetry 20개를 모두 수신했다.
+
+## 10. ArUco 오버레이를 온보드에서 그릴지 GCS에서 그릴지에 대한 설계 판단
+
+### 고민 배경
+
+ArUco marker 인식 후 결과를 영상 위에 표시하는 방법은 두 가지가 있었다.
+
+1. 온보드에서 marker box, id, 방향 등을 영상에 직접 그린 뒤 그 결과 영상을 GCS로 송신한다.
+2. 온보드는 marker id/corners/center/orientation만 계산해 telemetry로 보내고, GCS가 원본 영상 위에 overlay를 그린다.
+
+온보드에서 바로 그려서 보내는 방식은 구현이 간단해 보였다. 특히 디버깅 단계에서는 `cv::aruco::drawDetectedMarkers`나 `cv::line`, `cv::putText`를 사용하면 빠르게 화면을 확인할 수 있다.
+
+하지만 프로젝트 최종 목표와 Raspberry Pi Zero 2 W급 저사양 환경을 고려하면 단순 구현 편의성보다 역할 분리가 중요했다.
+
+### 온보드에서 오버레이를 그리는 방식의 장점
+
+- 구현이 직관적이다.
+- GCS는 그냥 영상만 띄우면 된다.
+- frame과 overlay가 영상 픽셀에 이미 합쳐져 있으므로 동기화 문제가 적어 보인다.
+- 초기 데모에서는 빠르게 시각적 결과를 만들 수 있다.
+
+### 온보드에서 오버레이를 그리는 방식의 단점
+
+- 온보드 CPU/GPU 자원을 관제용 drawing에 사용한다.
+- 영상에 그려진 overlay는 원본 영상 정보를 훼손한다.
+- 실전에서는 overlay를 끄고 싶을 수 있는데, debug/competition 모드를 분리해야 한다.
+- line tracing, intersection, marker map 등 mission-critical 계산과 관제용 drawing 코드가 섞일 위험이 있다.
+- 나중에 GCS에서 overlay 스타일을 바꾸거나 log/GUI와 연동할 때 유연성이 떨어진다.
+- Raspberry Pi Zero 2 W급 환경에서는 불필요한 drawing과 JPEG 재처리가 mission loop에 부담이 될 수 있다.
+
+### GCS에서 오버레이를 그리는 방식의 장점
+
+- 온보드는 인식과 판단에만 집중한다.
+- 원본 카메라 영상을 그대로 보존해 GCS로 보낼 수 있다.
+- 오버레이 스타일, 색상, 표시 항목, GUI 구성을 GCS에서 자유롭게 바꿀 수 있다.
+- 최종 목표인 영상 창, 로그 창, 명령 창 구조와 잘 맞는다.
+- ArUco뿐 아니라 line contour, intersection, grid state overlay를 같은 방식으로 확장할 수 있다.
+- 온보드에서 관제용 GUI/drawing 연산을 하지 않는 원칙을 지킬 수 있다.
+
+### GCS에서 오버레이를 그리는 방식의 단점
+
+- video frame과 telemetry를 `frame_seq` 기준으로 맞춰야 한다.
+- GCS 쪽에 overlay drawing backend가 필요하다.
+- Windows에서 OpenCV가 없으므로 Win32/GDI overlay 구현이 추가로 필요하다.
+
+### 최종 판단
+
+GCS에서만 오버레이를 그리는 방식으로 결정했다.
+
+결정 이유:
+
+- 온보드의 mission-critical 비전 처리와 관제용 시각화를 분리해야 한다.
+- 원본 영상은 보존하고, overlay는 GCS에서 동적으로 그리는 편이 확장성이 높다.
+- Raspberry Pi Zero 2 W급 사양을 고려하면, 관제용 drawing은 노트북 GCS가 담당하는 것이 낫다.
+- 최종 GCS 목표가 영상 창, 로그 창, 명령 창으로 분리되는 구조이므로 GCS overlay가 자연스럽다.
+- line tracing, intersection detection, marker map, grid state도 모두 metadata telemetry + GCS overlay 구조로 확장할 수 있다.
+
+### 구현 결과
+
+온보드:
+
+- `ArucoDetector`는 marker id, corners, center, orientation만 계산한다.
+- `vision_debug_node`는 원본 JPEG frame과 marker telemetry를 송신한다.
+- 온보드 코드에는 `drawDetectedMarkers`, `cv::line`, `cv::circle`, `cv::putText` 기반 marker overlay drawing이 없다.
+
+GCS:
+
+- `MarkerOverlay`가 marker telemetry를 overlay primitive로 변환한다.
+- `VideoWindow`가 overlay primitive를 실제 영상 위에 그린다.
+- OpenCV backend와 Win32/WIC backend 모두 overlay drawing을 지원한다.
+
+### 보고서용 요약
+
+초기에는 구현 편의성을 위해 온보드에서 ArUco marker overlay를 직접 그려 송신하는 방안도 검토했다. 그러나 최종 시스템에서는 온보드가 mission-critical 비전 판단에 집중해야 하고, GCS는 관제용 시각화와 로그를 담당해야 하므로 역할 분리를 우선했다. 이에 따라 온보드는 marker detection 결과만 telemetry로 전송하고, GCS가 원본 영상 위에 overlay를 그리는 구조로 설계했다.
+
+## 11. 현재 권장 실행 순서
+
+### ArUco vision debug
+
+GCS:
+
+```powershell
+cd uav-gcs
+git pull
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+.\build\uav_gcs_vision_debug.exe --config config
+```
+
+Raspberry Pi:
+
+```bash
+cd ~/astroquad/uav-onboard
+git pull --ff-only
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/vision_debug_node --config config
+```
+
+정상 동작 기준:
+
+- Pi에서 `discovered GCS video receiver at <laptop-ip>:5600` 출력
+- Pi에서 `frame=N markers=M jpeg_bytes=...` 출력
+- GCS에 영상 창 표시
+- ArUco marker가 보이면 GCS 영상 창에 overlay 표시
+- GCS PowerShell console에 marker log 출력
+
+## 12. 다음에 비슷한 문제가 생겼을 때 확인할 것
+
+1. GCS 실행 파일이 올바른 조합인지 확인한다.
+   - telemetry만: `uav_gcs`
+   - 영상만: `uav_gcs_video`
+   - ArUco overlay: `uav_gcs_vision_debug`
+2. Ninja generator 사용 시 실행 파일은 `build/Release/`가 아니라 `build/` 아래에 있다.
+3. Pi camera가 `rpicam-hello --list-cameras`에서 보이는지 확인한다.
+4. Pi에서 `discovered GCS video receiver...`가 출력되는지 확인한다.
+5. discovery는 되는데 packet이 안 들어오면 Windows Firewall을 확인한다.
+6. 영상이 불안정하면 `config/vision.toml`의 `fps`, `jpeg_quality`, 해상도를 낮춰본다.
+7. rpicam 내부 오류는 Pi의 `/tmp/astroquad_rpicam_vid.log`를 확인한다.
+8. ArUco overlay가 어긋나면 `camera.frame_seq`와 video `frame_id` 동기화를 먼저 의심한다.
