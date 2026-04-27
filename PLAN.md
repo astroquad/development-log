@@ -1,804 +1,623 @@
-# Astroquad Next Vision Milestone Plan
+# Astroquad Latency and Line Stability Improvement Plan
 
 작성일: 2026-04-27  
-상태: 1~4단계 구현 반영 완료, Raspberry Pi 실기 검증 대기
-원칙: 이 문서는 다음 vision milestone의 설계 기준과 구현 결과를 함께 기록한다.
+상태: 계획 수립 전용. 아직 코드 수정 금지.
+범위: `RESEARCH.md` 기준 최신 구조에서 latency 증가 원인 분석, line tracking point 튐 완화, 라인트레이싱 정확도 개선 계획.
 
-## 1. 현재 프로젝트 진행 상황 요약
+## 1. 현재 진행 상황 이해
 
-`RESEARCH.md`와 현재 파일 구조 기준으로 Astroquad는 기본 bring-up 단계를 넘어 다음 흐름이 검증된 상태다.
+현재 구현 흐름은 다음 단계까지 와 있다.
 
 ```text
 Pi camera
+  -> rpicam MJPEG frame
+  -> onboard JPEG decode to cv::Mat
   -> onboard ArUco detection
-  -> onboard marker telemetry
-  -> onboard raw MJPEG streaming
-  -> GCS video reception
-  -> GCS-side marker overlay
-  -> GCS console marker logs
+  -> onboard LineDetector
+  -> onboard telemetry JSON
+  -> onboard raw MJPEG debug video
+  -> GCS video receive
+  -> GCS marker/line overlay
+  -> GCS vision log window
 ```
 
-현재 핵심 설계 원칙은 유지한다.
+중요한 현재 설계:
 
-| 책임 | Onboard | GCS |
-|---|---|---|
-| 카메라 frame 획득 | 수행 | 수행하지 않음 |
-| 미션 판단에 필요한 비전 연산 | 수행 | 수행하지 않음 |
-| ArUco 마커 인식 | 수행 | 수행하지 않음 |
-| 라인트레이싱 인식 | 수행 예정 | 수행하지 않음 |
-| 영상 송신 | 원본 JPEG best-effort 송신 | 수신 및 표시 |
-| 오버레이 drawing | 수행하지 않음 | 수행 |
-| GUI 창 | 수행하지 않음 | 수행 |
-| 로그/관제 표시 | telemetry로 전달 | 표시 및 기록 |
+- 온보드는 overlay drawing을 하지 않는다.
+- 온보드는 rpicam에서 받은 원본 JPEG를 GCS로 그대로 보낸다.
+- 온보드는 vision 처리를 위해 JPEG decode는 하지만, 현재 video stream을 위해 JPEG 재인코딩은 하지 않는다.
+- GCS video는 best-effort debug channel이다.
+- `LatestVideoSender`가 별도 worker thread로 video frame을 송신하므로, video UDP 송신 자체는 main vision loop를 직접 오래 block하지 않도록 이미 분리되어 있다.
+- line overlay는 GCS에서 `vision.line.contour_px`와 `tracking_point_px`를 사용해 그린다.
 
-즉, 온보드는 숫자화된 비전 결과만 만들고, GCS는 그 결과를 사람이 보기 좋은 형태로 그린다.
+최근 관찰된 latency:
 
-추가 원칙: **debug video streaming은 절대 capture, vision detection, mission decision, future control output을 block하면 안 된다.** 영상 송출이 밀리면 오래된 frame을 버리고 최신 frame/result만 유지한다. 라즈베리파이의 우선순위는 항상 `카메라 획득 -> 비전 인식 -> 미션 판단/제어 -> telemetry -> debug video` 순서다.
+| 모드 | 평균 latency |
+|---|---:|
+| 영상만 streaming | 약 150 ms |
+| ArUco 추가 | 약 210 ms |
+| ArUco + line tracing 추가 | 약 470 ms |
 
-## 2. 현재 전체 디렉터리 구조
+라인 추가 후 latency가 2배 이상 증가했으므로, 단순히 detector 하나가 추가된 수준으로 보기 어렵다. 먼저 계측을 강화해 병목을 분리한 뒤 최적화해야 한다.
+
+## 2. Latency 증가 원인 후보 분석
+
+### 2.1 가능성이 낮은 원인
+
+#### JPEG 재인코딩
+
+현재 코드 기준으로 onboard는 video stream용 JPEG를 재인코딩하지 않는다.
 
 ```text
-astroquad/
-├── development-log/
-│   ├── .git/
-│   ├── PLAN.md
-│   ├── RESEARCH.md
-│   └── TROUBLESHOOTING.md
-├── uav-gcs/
-│   ├── .git/
-│   ├── CMakeLists.txt
-│   ├── PROJECT_SPEC.md
-│   ├── README.md
-│   ├── config/
-│   ├── docs/
-│   ├── logs/
-│   ├── scripts/
-│   ├── src/
-│   ├── test_data/
-│   ├── tests/
-│   ├── third_party/
-│   └── tools/
-└── uav-onboard/
-    ├── .git/
-    ├── CMakeLists.txt
-    ├── PROJECT_SPEC.md
-    ├── README.md
-    ├── config/
-    ├── docs/
-    ├── logs/
-    ├── scripts/
-    ├── src/
-    ├── test_data/
-    ├── tests/
-    └── tools/
+rpicam-vid MJPEG stdout
+  -> RpicamMjpegSource extracts JPEG
+  -> VisionDebugPipeline decodes JPEG once for vision
+  -> UdpMjpegStreamer sends original JPEG bytes
 ```
 
-루트 `astroquad/` 자체는 Git 저장소가 아니다. `development-log`, `uav-gcs`, `uav-onboard`가 각각 독립적인 Git 저장소다.
+따라서 "라인 검출 때문에 JPEG 재인코딩 비용이 늘었다"는 원인은 현재 구조에서는 가능성이 낮다.
 
-## 3. 주요 파일 역할 파악
+#### video UDP 송신이 main loop를 직접 block
 
-### 3.1 `development-log`
+`VisionDebugPipeline.cpp`에는 `LatestVideoSender`가 있고, 내부 worker thread가 `UdpMjpegStreamer::sendFrame()`을 호출한다. main loop는 `video_sender.submit(frame)`만 수행한다.
 
-| 파일 | 역할 |
+따라서 UDP video 송신이 느려져도 main loop는 오래된 debug frame을 덮어쓰고 최신 frame만 유지하는 구조다. 다만 `submit(frame)`이 `CameraFrame`을 값으로 받아 JPEG vector copy가 발생할 수 있으므로, 완전히 비용이 없는 것은 아니다.
+
+### 2.2 가능성이 높은 원인
+
+#### LineDetector가 거의 전체 frame을 처리함
+
+현재 line 기본값:
+
+```toml
+roi_top_ratio = 0.08
+lookahead_y_ratio = 0.55
+mode = "auto"
+```
+
+`roi_top_ratio = 0.08`은 상단 절단 문제를 해결했지만, 결과적으로 frame의 약 92%를 line detector가 처리한다. 640x480 기준 대부분의 pixel이 threshold/morph/findContours 대상이다.
+
+#### `auto` mode가 mask pipeline을 두 번 수행함
+
+`mode = "auto"`에서는 밝은 라인 mask와 어두운 라인 mask를 모두 만든다.
+
+```text
+gray
+  -> bright-line Otsu threshold
+  -> morph open/close
+  -> findContours
+
+gray
+  -> dark-line Otsu threshold
+  -> morph open/close
+  -> findContours
+```
+
+흰색 라인으로 확정된 테스트에서는 `light_on_dark`로 고정하면 line detector 비용을 크게 줄일 수 있다.
+
+#### contour 후보마다 전체 크기 mask를 다시 그림
+
+현재 `LineDetector::evaluateContour()`는 후보 contour마다 다음을 수행한다.
+
+```cpp
+cv::Mat contour_mask = cv::Mat::zeros(mask.size(), CV_8UC1);
+cv::drawContours(contour_mask, draw_contours, 0, cv::Scalar(255), cv::FILLED);
+```
+
+즉, 후보 contour가 많으면 full ROI 크기의 mask allocation + draw가 반복된다. 바닥 무늬, 반사광, 노이즈가 많으면 후보가 많아지고 비용이 급증할 수 있다.
+
+이 지점이 latency 470 ms의 가장 유력한 코드 병목이다.
+
+#### contour가 많으면 telemetry payload와 GCS overlay도 커짐
+
+현재 `max_contour_points = 80`으로 제한되어 있지만, line contour가 잡힐 때마다 최대 80개 point가 JSON으로 들어간다. JSON payload가 커지고 GCS는 이를 parse한 뒤 overlay primitive로 변환한다.
+
+이 비용은 detector 비용보다 작을 가능성이 크지만, telemetry size와 GCS overlay primitive count를 계측해야 한다.
+
+#### rpicam stdout pipe backlog 가능성
+
+현재 vision loop가 camera fps보다 느려지면 `rpicam-vid` stdout pipe에 frame이 쌓일 수 있다. `RpicamMjpegSource`는 순차적으로 JPEG를 추출하므로, 처리 속도가 낮으면 실제 영상이 늦게 보일 수 있다.
+
+주의할 점:
+
+- `CameraFrame.timestamp_ms`는 JPEG를 추출한 시점에 찍힌다.
+- 실제 camera exposure/capture 시점이 아니다.
+- 따라서 GCS overlay에 표시되는 latency는 실제 camera-to-display latency보다 낮게 보일 수 있다.
+
+즉, GCS 표시 latency가 470 ms라면 실제 체감 지연은 그보다 더 클 수도 있다.
+
+## 3. Latency 개선을 위한 계측 계획
+
+최적화 전에 먼저 병목을 숫자로 분리한다.
+
+### 3.1 onboard 단계별 latency 계측 추가
+
+`VisionDebugPipeline`에서 frame마다 다음 값을 측정한다.
+
+| 항목 | 의미 |
 |---|---|
-| `PLAN.md` | 현재 문서. 다음 구현 단계의 기술 계획. |
-| `RESEARCH.md` | 프로젝트 구조, 구현 상태, 검증 결과, 다음 단계 요약. |
-| `TROUBLESHOOTING.md` | 실제 개발 중 발생한 문제와 해결 과정 기록. |
+| `read_frame_ms` | `camera.readFrame()` 소요 시간 |
+| `jpeg_decode_ms` | `cv::imdecode()` 소요 시간 |
+| `aruco_latency_ms` | 기존 ArUco detector 시간 |
+| `line_latency_ms` | 기존 LineDetector 시간 |
+| `telemetry_build_ms` | JSON 생성 시간 |
+| `telemetry_bytes` | telemetry JSON byte 수 |
+| `telemetry_send_ms` | UDP telemetry send 시간 |
+| `video_submit_ms` | latest video slot submit 시간 |
+| `video_jpeg_bytes` | frame JPEG byte 수 |
+| `video_sent_frames` | video worker가 실제 송신한 frame 수 |
+| `video_dropped_frames` | latest slot에서 덮어써진 debug frame 수 |
 
-### 3.2 `uav-gcs` 핵심 구조
+현재 protocol은 unknown field를 무시하는 구조이므로, 우선 `debug` object에 확장 field를 추가할 수 있다. 구현 시 `PROTOCOL.md` 양쪽을 갱신한다.
 
-| 영역 | 핵심 파일 | 현재 역할 |
-|---|---|---|
-| 빌드 | `CMakeLists.txt` | `gcs_core`, `gcs_video`, `uav_gcs`, `uav_gcs_video`, `uav_gcs_vision_debug` target 정의. OpenCV가 없으면 Windows WIC/GDI backend 사용. |
-| 설정 | `config/network.toml`, `config/ui.toml` | telemetry/video port, timeout, video window title 설정. |
-| 실행 진입점 | `src/main.cpp` | 기본 telemetry console receiver. |
-| 실행 진입점 | `src/video_main.cpp` | 원본 MJPEG video viewer. |
-| 실행 진입점 | `src/vision_debug_main.cpp` | video + telemetry + overlay vision debug viewer. |
-| 앱 orchestration | `src/app/VisionDebugApp.*` | video 수신, telemetry thread, telemetry store, marker overlay, console marker log를 하나의 GCS process 안에서 조합. |
-| 앱 orchestration | `src/app/VideoViewerApp.*` | overlay 없는 raw video viewer. |
-| telemetry 수신 | `src/network/UdpTelemetryReceiver.*` | UDP telemetry receive. |
-| telemetry parsing | `src/protocol/TelemetryMessage.*` | JSON telemetry parse. `vision.markers[]`와 legacy marker fields를 처리. |
-| telemetry store | `src/telemetry/TelemetryStore.*` | frame sequence/timestamp 기준으로 marker telemetry를 video frame에 매칭. 현재 이름은 marker 중심이지만 역할은 vision frame store에 가깝다. |
-| log formatting | `src/telemetry/MarkerLogFormatter.*` | marker telemetry를 console 문자열로 formatting. |
-| overlay model | `src/overlay/OverlayPrimitive.hpp` | line, circle, text primitive 정의. 라인트레이싱 오버레이도 이 모델을 그대로 사용할 수 있다. |
-| marker overlay | `src/overlay/MarkerOverlay.*` | marker corners/center/orientation을 overlay primitive로 변환. |
-| video UI | `src/ui/VideoWindow.*` | OpenCV backend 또는 Win32/WIC/GDI backend로 JPEG decode 및 overlay drawing. |
-| video 수신 | `src/video/UdpMjpegReceiver.*`, `JpegFrameReassembler.*`, `VideoPacket.*` | `AQV1` UDP chunk 수신 및 JPEG frame 재조립. |
-| discovery | `src/video/GcsDiscoveryBeacon.*` | GCS video receiver discovery beacon broadcast. |
-| tools | `tools/mock_onboard.cpp`, `tools/log_replayer.cpp` | 개발용 mock/replay placeholder. |
+### 3.2 LineDetector 내부 계측 추가
 
-### 3.3 `uav-onboard` 핵심 구조
+line latency가 큰 경우를 더 쪼갠다.
 
-| 영역 | 핵심 파일 | 현재 역할 |
-|---|---|---|
-| 빌드 | `CMakeLists.txt` | `onboard_core`, `onboard_video`, 조건부 `onboard_vision`, `vision_debug_node`, `video_streamer`, tool target 정의. |
-| 설정 | `config/network.toml` | GCS IP/port, telemetry interval 설정. discovery fallback과 호환. |
-| 설정 | `config/vision.toml` | camera/video/ArUco 설정. 이미 `[line]` section placeholder가 있다. |
-| 실행 진입점 | `src/main.cpp` | 기본 bring-up telemetry sender. |
-| camera | `src/camera/RpicamMjpegSource.*`, `CameraFrame.hpp` | `rpicam-vid` stdout에서 MJPEG frame 추출. |
-| video 송신 | `src/video/UdpMjpegStreamer.*`, `VideoPacket.*` | JPEG frame을 `AQV1` UDP chunk로 GCS에 송신. |
-| telemetry 송신 | `src/network/UdpTelemetrySender.*` | UDP telemetry sender. |
-| telemetry build | `src/protocol/TelemetryMessage.*` | onboard telemetry JSON 생성. marker 배열과 line placeholder field가 이미 있다. |
-| vision type | `src/vision/VisionTypes.hpp` | `MarkerObservation`, `VisionResult` 정의. 현재 line은 bool placeholder만 있다. |
-| ArUco | `src/vision/ArucoDetector.*` | OpenCV ArUco detector. id/corners/center/orientation 계산, drawing은 하지 않음. |
-| live debug | `tools/vision_debug_node.cpp` | Pi camera capture, JPEG decode, ArUco detect, telemetry 송신, 원본 video 송신. 현재 동기 loop 구조. |
-| raw video | `tools/video_streamer.cpp` | ArUco 없이 raw camera/test-pattern/image video 송신. |
-| line tool | `tools/line_detector_tuner.cpp` | 현재 scaffold. 라인트레이싱 튜닝 도구로 쓰기 좋다. |
-| replay tool | `tools/replay_vision.cpp` | 현재 scaffold. recorded frame 기반 regression 확인 도구 후보. |
+| 항목 | 의미 |
+|---|---|
+| `line_mode_used` | `auto`, `light_on_dark`, `dark_on_light` |
+| `line_mask_count` | 만든 mask 개수. `auto`면 2 |
+| `line_roi_pixels` | 처리한 ROI pixel 수 |
+| `line_contours_found` | `findContours`로 찾은 후보 수 |
+| `line_candidates_evaluated` | scoring까지 들어간 후보 수 |
+| `line_selected_contour_points` | telemetry로 보낸 contour point 수 |
 
-## 4. 핵심 설계 판단: ArUco와 라인트레이싱은 같은 live workflow에 통합한다
+이 값은 처음에는 console log 또는 vision log window에 표시하고, 필요하면 telemetry debug field로 올린다.
 
-이번 라인트레이싱 MVP는 **기존 `vision_debug_node` + `uav_gcs_vision_debug` 흐름에 통합하는 것이 최적**이다.
+### 3.3 GCS latency 표시 개선
 
-결론:
+GCS vision log window에 다음을 같이 표시한다.
 
 ```text
-Live 실행 파일은 분리하지 않는다.
-
-유지/확장:
-  Raspberry Pi: ./build/vision_debug_node --config config
-  GCS:          .\build\uav_gcs_vision_debug.exe --config config
-
-별도 도구:
-  line_detector_tuner, replay_vision은 튜닝/테스트용으로만 사용한다.
+[vision] frame=...
+age=...
+processing=...
+decode=...
+aruco=...
+line=...
+telemetry_bytes=...
+video_bytes=...
+video_sent=...
+video_dropped=...
+line_contours=...
+line_candidates=...
 ```
 
-### 4.1 통합하는 이유
+목표는 "470 ms가 onboard line detector 때문인지, video 송신/수신 때문인지, GCS decode/display 때문인지"를 한 번에 분리하는 것이다.
 
-| 판단 기준 | 통합 workflow | 별도 live 실행 파일 |
-|---|---|---|
-| 최종 미션 구조 | ArUco와 line은 같은 카메라 frame에서 나온 mission vision 결과이므로 자연스럽다. | 나중에 다시 합쳐야 한다. |
-| video/telemetry 동기화 | 같은 `frame_seq`로 marker와 line을 동시에 매칭할 수 있다. | 두 실행 파일이면 frame 기준이 갈라진다. |
-| 카메라 점유 | Pi camera를 한 process가 소유한다. | 두 live process가 동시에 camera를 쓰기 어렵다. |
-| UDP port/firewall | 기존 GCS port와 방화벽 규칙을 재사용한다. | 새 실행 파일/port/firewall 문제가 늘어난다. |
-| 코드 중복 | discovery, video 송신, telemetry 송신, overlay loop를 재사용한다. | 거의 같은 코드를 한 벌 더 만들 위험이 있다. |
-| 디버깅 | 한 영상에서 marker와 line을 같이 보며 frame alignment를 확인할 수 있다. | 각각은 쉬워도 통합 문제를 늦게 발견한다. |
+## 4. Latency 최적화 계획
 
-### 4.2 단, detector enable/disable 옵션은 둔다
+### 4.1 1순위: line mode 고정
 
-통합 실행 파일을 쓰되, 기능은 config 또는 CLI로 끄고 켤 수 있어야 한다.
-
-권장 옵션:
+현재 라인이 흰색이면 실전 테스트에서는 `auto` 대신 `light_on_dark`를 기본 실행으로 사용한다.
 
 ```bash
-./build/vision_debug_node --config config
-./build/vision_debug_node --config config --line-only
-./build/vision_debug_node --config config --aruco-only
-./build/vision_debug_node --config config --disable-aruco
-./build/vision_debug_node --config config --disable-line
+./build/vision_debug_node --config config --line-mode light_on_dark
 ```
 
-GCS도 overlay 표시 옵션을 둘 수 있다.
+효과:
 
-```powershell
-.\build\uav_gcs_vision_debug.exe --config config
-.\build\uav_gcs_vision_debug.exe --config config --show-line
-.\build\uav_gcs_vision_debug.exe --config config --hide-markers
-```
+- threshold/morph/findContours pass가 2회에서 1회로 줄어든다.
+- 가장 쉽고 위험이 낮다.
 
-초기 구현에서는 옵션 수를 최소화해도 된다. 중요한 것은 live 실행 파일을 새로 나누는 것이 아니라, 같은 workflow 안에서 detector와 overlay를 선택 가능하게 만드는 것이다.
+계획:
 
-## 5. 라인트레이싱 MVP 범위
+- `config/vision.toml` 기본은 아직 `auto`로 둘지, 실전 preset만 `light_on_dark`로 둘지 계측 후 결정한다.
+- README에는 실전 흰색 라인 테스트 명령을 `light_on_dark`로 명시한다.
 
-이번 라인트레이싱 단계에서 구현할 것:
+### 4.2 2순위: multi ROI 분리
 
-- 온보드에서 카메라 frame 기반 라인 검출
-- 라인 contour 또는 edge polyline 추출
-- 라인 tracking point 계산
-- line offset, angle, confidence 계산
-- GCS telemetry로 line metadata 송신
-- GCS 영상 창에 line overlay 표시
-- 라인 contour는 분홍색/magenta로 표시
-- tracking point는 초록색/green 점으로 표시
-- ArUco marker overlay와 line overlay를 같은 영상 창에 동시에 표시 가능하게 구성
+현재 하나의 넓은 ROI가 line tracking과 교차점 contour 표시를 모두 담당한다. 이 때문에 상단 절단은 줄었지만 처리량이 커졌다.
 
-이번 단계에서 구현하지 않을 것:
+권장 분리:
 
-- 교차점 판단
-- grid row/col 갱신
-- visited coordinate 저장
-- marker map 저장
-- Pixhawk/MAVLink 제어
-- 라인 기반 실제 비행 제어 출력
-- mission command channel
-
-## 6. 라인트레이싱 데이터 정의
-
-`VisionTypes.hpp`에는 marker와 같은 레벨의 line 결과 타입을 둔다.
-
-권장 onboard type:
-
-```cpp
-struct LineDetection {
-    bool detected = false;
-    Point2f tracking_point_px;
-    Point2f centroid_px;
-    float center_offset_px = 0.0f;
-    float angle_deg = 0.0f;
-    float confidence = 0.0f;
-    std::vector<Point2f> contour_px;
-};
-```
-
-필드 의미:
-
-| 필드 | 의미 |
-|---|---|
-| `detected` | 유효한 라인을 찾았는지 여부. |
-| `tracking_point_px` | 라인트레이싱 제어에 사용할 대표 점. GCS에서는 초록색 점으로 표시한다. |
-| `centroid_px` | 검출된 contour의 무게중심. tracking point 계산 실패 시 fallback으로 쓸 수 있다. |
-| `center_offset_px` | image center x 기준 tracking point의 좌우 오프셋. |
-| `angle_deg` | 라인의 image-plane 방향. `fitLine` 또는 contour principal direction 기준. |
-| `confidence` | contour 면적, 길이, mask 품질 등을 합친 0.0~1.0 신뢰도. |
-| `contour_px` | GCS에서 분홍색 테두리로 그릴 contour/polyline 좌표. |
-
-### 6.1 tracking point 정의
-
-사용자가 말한 “카메라가 라인을 인식하는 점”은 단순 centroid보다 **lookahead row에서의 line center**로 정의하는 것이 라인트레이싱에 더 유용하다.
-
-권장 방식:
-
-```text
-1. frame 하단 또는 중앙 하단에 ROI를 잡는다.
-2. ROI 안에서 가장 신뢰도 높은 line contour를 찾는다.
-3. configurable lookahead_y_ratio 위치의 가로 scan line과 contour가 만나는 x 범위를 구한다.
-4. 그 x 범위의 중앙을 tracking_point_px로 둔다.
-5. 실패하면 contour centroid를 fallback tracking point로 둔다.
-```
-
-초기값 예:
-
-```toml
-[line]
-enabled = true
-roi_top_ratio = 0.35
-lookahead_y_ratio = 0.70
-min_area_px = 250
-max_contour_points = 80
-```
-
-이렇게 하면 초록색 점이 “라인 전체의 중심”이 아니라 실제 제어 입력에 쓸 관측점이 된다.
-
-## 7. Telemetry schema 확장 계획
-
-현재 schema에는 legacy line fields가 이미 있다.
-
-```json
-{
-  "vision": {
-    "line_detected": false,
-    "line_offset": 0.0,
-    "line_angle": 0.0
-  }
-}
-```
-
-이번 단계에서는 backward compatibility를 위해 위 필드는 유지하고, 상세 line 객체를 추가한다.
-
-권장 schema:
-
-```json
-{
-  "vision": {
-    "line_detected": true,
-    "line_offset": -18.5,
-    "line_angle": 2.4,
-    "line": {
-      "detected": true,
-      "tracking_point_px": { "x": 304.0, "y": 336.0 },
-      "centroid_px": { "x": 310.2, "y": 258.6 },
-      "center_offset_px": -16.0,
-      "angle_deg": 2.4,
-      "confidence": 0.86,
-      "contour_px": [
-        { "x": 282.0, "y": 120.0 },
-        { "x": 350.0, "y": 120.0 },
-        { "x": 365.0, "y": 470.0 },
-        { "x": 260.0, "y": 470.0 }
-      ]
-    },
-    "marker_detected": true,
-    "marker_count": 1,
-    "markers": []
-  }
-}
-```
-
-프로토콜 문서는 구현 단계에서 `uav-gcs/docs/PROTOCOL.md`와 `uav-onboard/docs/PROTOCOL.md` 양쪽을 동일하게 갱신한다. 문서 버전은 `v1.2` 후보로 둔다.
-
-## 8. GCS 오버레이 설계
-
-라인 오버레이는 기존 `OverlayPrimitive`만으로 구현 가능하다.
-
-| 시각 요소 | 색상 | primitive |
+| ROI | 목적 | 크기 |
 |---|---|---|
-| line contour / border | magenta `RGB(255, 0, 255)` | contour point 사이 `OverlayLine` |
-| tracking point | green `RGB(0, 255, 0)` | filled `OverlayCircle` |
-| optional line direction | yellow/cyan 계열 | `OverlayLine` arrow |
-| optional label | green 또는 white | `OverlayText` |
+| tracking ROI | green tracking point/offset 계산 | 중하단 중심, 예: y 0.45~0.85 |
+| contour ROI | GCS magenta contour 표시 | 현재처럼 넓게, 예: y 0.08~1.0 |
+| future intersection ROI | 십자 판단 | 중앙~상단 포함, 별도 scoring |
 
-권장 drawing order:
+단기 구현:
 
-1. line contour를 먼저 그림
-2. line tracking point를 그림
-3. ArUco marker box/corner/center/text를 그림
-4. frame latency text는 기존처럼 상단에 표시
+- detector 계산은 tracking ROI 중심으로 줄인다.
+- contour overlay는 selected connected contour가 있으면 넓은 ROI에서 얻되, 후보 탐색 수를 제한한다.
 
-이 순서가 좋은 이유는 line contour가 화면의 큰 면적을 차지할 수 있기 때문이다. marker overlay를 나중에 그리면 marker 정보가 line contour에 묻히지 않는다.
+주의:
 
-추가할 GCS module 후보:
+- 지금 사용자가 원하는 십자 contour 보존 때문에 overlay ROI를 너무 좁히면 안 된다.
+- line 주행용 center와 교차점 표시용 contour를 같은 값으로 억지로 맞추지 않는다.
 
-```text
-uav-gcs/src/overlay/LineOverlay.hpp
-uav-gcs/src/overlay/LineOverlay.cpp
-```
+### 4.3 3순위: downscale line detection
 
-`VisionDebugApp`에서는 다음처럼 overlay를 합친다.
+라인 검출은 정밀한 ArUco corner 수준의 해상도가 필요하지 않다. line detector 입력만 축소해서 처리하고 결과 좌표를 원본 frame 좌표로 scale back한다.
 
-```text
-overlays = buildLineOverlays(frame.line)
-overlays += buildMarkerOverlays(frame.markers)
-window.showFrame(frame, overlays)
-```
-
-## 9. 최종 단계별 실행 계획
-
-### 1단계: GCS 전용 로그 창 추가
-
-### 목표
-
-현재 marker log는 PowerShell console에만 출력된다. 다음 단계에서는 별도 log window를 추가해 video window와 분리된 관측성을 확보한다.
-
-### 설계 판단
-
-`MarkerLogWindow`라는 이름으로 시작하기보다, 라인트레이싱까지 고려해 **`VisionLogWindow`** 또는 이에 준하는 일반 이름을 쓰는 편이 낫다.
-
-이유:
-
-- 4단계에서 marker뿐 아니라 line detection 상태도 표시해야 한다.
-- 지금 marker 전용 이름으로 만들면 곧바로 rename/refactor가 필요하다.
-- 최종 GCS는 marker, line, packet stats, latency, event를 함께 보여줘야 한다.
-
-### 구현 후보
-
-GCS:
-
-```text
-uav-gcs/src/ui/VisionLogWindow.hpp
-uav-gcs/src/ui/VisionLogWindow.cpp
-uav-gcs/src/telemetry/VisionLogFormatter.hpp
-uav-gcs/src/telemetry/VisionLogFormatter.cpp
-```
-
-초기에는 `MarkerLogFormatter`의 문자열을 재사용해도 된다. 다만 파일/클래스 이름은 line 확장에 맞게 일반화한다.
-
-### 완료 기준
-
-- `uav_gcs_vision_debug` 실행 시 video window와 별도 log window가 열린다.
-- marker id, center, orientation, ArUco latency, packet stats가 1~2초 주기로 갱신된다.
-- log window가 실패하거나 Windows backend 이슈가 있으면 console log fallback이 유지된다.
-- 아직 command UI는 구현하지 않는다.
-
-### 2단계: `vision_debug_node`를 non-blocking vision pipeline 방향으로 리팩터링
-
-### 목표
-
-현재 `vision_debug_node`는 한 loop에서 다음 작업을 순서대로 수행한다.
-
-```text
-camera read
-  -> JPEG decode
-  -> ArUco detect
-  -> telemetry send
-  -> video send
-```
-
-라인 검출까지 추가되면 detection 비용이 늘어난다. 또한 video send가 느려질 때 mission-critical vision loop가 막히면 안 된다. 따라서 line 구현 전 또는 line 구현과 동시에 pipeline 경계를 정리한다.
-
-### 권장 구조
-
-```text
-RpicamMjpegSource
-  -> CaptureWorker
-  -> LatestFrameSlot
-  -> VisionWorker
-       -> JPEG decode once
-       -> enabled detectors: ArUco, Line
-       -> VisionResult
-  -> TelemetryPublisher
-  -> DebugVideoStreamer
-```
-
-핵심 정책:
-
-- JPEG decode는 frame당 한 번만 한다.
-- ArUco와 Line detector는 같은 decoded `cv::Mat`을 사용한다.
-- telemetry는 latest vision result 기준으로 송신한다.
-- debug video는 best-effort다.
-- video send가 느려지면 오래된 debug frame은 버린다.
-- `frame_seq`는 video frame id와 telemetry `camera.frame_seq`에서 동일해야 한다.
-
-### 구현 후보
-
-Onboard:
-
-```text
-uav-onboard/src/app/VisionDebugPipeline.hpp
-uav-onboard/src/app/VisionDebugPipeline.cpp
-uav-onboard/src/vision/VisionTypes.hpp
-uav-onboard/tools/vision_debug_node.cpp
-```
-
-처음부터 과도한 framework를 만들 필요는 없다. 다만 `vision_debug_node.cpp`에 모든 로직이 계속 쌓이지 않도록 pipeline class로 분리한다.
-
-### 완료 기준
-
-- 기존 ArUco live debug 기능이 유지된다.
-- video stream이 잠깐 느려져도 capture/detection loop가 멈추지 않는다.
-- `--count`, `--no-video`, `--no-telemetry` 옵션이 계속 동작한다.
-- frame sequence 동기화가 유지된다.
-
-### 3단계: ArUco test data와 자동화 테스트 추가
-
-### 목표
-
-라인 기능을 붙이기 전에 이미 성공한 ArUco/overlay/protocol 동작을 테스트로 고정한다.
-
-### 추천 테스트
-
-Onboard:
-
-```text
-uav-onboard/tests/test_aruco_detector.cpp
-uav-onboard/tests/test_telemetry_marker_json.cpp
-uav-onboard/tests/test_vision_types.cpp
-```
-
-GCS:
-
-```text
-uav-gcs/tests/test_marker_telemetry_parse.cpp
-uav-gcs/tests/test_telemetry_store.cpp
-uav-gcs/tests/test_marker_overlay_mapping.cpp
-uav-gcs/tests/test_video_frame_marker_sync.cpp
-```
-
-Test data:
-
-```text
-uav-onboard/test_data/images/aruco_marker_*.png
-uav-gcs/test_data/telemetry/marker_*.json
-```
-
-### 구현 방향
-
-- ArUco marker image는 OpenCV로 생성하거나 repo에 작은 PNG로 저장한다.
-- marker 0개, 1개, 여러 개 telemetry JSON을 모두 테스트한다.
-- `TelemetryStore`의 exact `frame_seq` match와 timestamp fallback을 테스트한다.
-- `MarkerOverlay`가 marker 1개당 기대 개수의 primitive를 만드는지 확인한다.
-
-### 완료 기준
-
-- ArUco marker 검출 결과가 deterministic하게 확인된다.
-- marker telemetry build/parse round-trip이 깨지지 않는다.
-- GCS overlay primitive 생성이 테스트로 보호된다.
-- line schema 추가 전에 기존 marker 기능 regression 위험이 줄어든다.
-
-### 4단계: 라인트레이싱 MVP 구현
-
-### 목표
-
-교차점 판단이나 grid 저장 없이, 라인 인식과 GCS overlay만 구현한다.
-
-목표 영상:
-
-```text
-raw camera frame
-  + magenta line contour/border
-  + green tracking point
-  + optional ArUco marker overlay
-```
-
-### 4.1 Onboard detector
-
-추가 후보:
-
-```text
-uav-onboard/src/vision/LineDetector.hpp
-uav-onboard/src/vision/LineDetector.cpp
-```
-
-권장 초기 알고리즘:
-
-1. decoded BGR frame 입력
-2. `vision.toml`의 `[line]` config 로드
-3. ROI crop 적용
-4. grayscale 또는 HSV 기반 threshold/mask 생성
-5. morphology open/close로 noise 제거
-6. 가장 큰 valid contour 선택
-7. contour area, length, bounding box로 confidence 계산
-8. `fitLine` 또는 contour principal axis로 `angle_deg` 계산
-9. lookahead row 기준 `tracking_point_px` 계산
-10. contour point를 적당히 simplify해서 telemetry 크기 제한
-
-초기 config 후보:
+권장 config:
 
 ```toml
 [line]
-enabled = true
-mode = "dark_on_light"
-roi_top_ratio = 0.35
-lookahead_y_ratio = 0.70
-threshold = 90
-min_area_px = 250
-morph_kernel = 5
-max_contour_points = 80
-confidence_min = 0.05
+process_width = 320
 ```
 
-실제 경기장 라인 색과 조명에 따라 `mode`, `threshold`, `roi_top_ratio`는 조정될 수 있다. 따라서 `line_detector_tuner`를 먼저 살려서 이미지 파일 기반으로 threshold를 조정할 수 있게 만든다.
+640x480을 320x240으로 줄이면 pixel 수가 1/4로 줄어 threshold/morph/findContours 비용이 크게 감소한다.
 
-### 4.2 Onboard telemetry
+주의:
 
-`VisionResult`에 line result를 추가한다.
+- contour point와 tracking point는 GCS overlay를 위해 원본 좌표로 복원해야 한다.
+- 너무 낮추면 얇은 라인이 끊길 수 있으므로 320 width부터 시작한다.
 
-```cpp
-struct VisionResult {
-    std::uint32_t frame_seq = 0;
-    std::int64_t timestamp_ms = 0;
-    int width = 0;
-    int height = 0;
-    std::vector<MarkerObservation> markers;
-    LineDetection line;
-};
+### 4.4 4순위: per-candidate full mask 제거
+
+현재 가장 의심되는 병목이다. 후보 contour마다 full-size `contour_mask`를 만드는 방식을 제거한다.
+
+대체 방법:
+
+1. 먼저 `cv::boundingRect(contour)`로 lookahead row 포함 여부를 확인한다.
+2. bounding rect가 lookahead row를 포함하지 않으면 바로 skip한다.
+3. row center 계산이 필요한 후보만 작은 local mask를 만든다.
+4. local mask 크기는 `bounds.width * bounds.height`로 제한한다.
+5. 후보 수가 너무 많으면 area 상위 N개만 평가한다.
+
+권장 초기값:
+
+```toml
+[line]
+max_candidates = 8
 ```
 
-`BringupTelemetry.vision`에는 legacy fields와 상세 `line` object를 함께 채운다.
+효과:
+
+- 노이즈 contour가 많아도 full ROI mask allocation 반복을 피한다.
+- line latency spike를 줄일 가능성이 크다.
+
+### 4.5 5순위: contour/projection 기반 center 계산 개선
+
+tracking point는 contour 전체 centroid보다 lookahead row projection이 더 좋다. 다만 지금 방식은 후보마다 mask를 만들어 row span을 찾는다.
+
+대안:
+
+- final binary mask에서 lookahead band 몇 줄을 projection한다.
+- selected contour의 bounding box 안에서만 x projection을 계산한다.
+- line 폭이 너무 넓은 경우 hard reject하지 말고 confidence 감점만 한다. 현재 십자 contour 보존을 위해 이 방향이 맞다.
+
+### 4.6 6순위: telemetry contour point와 overlay 비용 제한
+
+현재 `max_contour_points = 80`은 크게 나쁘지 않다. 다만 latency를 줄여야 하면 다음을 실험한다.
+
+```toml
+[line]
+max_contour_points = 40
+```
+
+GCS overlay는 40개 point만 있어도 line border 확인에는 충분할 가능성이 크다.
+
+주의:
+
+- 교차점 판단 자체는 GCS overlay contour point가 아니라 onboard detector 내부 contour로 해야 한다.
+- telemetry contour point는 관제 표시용이다.
+
+## 5. 라인 tracking point 튐 문제 분석
+
+현재 튐 현상은 다음 상황에서 발생할 수 있다.
+
+1. 순간 조명 변화로 다른 contour가 선택됨
+2. 바닥 무늬/그림자/발/반사광이 line 후보 점수에서 이김
+3. 드론 진동으로 line이 ROI에서 끊김
+4. 십자 교차점에서 line width가 갑자기 넓어져 tracking x가 이동함
+5. frame마다 threshold/Otsu 결과가 달라짐
+6. `auto` mode에서 bright/dark 후보가 frame마다 바뀜
+
+현재 `LineDetector`는 stateless다. 즉, 이전 frame의 line 위치를 고려하지 않고 매 frame 새 후보를 고른다. 따라서 순간적인 오검출이 바로 green tracking point 튐으로 나타난다.
+
+## 6. Line tracking 안정화 계획
+
+### 6.1 새 상태 필터 추가: `LineTracker` 또는 `LineStabilizer`
+
+`LineDetector`는 raw detection만 담당하고, 그 뒤에 temporal filter를 둔다.
+
+권장 위치:
 
 ```text
-vision.line_detected = result.line.detected
-vision.line_offset = result.line.center_offset_px
-vision.line_angle = result.line.angle_deg
-vision.line = detailed line object
+uav-onboard/src/vision/LineStabilizer.hpp
+uav-onboard/src/vision/LineStabilizer.cpp
 ```
 
-### 4.3 GCS parser/store
-
-현재 `TelemetryStore`는 marker 중심의 `MarkerFrame`을 저장한다. 라인까지 들어오면 다음 중 하나를 선택한다.
-
-권장:
-
-```text
-MarkerFrame -> VisionFrame으로 일반화
-TelemetryStore -> VisionTelemetryStore 또는 이름 유지 후 내부 type만 일반화
-```
-
-최소 변경 경로:
-
-- class 이름 `TelemetryStore`는 유지한다.
-- 저장 struct만 `VisionFrame`으로 확장한다.
-- 기존 marker API는 가능하면 wrapper로 유지한다.
-
-`VisionFrame` 후보:
-
-```cpp
-struct VisionFrame {
-    std::uint32_t frame_seq = 0;
-    std::int64_t timestamp_ms = 0;
-    int width = 0;
-    int height = 0;
-    double processing_latency_ms = 0.0;
-    double aruco_latency_ms = 0.0;
-    double line_latency_ms = 0.0;
-    std::vector<protocol::MarkerTelemetry> markers;
-    std::optional<protocol::LineTelemetry> line;
-};
-```
-
-### 4.4 GCS line overlay
-
-추가 후보:
-
-```text
-uav-gcs/src/overlay/LineOverlay.hpp
-uav-gcs/src/overlay/LineOverlay.cpp
-```
-
-`LineOverlay`는 detector가 아니라 telemetry-to-primitive 변환기다.
+또는 초기에는 `VisionDebugPipeline` 내부 helper로 시작하고, 안정화되면 별도 class로 분리한다.
 
 입력:
 
-- `LineTelemetry`
+```cpp
+LineDetection raw;
+std::uint32_t frame_seq;
+std::int64_t timestamp_ms;
+int image_width;
+int image_height;
+```
 
 출력:
-
-- contour point 사이 magenta line segments
-- tracking point green filled circle
-- optional angle/offset text
-
-색상:
 
 ```cpp
-magenta = {255, 0, 255}
-green   = {0, 255, 0}
+LineDetection filtered;
+LineFilterDebug debug;
 ```
 
-### 4.5 GCS live overlay 통합
+### 6.2 필터 정책
 
-`VisionDebugApp`의 기존 marker overlay 흐름을 다음처럼 확장한다.
+#### Confidence gate
+
+raw confidence가 너무 낮으면 바로 반영하지 않는다.
+
+초기값:
+
+```toml
+[line_filter]
+min_accept_confidence = 0.25
+```
+
+#### Jump gate
+
+이전 accepted tracking point와 너무 멀리 떨어지면 reject 또는 hold한다.
+
+초기값:
+
+```toml
+[line_filter]
+max_offset_jump_px = 80
+max_angle_jump_deg = 35
+```
+
+정규화 버전도 가능하다.
 
 ```text
-vision_frame = telemetry_store.findForFrame(video_frame.frame_id, video_frame.timestamp_ms)
-
-overlays = []
-if vision_frame.line.detected:
-    overlays += buildLineOverlays(vision_frame.line)
-overlays += buildMarkerOverlays(vision_frame.markers)
-
-video_window.showFrame(video_frame, overlays)
+max_offset_jump_px = image_width * 0.12
 ```
 
-기본값은 ArUco와 line을 동시에 표시하는 것이다. 단, 성능이나 화면 혼잡이 문제되면 overlay toggle을 둔다.
+#### EMA filter
 
-### 4.6 라인트레이싱 튜닝 도구
-
-live 실행 파일을 새로 만들지는 않지만, tuning tool은 별도로 둔다.
-
-`line_detector_tuner`의 권장 역할:
-
-```bash
-./build/line_detector_tuner --image test_data/images/line_sample_01.jpg --config config
-./build/line_detector_tuner --image sample.jpg --threshold 90 --roi-top 0.35
-```
-
-출력:
+accepted raw detection을 바로 쓰지 않고 지수 이동 평균으로 부드럽게 만든다.
 
 ```text
-detected=true
-tracking_point=(304.0,336.0)
-offset=-16.0px
-angle=2.4deg
-confidence=0.86
-contour_points=42
+filtered_x = alpha * raw_x + (1 - alpha) * prev_x
+filtered_angle = alpha * raw_angle + (1 - alpha) * prev_angle
 ```
 
-OpenCV GUI가 가능한 환경에서는 mask/contour preview를 띄울 수 있다. Pi headless 환경에서는 숫자 출력과 output image 저장만으로 시작해도 된다.
+초기값:
 
-### 4.7 완료 기준
+```toml
+[line_filter]
+ema_alpha = 0.35
+```
 
-- Pi에서 `vision_debug_node --config config` 실행 시 line telemetry가 송신된다.
-- GCS `uav_gcs_vision_debug` 영상 창에 분홍색 line contour가 표시된다.
-- GCS 영상 창에 초록색 tracking point가 표시된다.
-- ArUco marker가 보이면 기존 marker overlay도 함께 표시된다.
-- `--line-only` 또는 equivalent config로 ArUco 없이 line만 확인할 수 있다.
-- marker가 없어도 line overlay는 정상 표시된다.
-- line이 없으면 stale line overlay를 그리지 않는다.
-- 교차점 판단, grid 좌표 저장, marker map 저장은 구현하지 않는다.
+#### Short hold
 
-## 10. 권장 작업 순서
+진동으로 1~3 frame line이 끊긴 경우 이전 filtered result를 잠시 유지한다.
 
-실제 구현 시 순서는 다음이 가장 안전하다.
+초기값:
 
-1. `PLAN.md` 기준으로 1단계 log window를 generic vision log window로 구현한다.
-2. 기존 ArUco live flow가 그대로 동작하는지 GCS/Pi에서 확인한다.
-3. `vision_debug_node` 내부 구조를 pipeline class로 분리하되 behavior는 바꾸지 않는다.
-4. ArUco/protocol/GCS store/overlay 테스트를 추가한다.
-5. `LineDetection` type과 line config를 추가한다.
-6. `line_detector_tuner`를 image 기반으로 먼저 구현한다.
-7. `LineDetector`를 `vision_debug_node` pipeline에 붙인다.
-8. telemetry schema에 `vision.line`을 추가하고 GCS parser를 확장한다.
-9. `LineOverlay`를 추가하고 GCS video window에 magenta/green overlay를 표시한다.
-10. Pi live camera로 line-only, ArUco-only, combined mode를 각각 확인한다.
+```toml
+[line_filter]
+hold_frames = 3
+```
 
-## 11. 주요 리스크와 대응
+hold 중에는 confidence를 점진적으로 낮춘다.
 
-| 리스크 | 영향 | 대응 |
+```text
+held_confidence = prev_confidence * 0.85
+```
+
+#### Reject counting
+
+갑자기 튄 raw detection은 버리되, 여러 frame 연속 같은 방향으로 나타나면 실제 line 변화일 수 있으므로 재획득한다.
+
+초기 정책:
+
+```text
+if jump detected for 1~2 frames:
+    hold previous
+if jump persists for 3 frames:
+    accept as reacquired line
+```
+
+### 6.3 GCS 표시
+
+GCS vision log window에 raw/filtered 상태를 표시한다.
+
+권장 표시:
+
+```text
+[line] raw=yes filtered=yes hold=no rejected=1
+tracking=(x,y) raw=(x,y)
+offset=...
+angle=...
+confidence=...
+```
+
+overlay 옵션:
+
+- 기본 green point는 filtered tracking point
+- raw point는 필요 시 작은 yellow point로 표시
+- rejected frame은 log에만 표시하고 overlay는 이전 filtered point 유지
+
+초기 구현은 telemetry schema를 크게 늘리지 않고 `debug.note` 또는 추가 debug fields로 시작할 수 있다. 안정화 후 `PROTOCOL.md`에 정식 field를 추가한다.
+
+## 7. 사용자가 제시한 개선책 적용 판단
+
+| 방법 | 현재 적용 판단 | 이유 |
 |---|---|---|
-| line detection threshold가 조명에 민감함 | 라인 contour가 끊기거나 바닥을 라인으로 오인할 수 있음 | `line_detector_tuner`, config 기반 threshold/ROI/morphology 조정 |
-| contour point가 너무 많음 | telemetry packet이 커지고 UDP 손실 가능성 증가 | contour simplify, `max_contour_points` 제한 |
-| ArUco와 line을 동시에 돌리면 Pi CPU 부담 증가 | FPS 저하 가능 | detector enable/disable 옵션, ROI 제한, video best-effort drop |
-| video와 telemetry frame mismatch | overlay 위치가 늦게 보일 수 있음 | 기존 `frame_seq` match 유지, stale threshold 적용 |
-| marker와 line overlay 색이 헷갈림 | 화면 해석 어려움 | line은 magenta/green 고정, marker overlay는 기존 색 유지하되 필요 시 후속 조정 |
-| log window가 marker 전용으로 굳어짐 | line log 추가 때 refactor 필요 | 1단계부터 `VisionLogWindow` 이름으로 일반화 |
-| live 실행 파일을 분리함 | 나중에 통합 비용 증가 | live는 통합, tuning/replay만 별도 tool 유지 |
+| 1. ROI crop / 다중 ROI | 바로 적용 | latency와 안정성 모두에 가장 효과적. tracking ROI와 contour/intersection ROI를 분리해야 함 |
+| 2. HSV/gray threshold | 조건부 적용 | 현재는 gray polarity가 가볍고 단순함. 라인 색이 확정되거나 명암 차가 부족하면 `color_hsv` 추가 |
+| 3. 원근 변환 Bird's Eye View | 지금은 보류 | 계산 비용과 calibration 부담이 있음. 카메라 장착 각도 고정 후 control 단계에서 검토 |
+| 4. morphology | 이미 적용, 튜닝 필요 | kernel size와 open/close 순서가 latency/정확도에 영향. ROI/downscale 후 재튜닝 |
+| 5. largest contour or projection center | 적용 | 후보 전체 mask 대신 projection/상위 contour 평가로 변경. center 튐도 줄일 수 있음 |
+| 6. fitLine angle | 이미 적용 | 유지. 단, low confidence contour의 angle은 filter에서 gate 처리 |
+| 7. confidence 계산 | 개선 필요 | 현재 면적/폭/중앙성 중심. temporal consistency, ROI coverage, row projection 안정성을 추가 |
+| 8. EMA 필터 | 바로 적용 | tracking point 튐 완화에 가장 직접적이고 계산 비용이 작음 |
+| 9. GCS telemetry 표시 | 바로 적용 | latency 병목과 filter 동작을 현장에서 확인하려면 필수 |
+| 10. 실제 영상 threshold 튜닝 | 바로 적용 | 경기장 환경 불확실성이 가장 큼. `line_detector_tuner` batch/preview 강화 필요 |
 
-## 12. 최종 결론
+## 8. 구현 우선순위
 
-이번 1~4단계의 최적 방향은 **기존 vision debug workflow를 일반화해서 ArUco와 라인트레이싱을 같은 video/telemetry/GCS overlay 흐름에 태우는 것**이다.
+### 1단계: 계측 먼저 추가
 
-따라서 live 실행 파일은 새로 나누지 않는다.
+목표:
+
+- 470 ms가 정확히 어디서 생기는지 확인한다.
+
+작업:
+
+1. `VisionDebugPipeline` 단계별 latency 측정 추가
+2. `LineDetector` 내부 contour/mask/candidate count 측정 추가
+3. telemetry debug fields 확장
+4. GCS `VisionLogFormatter`에 latency breakdown 표시
+5. README/PROTOCOL 갱신
+
+완료 기준:
+
+- GCS log window에서 `read/decode/aruco/line/telemetry/video` 비용을 볼 수 있다.
+- `line_contours_found`, `line_candidates_evaluated`, `telemetry_bytes`, `video_dropped_frames`를 볼 수 있다.
+
+### 2단계: low-risk latency 개선
+
+목표:
+
+- 동작을 크게 바꾸지 않고 latency를 먼저 낮춘다.
+
+작업:
+
+1. 흰색 라인 테스트 command를 `--line-mode light_on_dark`로 고정
+2. `max_contour_points` 80 -> 40 실험
+3. `line_detector_tuner`로 threshold 고정값 실험
+4. `auto` mode는 현장 초기 탐색용으로만 사용
+
+완료 기준:
+
+- ArUco + line 평균 latency가 470 ms에서 유의미하게 감소한다.
+- line overlay는 계속 표시된다.
+- 십자 contour는 계속 connected contour로 보인다.
+
+### 3단계: LineDetector hotspot 제거
+
+목표:
+
+- per-candidate full mask allocation/draw를 제거한다.
+
+작업:
+
+1. contour를 area/boundingRect로 1차 필터링
+2. area 상위 N개 후보만 평가
+3. lookahead row 계산은 boundingRect local mask 또는 projection 방식으로 변경
+4. downscale `process_width=320` 옵션 추가
+
+완료 기준:
+
+- `line_latency_ms` spike가 줄어든다.
+- 바닥 노이즈가 많아도 후보 평가 시간이 안정적이다.
+
+### 4단계: LineStabilizer 추가
+
+목표:
+
+- 초록 tracking point가 갑자기 튀는 현상을 줄인다.
+
+작업:
+
+1. raw line detection 뒤 temporal filter 추가
+2. confidence gate, jump gate, EMA, hold_frames 구현
+3. filtered result를 telemetry/GCS overlay 기본값으로 사용
+4. GCS log에 raw/filtered/rejected/hold 상태 표시
+
+완료 기준:
+
+- 1~3 frame의 순간 오검출이나 line 끊김에서 green point가 크게 튀지 않는다.
+- 실제 큰 경로 변화가 여러 frame 지속되면 재획득한다.
+- line이 완전히 사라지면 hold 후 detected=false로 내려간다.
+
+### 5단계: 다중 ROI와 projection center
+
+목표:
+
+- latency와 안정성을 동시에 개선한다.
+
+작업:
+
+1. tracking ROI와 contour ROI 분리
+2. tracking point는 lookahead band projection으로 계산
+3. contour overlay는 connected contour를 유지
+4. future intersection ROI 설계만 준비
+
+완료 기준:
+
+- tracking point 튐 감소
+- 십자 contour 표시 유지
+- line detector 처리 pixel 수 감소
+
+### 6단계: 실제 영상 기반 튜닝 도구 강화
+
+목표:
+
+- 경기장 전까지 threshold/ROI/morphology 값을 감으로 맞추지 않는다.
+
+작업:
+
+1. `line_detector_tuner`가 mask/contour preview image 저장
+2. 여러 image를 batch로 돌려 detection rate, average confidence, latency 출력
+3. 캡처 이미지별 추천 threshold/mode를 비교
+
+완료 기준:
+
+- `line1~line4` 같은 캡처를 batch로 돌려 수치 비교 가능
+- 현장 이미지가 생기면 config preset을 빠르게 선택 가능
+
+## 9. 성능 목표
+
+현재 관찰:
 
 ```text
-Raspberry Pi: vision_debug_node
-GCS:          uav_gcs_vision_debug
+video only:       ~150 ms
+ArUco:            ~210 ms
+ArUco + Line:     ~470 ms
 ```
 
-대신 다음은 별도 도구로 유지한다.
+1차 목표:
 
 ```text
-line_detector_tuner: line threshold/ROI/contour 튜닝
-replay_vision: recorded frame 기반 regression 확인
-aruco_detector_tester: ArUco detector smoke test
+ArUco + Line:     < 300 ms average
+line_latency_ms:  < 40 ms average at 640x480 or downscaled line input
 ```
 
-라인트레이싱 MVP의 화면 목표는 명확하다.
+2차 목표:
 
 ```text
-GCS video window
-  -> 원본 카메라 영상
-  -> 분홍색 라인 contour/border overlay
-  -> 초록색 tracking point overlay
-  -> 필요 시 기존 ArUco marker overlay 동시 표시
+ArUco + Line:     210~260 ms range
+line spike:       no repeated >100 ms spikes in normal lighting
 ```
 
-교차점 판단과 grid state 저장은 이번 milestone의 범위 밖으로 둔다. 라인 검출 결과가 안정적으로 보이고 telemetry/overlay 구조가 굳어진 뒤 다음 단계에서 교차점 판단과 grid state를 붙이는 것이 맞다.
+판단 기준:
 
-## 13. 2026-04-27 라인 오검출 대응 계획 및 반영
+- GCS displayed latency만 보지 않는다.
+- onboard `processing_latency_ms`, `line_latency_ms`, `video_dropped_frames`, GCS `age`를 함께 본다.
 
-### 관찰된 문제
+## 10. 구현 시 주의사항
 
-실기 테스트에서 흰색 라인이 화면 중앙에 있었지만, 기존 `dark_on_light` 설정 때문에 오른쪽 발/다리처럼 어두운 물체가 가장 큰 contour로 선택됐다. 결과적으로 분홍색 contour와 초록색 tracking point가 라인이 아니라 발 쪽에 표시됐다.
+- 이번 계획 단계에서는 코드 수정하지 않는다.
+- 실제 구현 시 `PROTOCOL.md`와 `README.md` 양쪽 repo를 항상 갱신한다.
+- `uav-gcs/docs/PROTOCOL.md`와 `uav-onboard/docs/PROTOCOL.md`는 동일하게 유지한다.
+- line branch filtering을 단순 재도입하지 않는다. 이전 실험에서 십자 contour를 깨뜨렸다.
+- 반사광 억제와 교차점 보존은 별도 output으로 풀어야 한다.
+- Bird's Eye View는 카메라 장착 각도와 calibration이 고정된 뒤 검토한다.
+- Pixhawk 제어보다 line/intersection vision 안정화가 우선이다.
 
-핵심 원인:
+## 11. 최종 결론
 
-- 기존 detector는 `mode = "dark_on_light"` 기본값으로 어두운 후보만 찾았다.
-- 후보 선택 기준이 “가장 큰 contour”에 가까워 발처럼 큰 어두운 물체가 라인보다 유리했다.
-- 경기장 라인이 밝은 색인지 어두운 색인지 아직 확정되지 않았다.
+latency 470 ms의 가장 유력한 원인은 JPEG 재인코딩이나 video 송신 main-loop block이 아니라, `LineDetector`의 넓은 ROI, `auto` mode 2-pass 처리, contour 후보마다 full mask를 새로 만드는 구조, 그리고 line contour telemetry/GCS 표시 비용의 조합이다.
 
-### 반영한 해결 방향
+라인 tracking point 튐은 현재 detector가 stateless이고, raw detection을 곧바로 telemetry/overlay에 쓰기 때문에 발생한다. 이를 해결하려면 raw detector 자체를 과하게 보수적으로 만드는 것보다, detector 뒤에 temporal stabilizer를 두고 confidence gate, jump gate, EMA, short hold를 적용하는 것이 맞다.
 
-기본 전략을 다음처럼 바꾼다.
+가장 안전한 다음 구현 순서는 다음이다.
 
-```text
-1. 기본 line mode는 auto로 둔다.
-2. auto mode에서는 bright-line mask와 dark-line mask를 둘 다 만든다.
-3. 단순히 가장 큰 contour를 고르지 않는다.
-4. lookahead row를 실제로 통과하는 후보만 사용한다.
-5. 후보 width가 너무 넓으면 발/그림자/큰 물체로 보고 제외한다.
-6. 길게 이어진 정도, 면적, 폭, 화면 중앙성, side edge 접촉 여부를 점수화한다.
-```
-
-즉, 흰색 라인이면 `light_on_dark` 후보가 이기고, 검정 라인이면 `dark_on_light` 후보가 이긴다. 발처럼 큰 물체는 크더라도 너무 넓거나 화면 side edge에 붙어 있거나 tracking point가 한쪽으로 치우쳐 점수가 낮아진다.
-
-### 실행 시 선택 옵션
-
-경기장에 가기 전까지 라인 색을 확신할 수 없으므로 실행 전 override를 제공한다.
-
-```bash
-./build/vision_debug_node --config config --line-only --line-mode auto
-./build/vision_debug_node --config config --line-only --line-mode light_on_dark
-./build/vision_debug_node --config config --line-only --line-mode dark_on_light
-./build/vision_debug_node --config config --line-only --line-threshold 160
-```
-
-`line_detector_tuner`도 같은 방향으로 사용한다.
-
-```bash
-./build/line_detector_tuner --config config --image test_data/images/line_sample.jpg --mode auto
-./build/line_detector_tuner --config config --image test_data/images/line_sample.jpg --mode light_on_dark --threshold 160
-```
-
-### 색 이름을 직접 지정하는 방식에 대한 판단
-
-`green`, `blue`, `white`, `black` 같은 색 이름을 직접 지정하는 방식은 당장 기본값으로 채택하지 않는다.
-
-이유:
-
-- 현재 detector는 가벼운 grayscale threshold 기반이라 Pi Zero 2W에서 부담이 작다.
-- 경기장 조명, 카메라 auto exposure, 바닥 반사에 따라 같은 색도 HSV/RGB 값이 크게 흔들릴 수 있다.
-- 색 이름 기반 mask는 실제 색상 범위를 정해야 해서 튜닝해야 할 값이 더 늘어난다.
-- 라인 색과 바닥이 명암으로 충분히 분리되면 grayscale polarity 방식이 더 단순하고 빠르다.
-
-다만 경기장에서 “라인과 바닥의 명암 차이는 작고 색상 차이만 큰 상황”이 확인되면 다음 단계에서 HSV 기반 `mode = "color_hsv"`를 추가한다. 이때는 `hue_min`, `hue_max`, `sat_min`, `value_min`을 config로 두고 `line_detector_tuner`로 범위를 맞춘다.
-
-### 향후 실행 중 변경
-
-현재는 command channel이 없으므로 실행 중 line mode를 GCS에서 바꾸지는 않는다. 당장은 실행 전 CLI/config override로 충분히 대응한다. 나중에 command channel이 생기면 다음 debug command를 추가하는 것이 좋다.
-
-```text
-set_line_mode(auto | light_on_dark | dark_on_light | color_hsv)
-set_line_threshold(value)
-set_line_roi(top_ratio, lookahead_ratio)
-```
-
-이 기능은 교차점 판단 전에 넣어도 좋지만, 현재는 detector 안정화가 우선이다.
+1. latency breakdown 계측
+2. `light_on_dark` 고정과 contour point 축소 같은 low-risk 최적화
+3. LineDetector 후보 평가 hotspot 제거
+4. LineStabilizer 추가
+5. multi ROI/projection center 개선
+6. 실제 영상 기반 threshold tuning 강화
