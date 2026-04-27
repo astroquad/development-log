@@ -118,20 +118,24 @@ Pi에서 `discovered GCS video receiver at <laptop-ip>:5600`가 출력되는데 
 
 ```text
 astroquad/
-├── PLAN.md
-├── RESEARCH.md
-├── TROUBLESHOOTING.md
+├── development-log/
+│   ├── .git/
+│   ├── PLAN.md
+│   ├── RESEARCH.md
+│   └── TROUBLESHOOTING.md
 ├── uav-gcs/
 └── uav-onboard/
 ```
 
-현재 루트 디렉토리 자체는 git 저장소가 아니며, `uav-gcs`와 `uav-onboard`가 각각 독립적인 git 저장소다.
+현재 루트 디렉토리 자체는 git 저장소가 아니며, `development-log`, `uav-gcs`, `uav-onboard`가 각각 독립적인 git 저장소다.
 
-| 루트 파일 | 역할 |
+기존에 루트에 흩어져 있던 리서치, 계획, 트러블슈팅 문서는 `development-log/` 폴더로 묶어서 관리한다. 이 폴더는 보고서 작성과 개발 이력 정리를 위한 문서 전용 저장소이며, 코드 저장소와 분리해서 커밋한다.
+
+| 문서 파일 | 역할 |
 |---|---|
-| `PLAN.md` | ArUco/GCS overlay milestone 구현 계획 기록. 현재 대부분 구현 완료. |
-| `RESEARCH.md` | 현재 프로젝트 구조, 구현 상태, 검증 결과, 다음 단계 정리 문서. |
-| `TROUBLESHOOTING.md` | 실제 개발 중 발생한 문제와 해결 방법을 보고서용 개발로그로 기록한 문서. |
+| `development-log/PLAN.md` | ArUco/GCS overlay milestone 구현 계획 기록. 현재 대부분 구현 완료. |
+| `development-log/RESEARCH.md` | 현재 프로젝트 구조, 구현 상태, 검증 결과, 다음 단계 정리 문서. |
+| `development-log/TROUBLESHOOTING.md` | 실제 개발 중 발생한 문제와 해결 방법을 보고서용 개발로그로 기록한 문서. |
 
 ## 5. `uav-gcs` 구조와 파일 역할
 
