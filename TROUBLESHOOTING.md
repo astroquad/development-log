@@ -424,3 +424,133 @@ cmake --build build
 6. 영상이 불안정하면 `config/vision.toml`의 `fps`, `jpeg_quality`, 해상도를 낮춰본다.
 7. rpicam 내부 오류는 Pi의 `/tmp/astroquad_rpicam_vid.log`를 확인한다.
 8. ArUco overlay가 어긋나면 `camera.frame_seq`와 video `frame_id` 동기화를 먼저 의심한다.
+
+## 13. 라인 contour 상단 절단, 낮은 tracking point, 밝은 바닥 반사 오검출
+
+### 증상
+
+실제 카메라 테스트 캡처 `line1.png`, `line2.png`, `line3.png`, `line4.png`에서 다음 현상을 확인했다.
+
+- 어두운 조명 또는 검정 천 위에서는 흰색 라인이 비교적 잘 잡혔다.
+- 밝은 조명이 바닥에 반사되는 환경에서는 흰색 라인뿐 아니라 반사광이 같은 밝은 contour로 붙으면서 magenta contour가 넓게 퍼졌다.
+- 가상 격자선 이미지를 태블릿에 띄워 촬영한 경우 십자 형태는 잘 검출됐다.
+- 모든 캡처에서 green tracking point가 화면 상하 기준 중점보다 아래쪽에 표시됐다.
+- magenta contour가 하단까지는 내려오지만 상단은 잘린 것처럼 보였다.
+- 카메라가 완전 탑다운에 가까울 때보다 약간 전방을 보도록 세웠을 때 라인이 더 잘 이어지는 느낌이 있었다.
+
+### 원인
+
+가장 큰 직접 원인은 line config 기본값이었다.
+
+```toml
+roi_top_ratio = 0.35
+lookahead_y_ratio = 0.70
+```
+
+`roi_top_ratio = 0.35`는 영상 상단 35%를 라인 검출에서 제외한다. 따라서 실제 라인이 영상 상단까지 보여도 detector는 그 영역을 보지 못하고, GCS overlay의 contour도 ROI 시작 지점에서 잘린 것처럼 보인다.
+
+`lookahead_y_ratio = 0.70`은 green tracking point를 의도적으로 화면 아래쪽 70% 위치에 둔다. 그래서 정상 검출이어도 tracking point가 중앙보다 낮게 보인다.
+
+밝은 바닥 반사 문제는 별도 원인이 있다. 현재 라인 검출은 Raspberry Pi Zero 2 W 부담을 줄이기 위해 grayscale threshold 기반으로 동작한다. 흰색 라인과 밝은 반사광이 비슷한 밝기로 붙으면 OpenCV contour 단계에서 하나의 큰 component처럼 합쳐질 수 있다. 이 경우 line 자체보다 반사광이 magenta contour에 포함된다.
+
+카메라 각도 문제는 설정값과 시야 특성이 겹친 결과다. 기존 ROI가 하단 위주였기 때문에, 카메라를 조금 전방으로 세워 라인이 하단 ROI를 길게 통과할 때 더 잘 잡히는 것처럼 보였다. 최종 주행에서는 카메라 장착 각도를 고정한 뒤 그 각도에서 `roi_top_ratio`와 `lookahead_y_ratio`를 맞추는 것이 중요하다.
+
+### 적용한 수정
+
+기본 ROI와 tracking point 위치를 다음처럼 변경했다.
+
+```toml
+roi_top_ratio = 0.08
+lookahead_y_ratio = 0.55
+```
+
+효과:
+
+- 영상 상단 대부분을 검출에 포함하므로 contour 상단 절단이 크게 줄어든다.
+- green tracking point가 화면 중앙에 가까워져 현재 캡처에서 보였던 하단 치우침이 완화된다.
+- 너무 먼 상단 0%부터 모두 쓰지는 않아, 카메라가 살짝 전방을 볼 때 생길 수 있는 비바닥 영역의 영향을 조금 줄인다.
+
+밝은 반사광 대응으로 `LineDetector`에 line-branch filtering을 추가했다.
+
+동작 방식:
+
+1. 기존처럼 threshold mask와 contour 후보를 만든다.
+2. `lookahead_y_ratio` 위치의 행에서 정상적인 라인 폭 후보만 통과시킨다.
+3. 그 행의 tracking x를 기준으로 위/아래 행을 따라가며 정상 라인 폭 run만 추적한다.
+4. 너무 넓은 반사광, 화면 가장자리 큰 물체, 십자 교차부처럼 폭이 넓은 span은 selected line branch contour에서 제외한다.
+5. GCS에는 이 selected branch contour를 `vision.line.contour_px`로 보내고 magenta overlay로 그린다.
+
+이 방식은 교차점 판단 로직이 아니다. 이번 단계에서는 라인을 따라갈 branch만 안정적으로 시각화하는 것이 목적이다. 따라서 십자 교차부의 가로선 전체를 저장하거나 교차점 좌표를 계산하지 않는다.
+
+실행 전/현장 튜닝을 위해 다음 옵션도 추가했다.
+
+```bash
+./build/vision_debug_node --config config --line-only --line-roi-top 0.08 --line-lookahead 0.55
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark --line-threshold 180
+./build/line_detector_tuner --config config --image test_data/images/line_sample.jpg --mode light_on_dark --threshold 180 --roi-top 0.08 --lookahead 0.55
+```
+
+### 자연광/운동장 바닥에서의 예상
+
+실내 나무 바닥이나 태블릿 화면처럼 반사가 강한 표면은 밝은 라인 검출에 불리하다. 운동장 흙바닥은 일반적으로 정반사가 적기 때문에 `line3.png` 같은 넓은 하이라이트 문제는 줄어들 가능성이 크다.
+
+다만 자연광 환경도 완전히 안전하지는 않다.
+
+- 구름/햇빛 변화로 auto exposure가 흔들릴 수 있다.
+- UAV 그림자나 사람 그림자가 라인 근처에 생길 수 있다.
+- 라인 재질이 흰색 테이프처럼 반짝이면 특정 각도에서 glare가 생길 수 있다.
+- 흙바닥 색과 라인 색의 명암 차이가 작으면 grayscale threshold만으로는 불안정할 수 있다.
+
+현장에서는 먼저 `--line-mode auto`로 확인하고, 라인이 흰색/밝은 색이면 `--line-mode light_on_dark`, 검정/어두운 색이면 `--line-mode dark_on_light`로 고정해서 비교한다. 반사광이 계속 붙으면 `--line-threshold`를 올려 라인보다 어두운 하이라이트를 제외한다.
+
+### 현장 테스트 순서
+
+GCS:
+
+```powershell
+cd uav-gcs
+git pull --ff-only
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+.\build\uav_gcs_vision_debug.exe --config config
+```
+
+Raspberry Pi:
+
+```bash
+cd ~/astroquad/uav-onboard
+git pull --ff-only
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/vision_debug_node --config config --line-only --line-mode auto
+```
+
+흰색 라인으로 확정되면:
+
+```bash
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark
+```
+
+상단이 아직 잘리면:
+
+```bash
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark --line-roi-top 0.03
+```
+
+green tracking point를 더 위에서 보고 싶으면:
+
+```bash
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark --line-lookahead 0.45
+```
+
+주행 제어용으로 너무 먼 곳을 보고 흔들리면:
+
+```bash
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark --line-lookahead 0.60
+```
+
+ArUco와 라인을 동시에 확인하려면 `--line-only`를 빼고 실행한다.
+
+```bash
+./build/vision_debug_node --config config --line-mode light_on_dark
+```
