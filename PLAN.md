@@ -1,8 +1,8 @@
 # Astroquad Next Vision Milestone Plan
 
 작성일: 2026-04-27  
-상태: 구현 전 계획 문서  
-원칙: 이 문서는 작업 계획만 정의한다. 이번 요청에서는 소스 코드를 수정하지 않는다.
+상태: 1~4단계 구현 반영 완료, Raspberry Pi 실기 검증 대기
+원칙: 이 문서는 다음 vision milestone의 설계 기준과 구현 결과를 함께 기록한다.
 
 ## 1. 현재 프로젝트 진행 상황 요약
 
@@ -32,6 +32,8 @@ Pi camera
 | 로그/관제 표시 | telemetry로 전달 | 표시 및 기록 |
 
 즉, 온보드는 숫자화된 비전 결과만 만들고, GCS는 그 결과를 사람이 보기 좋은 형태로 그린다.
+
+추가 원칙: **debug video streaming은 절대 capture, vision detection, mission decision, future control output을 block하면 안 된다.** 영상 송출이 밀리면 오래된 frame을 버리고 최신 frame/result만 유지한다. 라즈베리파이의 우선순위는 항상 `카메라 획득 -> 비전 인식 -> 미션 판단/제어 -> telemetry -> debug video` 순서다.
 
 ## 2. 현재 전체 디렉터리 구조
 
@@ -531,7 +533,7 @@ threshold = 90
 min_area_px = 250
 morph_kernel = 5
 max_contour_points = 80
-confidence_min = 0.30
+confidence_min = 0.05
 ```
 
 실제 경기장 라인 색과 조명에 따라 `mode`, `threshold`, `roi_top_ratio`는 조정될 수 있다. 따라서 `line_detector_tuner`를 먼저 살려서 이미지 파일 기반으로 threshold를 조정할 수 있게 만든다.

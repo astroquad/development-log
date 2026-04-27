@@ -4,6 +4,12 @@
 
 범위: 루트 문서, `uav-gcs`, `uav-onboard`, 현재 소스 구조, 구현 상태, 검증된 bring-up 결과, 추천 다음 단계.
 
+2026-04-27 추가 구현 메모:
+
+- `PLAN.md`의 1~4단계 방향을 반영해 GCS vision log window, onboard non-blocking debug video pipeline, line tracing MVP, GCS line overlay, `vision.line` telemetry schema, 최소 protocol/overlay 테스트를 추가했다.
+- 라인트레이싱은 아직 Raspberry Pi 실기 검증 전이다. 로컬 Windows에서는 GCS build와 line telemetry/overlay 테스트가 통과했고, 로컬 onboard는 OpenCV가 없어 `vision_debug_node` 계열 target은 skip된다.
+- debug video streaming은 mission-critical 경로가 아니다. 영상 송출이 밀리면 오래된 frame을 버리고, capture/vision/미션 판단/향후 제어 출력을 우선한다.
+
 관련 문서:
 
 - `PLAN.md`: ArUco 인식 및 GCS 오버레이 단계의 구현 계획 기록. 현재 주요 항목은 대부분 구현 완료됨.
