@@ -732,3 +732,73 @@ GCS video window
 ```
 
 교차점 판단과 grid state 저장은 이번 milestone의 범위 밖으로 둔다. 라인 검출 결과가 안정적으로 보이고 telemetry/overlay 구조가 굳어진 뒤 다음 단계에서 교차점 판단과 grid state를 붙이는 것이 맞다.
+
+## 13. 2026-04-27 라인 오검출 대응 계획 및 반영
+
+### 관찰된 문제
+
+실기 테스트에서 흰색 라인이 화면 중앙에 있었지만, 기존 `dark_on_light` 설정 때문에 오른쪽 발/다리처럼 어두운 물체가 가장 큰 contour로 선택됐다. 결과적으로 분홍색 contour와 초록색 tracking point가 라인이 아니라 발 쪽에 표시됐다.
+
+핵심 원인:
+
+- 기존 detector는 `mode = "dark_on_light"` 기본값으로 어두운 후보만 찾았다.
+- 후보 선택 기준이 “가장 큰 contour”에 가까워 발처럼 큰 어두운 물체가 라인보다 유리했다.
+- 경기장 라인이 밝은 색인지 어두운 색인지 아직 확정되지 않았다.
+
+### 반영한 해결 방향
+
+기본 전략을 다음처럼 바꾼다.
+
+```text
+1. 기본 line mode는 auto로 둔다.
+2. auto mode에서는 bright-line mask와 dark-line mask를 둘 다 만든다.
+3. 단순히 가장 큰 contour를 고르지 않는다.
+4. lookahead row를 실제로 통과하는 후보만 사용한다.
+5. 후보 width가 너무 넓으면 발/그림자/큰 물체로 보고 제외한다.
+6. 길게 이어진 정도, 면적, 폭, 화면 중앙성, side edge 접촉 여부를 점수화한다.
+```
+
+즉, 흰색 라인이면 `light_on_dark` 후보가 이기고, 검정 라인이면 `dark_on_light` 후보가 이긴다. 발처럼 큰 물체는 크더라도 너무 넓거나 화면 side edge에 붙어 있거나 tracking point가 한쪽으로 치우쳐 점수가 낮아진다.
+
+### 실행 시 선택 옵션
+
+경기장에 가기 전까지 라인 색을 확신할 수 없으므로 실행 전 override를 제공한다.
+
+```bash
+./build/vision_debug_node --config config --line-only --line-mode auto
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark
+./build/vision_debug_node --config config --line-only --line-mode dark_on_light
+./build/vision_debug_node --config config --line-only --line-threshold 160
+```
+
+`line_detector_tuner`도 같은 방향으로 사용한다.
+
+```bash
+./build/line_detector_tuner --config config --image test_data/images/line_sample.jpg --mode auto
+./build/line_detector_tuner --config config --image test_data/images/line_sample.jpg --mode light_on_dark --threshold 160
+```
+
+### 색 이름을 직접 지정하는 방식에 대한 판단
+
+`green`, `blue`, `white`, `black` 같은 색 이름을 직접 지정하는 방식은 당장 기본값으로 채택하지 않는다.
+
+이유:
+
+- 현재 detector는 가벼운 grayscale threshold 기반이라 Pi Zero 2W에서 부담이 작다.
+- 경기장 조명, 카메라 auto exposure, 바닥 반사에 따라 같은 색도 HSV/RGB 값이 크게 흔들릴 수 있다.
+- 색 이름 기반 mask는 실제 색상 범위를 정해야 해서 튜닝해야 할 값이 더 늘어난다.
+- 라인 색과 바닥이 명암으로 충분히 분리되면 grayscale polarity 방식이 더 단순하고 빠르다.
+
+다만 경기장에서 “라인과 바닥의 명암 차이는 작고 색상 차이만 큰 상황”이 확인되면 다음 단계에서 HSV 기반 `mode = "color_hsv"`를 추가한다. 이때는 `hue_min`, `hue_max`, `sat_min`, `value_min`을 config로 두고 `line_detector_tuner`로 범위를 맞춘다.
+
+### 향후 실행 중 변경
+
+현재는 command channel이 없으므로 실행 중 line mode를 GCS에서 바꾸지는 않는다. 당장은 실행 전 CLI/config override로 충분히 대응한다. 나중에 command channel이 생기면 다음 debug command를 추가하는 것이 좋다.
+
+```text
+set_line_mode(auto | light_on_dark | dark_on_light | color_hsv)
+set_line_threshold(value)
+set_line_roi(top_ratio, lookahead_ratio)
+```
+
+이 기능은 교차점 판단 전에 넣어도 좋지만, 현재는 detector 안정화가 우선이다.
