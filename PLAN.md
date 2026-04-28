@@ -461,7 +461,7 @@ vflip = false
 rotation = 0
 
 [debug_video]
-enabled = true
+enabled = false
 send_fps = 8
 jpeg_quality = 40
 chunk_pacing_us = 150

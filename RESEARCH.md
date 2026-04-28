@@ -144,6 +144,7 @@ lens_position = 0.67
 exposure = "sport"
 
 [debug_video]
+enabled = false
 send_fps = 8
 chunk_pacing_us = 150
 
