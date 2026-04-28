@@ -1,7 +1,7 @@
 # 라인 트레이싱 정확도 및 관제 영상 프레임 개선 계획
 
 작성일: 2026-04-28
-상태: v3 Pi camera/GCS 캡처 결과 반영. 아직 코드 수정 전 계획.
+상태: v3 Pi camera/GCS 캡처 결과 기반 1차 구현 완료. Raspberry Pi 실기 검증 대기.
 
 ## 1. 현재 진행상황 요약
 
@@ -34,19 +34,44 @@ Pi camera
 | `uav-gcs` | `src/video/JpegFrameReassembler.cpp` | UDP chunk를 JPEG frame으로 재조립 |
 | `uav-gcs` | `src/ui/VideoWindow.cpp` | JPEG decode, overlay drawing, OpenCV window 표시 |
 
-현재 line 기본값:
+현재 line/video 기본값:
 
 ```toml
+[video]
+fps = 12
+jpeg_quality = 45
+send_fps = 10
+chunk_pacing_us = 150
+
 [line]
 mode = "light_on_dark"
 mask_strategy = "local_contrast"
 lookahead_band_ratio = 0.06
 local_contrast_blur = 31
-local_contrast_threshold = 12
+local_contrast_threshold = 10
+morph_open_kernel = 1
+morph_close_kernel = 7
+line_run_merge_gap_px = 16
 confidence_min = 0.25
 process_width = 480
 filter_max_offset_velocity_ratio = 0.08
 ```
+
+## 0. 이번 구현 완료 내용
+
+이번 작업에서는 새 중복 모듈을 만들지 않고 기존 코드에 다음 변경을 흡수했다.
+
+| 영역 | 구현 내용 |
+|---|---|
+| 라인 mask | `morph_open_kernel`, `morph_close_kernel`, `morph_dilate_kernel` 분리 |
+| 라인 중심 계산 | projection run merge gap 추가로 가까운 parallel edge를 하나의 line run으로 결합 |
+| 영상 송신 | `video.send_fps`, `video.chunk_pacing_us` 추가. 기본 12FPS capture / 10FPS send / 150us chunk pacing |
+| onboard 계측 | `video_send_ms`, `video_chunk_count`, `video_chunks_sent`, `video_skipped_frames`, `cpu_temp_c` telemetry 추가 |
+| GCS 수신 | `uav_gcs_vision_debug` video receive thread 분리. UI는 최신 complete JPEG만 표시 |
+| GCS 계측 | UDP packet, malformed packet, completed/incomplete frame, displayed FPS, overwritten latest-frame 통계 표시 |
+| 테스트 | telemetry JSON/parse 테스트 갱신, video reassembler stats 테스트 추가 |
+
+프로토콜 문서는 v1.4로 갱신했다. `protocol_version` integer는 여전히 `1`이며, receiver는 unknown field를 무시한다.
 
 v3 테스트 결론:
 
@@ -398,6 +423,8 @@ chunk_pacing_us = 150
 
 ### 1단계: 계측 강화
 
+상태: 구현 완료. Pi 실기에서 수치 확인 필요.
+
 목표:
 
 - frame drop의 원인이 onboard, network, GCS 중 어디인지 분리한다.
@@ -414,6 +441,8 @@ chunk_pacing_us = 150
 - `video_sent_frames`, `video_dropped_frames`, `completed_frames`, `incomplete_frames`, `display_fps`를 동시에 볼 수 있다.
 
 ### 2단계: 라인 mask 후처리 개선
+
+상태: 1차 구현 완료. GCS screenshot 기반 local smoke test에서는 v3 이미지 모두 detected. 단, screenshot에는 기존 overlay가 섞여 있으므로 Pi raw camera 실기 검증이 필요하다.
 
 목표:
 
@@ -433,6 +462,8 @@ chunk_pacing_us = 150
 - iPad 십자와 L자 contour가 과하게 사라지지 않는다.
 
 ### 3단계: 영상 FPS 개선
+
+상태: 1차 구현 완료. GCS video receive thread 분리, onboard send FPS decimation, chunk pacing 기본값 적용. 실제 complete/display FPS는 Pi와 같은 네트워크에서 검증해야 한다.
 
 목표:
 

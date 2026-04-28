@@ -664,3 +664,66 @@ Raspberry Pi, ArUco와 라인 동시:
 4. tracking point를 조정하려면 `--line-lookahead`를 조정한다.
 5. 흰색 라인은 `--line-mode light_on_dark`, 어두운 라인은 `--line-mode dark_on_light`로 고정해서 비교한다.
 6. 반사광이 심하면 `--line-threshold`와 camera angle을 먼저 튜닝한다.
+
+## 16. v3 테스트 이후 라인 contour 갈라짐, GCS 프레임 드랍, Pi 발열
+
+### 문제 상황
+
+v3 테스트에서는 약 2m 고도에서도 검은 천 위 흰색 라인, 아이패드 격자, 흰색 진열장 테두리처럼 대비가 충분한 대상은 이전보다 잘 잡혔다. 특히 십자 교차와 L자 형태도 connected contour로 유지되는 방향이 확인됐다.
+
+반대로 방 바닥 위 휴지 라인은 여전히 잘 잡히지 않았다. 원인은 휴지 표면과 밝은 목재 바닥의 명도 차이가 작고, 바닥 반사와 카메라 자동 노출 때문에 라인과 배경의 local contrast가 약해지는 것으로 판단한다. 이 실내 테스트는 실제 운동장 흙바닥 대비 조건을 완전히 대표하지 못하므로, 경기장과 비슷한 흙색/무광 배경에서 별도 검증해야 한다.
+
+검은 천 위 흰색 라인은 검출되지만 contour가 내부 edge 중심으로 갈라지거나, 라인 폭 전체가 아니라 한쪽 edge만 얇게 잡히는 경우가 있었다. 또한 latency는 줄었지만 GCS 영상 displayed FPS가 낮아져 관제용 영상이 끊겨 보였고, Pi Zero 2 W 발열이 커졌다.
+
+### 원인 판단
+
+- 라인 갈라짐: local contrast 기반 마스크가 라인 전체 면보다 양쪽 edge를 먼저 잡고, morphology 연결이 부족하면 하나의 라인이 두 줄처럼 분리된다.
+- 원거리/고고도 검출 저하: 10cm 라인이 2m 고도에서 차지하는 픽셀 폭이 작아지고 JPEG 압축, 노출, 렌즈 왜곡 영향이 커진다.
+- GCS 프레임 드랍: onboard latency를 낮추기 위해 낮은 품질/낮은 send FPS로 조정했지만, GCS 쪽에서 UDP 수신과 화면 표시가 같은 흐름에 묶이면 packet drain이 늦어져 incomplete frame이 늘 수 있다.
+- CPU/발열: Pi Zero 2 W에서 camera capture, ArUco, line detection, JPEG packet 송신을 동시에 수행하면 미션 제어 여유가 줄어든다. 영상은 반드시 debug/best-effort 채널로 유지해야 한다.
+
+### 적용한 해결
+
+- 라인 마스크 후처리를 `morph_open_kernel`, `morph_close_kernel`, `morph_dilate_kernel`로 분리했다. 기본값은 작은 open, 큰 close로 잡아 얇은 노이즈는 줄이고 라인 내부 edge가 갈라지는 현상을 줄인다.
+- projection 기반 run merge에 `line_run_merge_gap_px`를 추가했다. 가까운 밝은 run은 하나의 라인 후보로 합치되, 지나치게 먼 외곽 노이즈는 합치지 않는다.
+- onboard debug video는 `fps`, `jpeg_quality`, `send_fps`, `chunk_pacing_us`를 분리했다. 기본값은 12FPS capture, 10FPS send, JPEG quality 45, chunk pacing 150us로 설정했다.
+- onboard telemetry에 `video_send_ms`, `video_chunk_count`, `video_chunks_sent`, `video_skipped_frames`, `cpu_temp_c`를 추가했다.
+- GCS는 UDP 수신을 별도 background thread에서 계속 drain하고, UI는 최신 complete JPEG만 표시하도록 변경했다.
+- GCS reassembler에 `completed`, `incomplete`, `old_packets`, `chunk_mismatch_resets`, `last_chunk_count`, `last_frame_bytes` 통계를 추가했다.
+
+### 검증 방법
+
+로컬에서는 다음 검증을 통과했다.
+
+```powershell
+cmake --build uav-onboard/build
+cmake --build uav-onboard/build-tests
+ctest --test-dir uav-onboard/build-tests --output-on-failure
+cmake --build uav-gcs/build
+cmake --build uav-gcs/build-tests
+ctest --test-dir uav-gcs/build-tests --output-on-failure
+```
+
+OpenCV가 있는 로컬 빌드에서는 `line_detector_tuner`와 `vision_debug_node`도 별도 Release 빌드로 확인했다. 단, v3 이미지 기반 튜너 검증은 GCS overlay가 이미 들어간 screenshot을 사용한 smoke test이므로 실제 raw camera frame 성능을 완전히 대체하지는 않는다.
+
+### Pi 실기 테스트 체크리스트
+
+GCS log에서 다음 항목을 같이 기록한다.
+
+- `latency`, `processing_latency_ms`, `line_latency_ms`
+- `display_fps`, `completed`, `incomplete`, `malformed`, `old_packets`, `mismatch_resets`
+- `video_send_ms`, `video_chunk_count`, `video_skipped_frames`, `video_dropped_frames`
+- `cpu_temp_c`
+
+Pi에서 발열 또는 throttling이 의심되면 다음을 같이 확인한다.
+
+```bash
+vcgencmd measure_temp
+vcgencmd get_throttled
+```
+
+테스트 우선순위는 1) 실제 경기장과 비슷한 흙색 무광 배경, 2) 1.8-2.0m 고도, 3) 흰색 라인과 검정 라인 각각, 4) line-only와 ArUco+line 동시 실행 비교 순서다.
+
+### 추가 판단
+
+Pi Zero 2 W와 Pi Camera만으로 MVP 검증은 가능하지만, ArUco, line tracing, mission 판단, Pixhawk 제어까지 모두 안정적으로 돌리려면 여유가 작다. 실제 비행 단계에서는 GCS 영상 FPS보다 제어 루프와 telemetry 안정성을 우선하고, 필요하면 debug video FPS/quality를 더 낮추거나 line-only 모드로 비행 테스트를 시작한다.
