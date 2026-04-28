@@ -1,8 +1,8 @@
 # Astroquad 트러블슈팅 및 개발 판단 로그
 
-최종 업데이트: 2026-04-27
+최종 업데이트: 2026-04-29
 
-범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석, 해결 방법, 설계 판단을 보고서용 개발로그로 정리한다.
+범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석, 해결 방법, 설계 판단을 보고서용 개발로그로 정리한다. 현재 기본 장치는 Raspberry Pi 4 + IMX519-78이며, Raspberry Pi Zero 2 W 관련 내용은 이전 bring-up 단계의 이력으로 남긴다.
 
 ## 1. GCS가 온보드 telemetry를 수신하지 못함
 
@@ -393,7 +393,7 @@ cmake --build build
 .\build\uav_gcs_vision_debug.exe --config config
 ```
 
-Raspberry Pi:
+Raspberry Pi, metadata-only 기본 실행:
 
 ```bash
 cd ~/astroquad/uav-onboard
@@ -403,13 +403,27 @@ cmake --build build
 ./build/vision_debug_node --config config
 ```
 
-정상 동작 기준:
+이 기본 실행은 onboard 부담을 줄이기 위해 debug video를 켜지 않는다. GCS vision log에는 telemetry가 들어오지만 camera window는 `waiting for video stream...` 상태일 수 있다.
 
-- Pi에서 `discovered GCS video receiver at <laptop-ip>:5600` 출력
+GCS camera window와 overlay까지 확인하려면 Pi 명령에 `--video`를 붙인다.
+
+```bash
+./build/vision_debug_node --config config --video
+```
+
+정상 동작 기준, metadata-only:
+
 - Pi에서 `frame=N markers=M jpeg_bytes=...` 출력
-- GCS에 영상 창 표시
-- ArUco marker가 보이면 GCS 영상 창에 overlay 표시
-- GCS PowerShell console에 marker log 출력
+- Pi startup line에 `video: off`, `telemetry: on` 출력
+- GCS vision log에 증가하는 `frame`, `seq`, line/marker/system/camera log 출력
+- GCS log의 video counters가 `video_sent=0`, `chunks_last=0`, `last_bytes=0`이면 video off 상태로 정상
+
+정상 동작 기준, `--video`:
+
+- Pi에서 `discovering GCS video receiver...` 이후 `discovered GCS video receiver at <laptop-ip>:5600` 또는 fallback 출력
+- GCS에 raw camera 영상 창 표시
+- ArUco marker가 보이면 GCS 영상 창에 GCS-side marker overlay 표시
+- line이 검출되면 GCS 영상 창에 magenta contour와 green tracking point 표시
 
 ## 12. 다음에 비슷한 문제가 생겼을 때 확인할 것
 
@@ -419,9 +433,9 @@ cmake --build build
    - ArUco overlay: `uav_gcs_vision_debug`
 2. Ninja generator 사용 시 실행 파일은 `build/Release/`가 아니라 `build/` 아래에 있다.
 3. Pi camera가 `rpicam-hello --list-cameras`에서 보이는지 확인한다.
-4. Pi에서 `discovered GCS video receiver...`가 출력되는지 확인한다.
+4. Metadata-only 실행이면 Pi에서 discovery가 출력되지 않는 것이 정상이다. `--video`를 켰을 때만 `discovered GCS video receiver...`를 확인한다.
 5. discovery는 되는데 packet이 안 들어오면 Windows Firewall을 확인한다.
-6. 영상이 불안정하면 `config/vision.toml`의 `fps`, `jpeg_quality`, 해상도를 낮춰본다.
+6. 영상이 불안정하면 `config/vision.toml`의 `debug_video.send_fps`, `camera.jpeg_quality`, 해상도를 낮춰본다.
 7. rpicam 내부 오류는 Pi의 `/tmp/astroquad_rpicam_vid.log`를 확인한다.
 8. ArUco overlay가 어긋나면 `camera.frame_seq`와 video `frame_id` 동기화를 먼저 의심한다.
 
@@ -451,7 +465,7 @@ lookahead_y_ratio = 0.70
 
 `lookahead_y_ratio = 0.70`은 green tracking point를 의도적으로 화면 아래쪽 70% 위치에 둔다. 그래서 정상 검출이어도 tracking point가 중앙보다 낮게 보인다.
 
-밝은 바닥 반사 문제는 별도 원인이 있다. 현재 라인 검출은 Raspberry Pi Zero 2 W 부담을 줄이기 위해 grayscale threshold 기반으로 동작한다. 흰색 라인과 밝은 반사광이 비슷한 밝기로 붙으면 OpenCV contour 단계에서 하나의 큰 component처럼 합쳐질 수 있다. 이 경우 line 자체보다 반사광이 magenta contour에 포함된다.
+밝은 바닥 반사 문제는 별도 원인이 있다. 현재 라인 검출은 onboard 부담을 줄이기 위해 grayscale/local-contrast threshold 기반으로 동작한다. 흰색 라인과 밝은 반사광이 비슷한 밝기로 붙으면 OpenCV contour 단계에서 하나의 큰 component처럼 합쳐질 수 있다. 이 경우 line 자체보다 반사광이 magenta contour에 포함된다.
 
 카메라 각도 문제는 설정값과 시야 특성이 겹친 결과다. 기존 ROI가 하단 위주였기 때문에, 카메라를 조금 전방으로 세워 라인이 하단 ROI를 길게 통과할 때 더 잘 잡히는 것처럼 보였다. 최종 주행에서는 카메라 장착 각도를 고정한 뒤 그 각도에서 `roi_top_ratio`와 `lookahead_y_ratio`를 맞추는 것이 중요하다.
 
@@ -686,7 +700,7 @@ Raspberry Pi, ArUco와 라인 동시:
 
 - 라인 마스크 후처리를 `morph_open_kernel`, `morph_close_kernel`, `morph_dilate_kernel`로 분리했다. 기본값은 작은 open, 큰 close로 잡아 얇은 노이즈는 줄이고 라인 내부 edge가 갈라지는 현상을 줄인다.
 - projection 기반 run merge에 `line_run_merge_gap_px`를 추가했다. 가까운 밝은 run은 하나의 라인 후보로 합치되, 지나치게 먼 외곽 노이즈는 합치지 않는다.
-- onboard debug video는 `fps`, `jpeg_quality`, `send_fps`, `chunk_pacing_us`를 분리했다. 기본값은 12FPS capture, 10FPS send, JPEG quality 45, chunk pacing 150us로 설정했다.
+- onboard debug video는 `fps`, `jpeg_quality`, `send_fps`, `chunk_pacing_us`를 분리했다. 현재 기본값은 12FPS capture, debug video 5FPS send, camera JPEG quality 45, chunk pacing 150us다. 다만 `debug_video.enabled = false`라서 `--video`를 켜지 않으면 video worker는 동작하지 않는다.
 - onboard telemetry에 `video_send_ms`, `video_chunk_count`, `video_chunks_sent`, `video_skipped_frames`, `cpu_temp_c`를 추가했다.
 - GCS는 UDP 수신을 별도 background thread에서 계속 drain하고, UI는 최신 complete JPEG만 표시하도록 변경했다.
 - GCS reassembler에 `completed`, `incomplete`, `old_packets`, `chunk_mismatch_resets`, `last_chunk_count`, `last_frame_bytes` 통계를 추가했다.
@@ -710,7 +724,7 @@ OpenCV가 있는 로컬 빌드에서는 `line_detector_tuner`와 `vision_debug_n
 
 GCS log에서 다음 항목을 같이 기록한다.
 
-- `latency`, `processing_latency_ms`, `line_latency_ms`
+- `processing_latency_ms`, `read_frame_ms`, `jpeg_decode_ms`, `aruco_latency_ms`, `line_latency_ms`
 - `display_fps`, `completed`, `incomplete`, `malformed`, `old_packets`, `mismatch_resets`
 - `video_send_ms`, `video_chunk_count`, `video_skipped_frames`, `video_dropped_frames`
 - `cpu_temp_c`
@@ -726,7 +740,7 @@ vcgencmd get_throttled
 
 ### 추가 판단
 
-Pi Zero 2 W와 Pi Camera만으로 MVP 검증은 가능하지만, ArUco, line tracing, mission 판단, Pixhawk 제어까지 모두 안정적으로 돌리려면 여유가 작다. 실제 비행 단계에서는 GCS 영상 FPS보다 제어 루프와 telemetry 안정성을 우선하고, 필요하면 debug video FPS/quality를 더 낮추거나 line-only 모드로 비행 테스트를 시작한다.
+Pi Zero 2 W와 Pi Camera만으로 MVP 검증은 가능하지만, ArUco, line tracing, mission 판단, Pixhawk 제어까지 모두 안정적으로 돌리려면 여유가 작다. 현재 기본 장치는 Pi 4 + IMX519로 바뀌었지만 설계 판단은 그대로다. 실제 비행 단계에서는 GCS 영상 FPS보다 제어 루프와 telemetry 안정성을 우선하고, 필요하면 debug video를 끄거나 line-only 모드로 비행 테스트를 시작한다.
 
 ## 17. Raspberry Pi 4 + IMX519-78 전환 체크
 
@@ -756,3 +770,177 @@ rpicam-vid -t 5000 --nopreview --codec mjpeg --width 640 --height 480 --framerat
 - `RpicamMjpegSource`가 rpicam autofocus/focus/exposure/AWB/denoise/orientation 옵션을 받을 수 있게 확장됐다.
 - telemetry v1.5에 `system.*`, `camera.*`, `debug.capture_fps`, `debug.processing_fps`, `debug.video_send_failures`를 추가했다.
 - GCS는 새 system/camera/debug field를 log window에 표시한다.
+- 현재 성능 우선 기본값은 `camera.width=960`, `camera.height=720`, `camera.fps=12`, `camera.jpeg_quality=45`, `debug_video.enabled=false`, `debug_video.send_fps=5`, `debug_video.chunk_pacing_us=150`이다.
+- GCS video latency/age 표시는 제거했다. GCS camera overlay는 `frame N`만 표시한다.
+
+## 18. GCS 영상 창이 `waiting for video stream...`에 머무르지만 vision log는 계속 갱신됨
+
+### 증상
+
+Windows에서 다음처럼 GCS vision debug를 실행했다.
+
+```powershell
+.\build\uav_gcs_vision_debug.exe --config config
+```
+
+Pi에서는 line tracing telemetry가 정상으로 송신됐다.
+
+```bash
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark
+```
+
+Pi console에는 `frame=N line=yes ... video_sent=0 video_chunks=0`처럼 처리 결과가 계속 출력되고, GCS log window도 frame/line/system/camera telemetry를 받았다. 하지만 GCS camera window는 검은 화면의 `waiting for video stream...` 상태였다.
+
+### 원인
+
+현재 `vision_debug_node` 기본값은 metadata-only다.
+
+```toml
+[debug_video]
+enabled = false
+```
+
+따라서 `--video`를 붙이지 않으면 onboard는 ArUco/line 정보를 telemetry로만 보내고, raw MJPEG debug video는 보내지 않는다. 이때 GCS video receiver는 열려 있어도 받을 video packet이 없으므로 waiting 화면이 정상이다.
+
+확인 신호:
+
+- Pi startup line: `video: off`, `telemetry: on`
+- Pi per-frame log: `video_sent=0`, `video_chunks=0`
+- GCS packet/video log: `video_sent=0`, `chunks_last=0`, `last_bytes=0`
+
+### 해결
+
+영상과 overlay를 실제로 보고 싶을 때만 Pi 명령에 `--video`를 추가한다.
+
+```bash
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark --video
+```
+
+네트워크 discovery가 막히면 GCS IP를 직접 지정한다.
+
+```bash
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark --video --gcs-ip <laptop-ip>
+```
+
+### 설계 판단
+
+이 동작은 버그가 아니라 의도된 기본값이다. 최종 시연에서는 GCS 없이 onboard만 돌릴 수도 있고, mission 판단과 MAVLink 제어가 최우선이다. GCS video는 디버그 관제용이므로 기본값은 꺼 두고 필요할 때만 켠다.
+
+## 19. GCS 영상 latency/age가 음수거나 체감 지연과 맞지 않음
+
+### 증상
+
+GCS camera overlay 또는 log에 표시되던 latency/age가 음수로 나오거나, 양수 20-30ms처럼 표시되는데 실제 체감 지연은 약 500ms 수준이었다.
+
+### 원인
+
+초기 latency 표시는 onboard frame timestamp와 GCS 수신/표시 시각을 단순 비교했다. 하지만 다음 조건 때문에 이 값은 end-to-end video latency로 보기 어렵다.
+
+- Raspberry Pi와 Windows laptop의 wall clock이 정확히 동기화되어 있다고 가정할 수 없다.
+- UDP MJPEG video는 best-effort이며 incomplete frame drop, reassembly, UI paint delay가 섞인다.
+- GCS는 최신 complete JPEG만 표시하므로 실제 사람이 보는 지연은 network packet timing만으로 설명되지 않는다.
+- Debug video는 mission-critical 경로가 아니므로 정확한 latency 계측보다 onboard 처리 시간과 packet health가 더 중요하다.
+
+### 해결
+
+GCS camera overlay와 vision log에서 video latency/age 표시를 제거했다.
+
+현재 표시 정책:
+
+- Camera window overlay: `frame N`만 표시
+- Vision log: onboard 처리 시간인 `processing`, `read`, `decode`, `aruco`, `line`, `json`, `tsend`, `vsubmit`, `vsend`를 표시
+- Video health: `completed`, `incomplete`, `display_fps`, `chunks_last`, `last_bytes`, `video_sent`, `video_skipped`, `video_dropped`, `video_send_failures`로 판단
+
+`config/ui.toml`에는 의도를 남기기 위해 다음 값을 둔다.
+
+```toml
+[video_window]
+show_latency = false
+```
+
+### 설계 판단
+
+현재 프로젝트에서 필요한 것은 정확한 관제 영상 latency 숫자가 아니라, onboard vision/control loop가 제때 돌고 있는지와 debug video가 관찰 가능한 수준인지다. 정확한 video latency가 필요해지는 경우에는 NTP/PTP 수준 clock sync 또는 GCS에서 송수신 round-trip 측정용 별도 protocol을 설계해야 한다.
+
+## 20. IMX519 화질을 높여도 ArUco 인식 개선 대비 onboard 부담이 큼
+
+### 증상
+
+IMX519 영상이 GCS 화면에서 뿌옇게 보이고 ArUco marker 인식이 불안정해 보여, capture 해상도와 JPEG quality를 올리는 실험을 했다.
+
+실험 방향:
+
+- `camera.width/height`를 `1280x960`까지 올림
+- `camera.jpeg_quality`를 `85-90` 수준까지 올림
+- ArUco bench tuning용 CLI override 추가
+
+```bash
+./build/vision_debug_node --config config --aruco-only --video --camera-quality 90 --lens-position 1.0
+```
+
+### 관찰
+
+GCS 영상의 JPEG artifact는 줄어들 수 있지만, 대회 조건에서는 ArUco marker가 50cm x 50cm이고 고도는 약 2m로 예상된다. 이 조건에서는 marker pixel 크기가 충분할 가능성이 높고, 고화질 video가 mission 성능을 결정하는 병목이라고 보기 어렵다.
+
+반대로 고화질 설정은 다음 부담을 키운다.
+
+- rpicam MJPEG frame 크기 증가
+- onboard JPEG decode 시간 증가
+- ArUco/line detector 입력 픽셀 증가
+- optional debug video UDP chunk 수 증가
+- Wi-Fi packet loss 가능성 증가
+- 추후 mission logic/MAVLink control loop 여유 감소
+
+### 해결
+
+기본값을 성능 우선 설정으로 되돌렸다.
+
+```toml
+[camera]
+width = 960
+height = 720
+fps = 12
+jpeg_quality = 45
+
+[debug_video]
+enabled = false
+send_fps = 5
+jpeg_quality = 40
+chunk_pacing_us = 150
+```
+
+Bench tuning이 필요할 때만 CLI override를 쓴다.
+
+```bash
+./build/vision_debug_node --config config --aruco-only --camera-quality 90 --lens-position 1.0
+./build/vision_debug_node --config config --aruco-only --video --camera-width 1280 --camera-height 960 --camera-quality 85
+```
+
+### 설계 판단
+
+현재 단계에서는 화질보다 onboard 처리 여유가 더 중요하다. ArUco가 실제 50cm marker/2m 조건에서 충분히 잡히는지 확인한 뒤, 정말 부족할 때만 해상도나 JPEG quality를 올린다. 기본값은 line tracing, ArUco, 추후 mission 판단, MAVLink 제어를 같이 얹을 수 있는 보수적 설정으로 유지한다.
+
+## 21. Metadata-only 실행에서도 GCS discovery 때문에 startup이 3초 늦어짐
+
+### 증상
+
+이전 구현에서는 `vision_debug_node`를 telemetry-only로 돌려도 GCS video discovery beacon을 최대 3초 기다리는 흐름이 있었다. 최종 운용에서 video를 끄고 onboard만 빠르게 띄우는 경우에는 불필요한 대기였다.
+
+### 원인
+
+GCS discovery는 video destination IP/port를 찾기 위한 기능이다. 하지만 debug video가 꺼진 상태에서도 broadcast address이면 discovery를 시도하면, 실제로 보낼 video가 없는데 startup만 늦어진다.
+
+### 해결
+
+`vision_debug_node`에서 `send_video`가 true일 때만 GCS discovery를 수행하도록 변경했다.
+
+현재 동작:
+
+- 기본 `./build/vision_debug_node --config config`: `debug_video.enabled=false`이므로 discovery 대기 없음
+- `--no-video`: discovery 대기 없음
+- `--video`: broadcast/default GCS IP일 때 discovery를 최대 3초 수행
+- `--video --gcs-ip <laptop-ip>`: 명시 IP가 있으므로 discovery 없이 바로 전송
+
+### 설계 판단
+
+Metadata-only 실행은 향후 mission run에 가장 가까운 형태다. 영상 관제 기능이 꺼져 있을 때는 startup과 처리 경로를 최대한 단순하게 유지한다.
