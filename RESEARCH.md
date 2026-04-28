@@ -6,7 +6,7 @@
 
 ## 1. 현재 목표
 
-Astroquad는 Raspberry Pi Zero 2 W onboard와 노트북 GCS를 나누어, 라인 기반 격자 경기장에서 UAV가 임무를 수행하도록 만드는 C++ 프로젝트다.
+Astroquad는 Raspberry Pi 4 + IMX519-78 onboard와 노트북 GCS를 나누어, 라인 기반 격자 경기장에서 UAV가 임무를 수행하도록 만드는 C++ 프로젝트다. 기존 Raspberry Pi Zero 2 W + ZeroCam 계열 설계 원칙은 유지하되, 현재 1차 전환 대상은 Pi 4 + IMX519-78이다.
 
 현재까지 구현/개선된 영역:
 
@@ -22,6 +22,8 @@ Astroquad는 Raspberry Pi Zero 2 W onboard와 노트북 GCS를 나누어, 라인
 - GCS video receive thread 분리
 - video frame drop/FPS/chunk 계측 강화
 - Pi CPU temperature telemetry
+- Pi 4 + IMX519-78 camera/rpicam config 확장
+- onboard system/camera/focus/exposure telemetry
 
 아직 남은 핵심 기능:
 
@@ -49,7 +51,7 @@ astroquad/
 |---|---|
 | `development-log` | 리서치, 구현 계획, 트러블슈팅 기록 |
 | `uav-gcs` | 노트북 GCS, telemetry/video 수신, overlay, log window |
-| `uav-onboard` | Raspberry Pi runtime, camera, onboard vision, telemetry/video 송신 |
+| `uav-onboard` | Raspberry Pi 4 runtime, IMX519 camera, onboard vision, telemetry/video 송신 |
 
 ## 3. 전체 아키텍처
 
@@ -73,7 +75,7 @@ Pi camera
 - 실제 임무 판단과 제어에 필요한 값은 onboard에서 계산한다.
 - GCS video/overlay/log는 관찰용 best-effort debug channel이다.
 - debug video가 밀리면 오래된 frame을 버리고 mission-critical vision loop를 막지 않는다.
-- protocol 문서는 v1.4이며, JSON top-level `protocol_version` integer는 여전히 `1`이다.
+- protocol 문서는 v1.5이며, JSON top-level `protocol_version` integer는 여전히 `1`이다.
 
 ## 4. `uav-onboard` 최신 구조와 역할
 
@@ -129,6 +131,20 @@ height = 480
 fps = 12
 jpeg_quality = 45
 send_fps = 10
+chunk_pacing_us = 150
+
+[camera]
+sensor_model = "imx519"
+width = 960
+height = 720
+fps = 12
+jpeg_quality = 45
+autofocus_mode = "manual"
+lens_position = 0.67
+exposure = "sport"
+
+[debug_video]
+send_fps = 8
 chunk_pacing_us = 150
 
 [line]
@@ -225,7 +241,7 @@ uav-gcs/
 - video receiver 통계 추가: packets, malformed, completed, incomplete, old packets, mismatch resets, last chunk count, last frame bytes
 - displayed FPS 표시 추가
 
-## 6. Protocol v1.4 상태
+## 6. Protocol v1.5 상태
 
 문서:
 
@@ -241,6 +257,8 @@ uav-gcs/
 | `debug.video_skipped_frames` | video send FPS 제한 때문에 의도적으로 video 송신을 생략한 frame 수 |
 | `debug.video_chunks_sent` | onboard가 보낸 누적 UDP video chunk 수 |
 | `debug.video_chunk_count` | 최근 video frame의 chunk 수 |
+| `system.*` | board model, OS, uptime, throttling, load, memory, Wi-Fi 상태 |
+| `camera.*` | IMX519 sensor/configured FPS/measured FPS/focus/exposure 설정 |
 
 기존 주요 fields:
 
@@ -343,7 +361,7 @@ GCS screenshot 기반 v3 smoke 결과:
 - chunk pacing은 packet loss를 줄일 수 있지만 send time을 늘릴 수 있으므로 현장 수치 확인 필요
 - `v3_line1` 같은 마루+휴지 hard case는 실제 경기장 대표 조건이 아닐 수 있음
 - `morph_close_kernel = 7`은 라인 edge 갈라짐을 줄이지만 강한 반사 환경에서는 false positive를 키울 수 있음
-- Pi Zero 2 W 발열이 이미 심하므로 fan/heatsink와 `cpu_temp_c`, `vcgencmd get_throttled` 확인이 필요
+- Pi 4도 고해상도 IMX519 + ArUco + line + debug video를 동시에 장시간 켜면 발열/전원 문제가 생길 수 있으므로 fan/heatsink와 `cpu_temp_c`, `vcgencmd get_throttled` 확인이 필요
 - ArUco + line + video를 모두 항상 켜면 실제 mission logic과 Pixhawk 제어까지 얹었을 때 여유가 작을 수 있음
 
 ## 10. 추천 다음 단계

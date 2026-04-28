@@ -1,7 +1,7 @@
 # Raspberry Pi 4 + IMX519-78 전환 계획
 
 작성일: 2026-04-28
-상태: 계획 수립만 완료. 아직 코드 수정 없음.
+상태: 1차 구현 진행. Pi 4 + IMX519 camera config, rpicam option, system/camera telemetry, GCS log/parser 확장 적용.
 
 ## 1. 이번 계획의 범위
 
@@ -72,7 +72,7 @@ Pi camera
 
 | 파일 | 현재 역할 |
 |---|---|
-| `RESEARCH.md` | 최신 구현 상태, 구조, protocol v1.4, 테스트 결과, 남은 리스크 요약 |
+| `RESEARCH.md` | 최신 구현 상태, 구조, protocol v1.5, 테스트 결과, 남은 리스크 요약 |
 | `PLAN.md` | 이번 Raspberry Pi 4 + IMX519-78 전환 계획. 기존 완료 계획을 대체 |
 | `TROUBLESHOOTING.md` | telemetry 수신 실패, OpenCV/Win32 fallback, rpicam stdout, GCS discovery, firewall, line/video/frame drop/thermal 이슈 기록 |
 
@@ -98,7 +98,7 @@ uav-onboard/
 | 파일 | 역할 |
 |---|---|
 | `CMakeLists.txt` | C++17, nlohmann/json, toml++, OpenCV optional targets, onboard libraries/tools/tests 구성 |
-| `PROJECT_SPEC.md` | 온보드 최종 목표 문서. 현재 hardware 항목은 Pi Zero 2 W 기준이라 Pi 4로 갱신 필요 |
+| `PROJECT_SPEC.md` | 온보드 최종 목표 문서. 현재 hardware 항목은 Pi 4 + IMX519-78 기준으로 갱신됨 |
 | `README.md` | Pi build, rpicam camera bring-up, video streaming, vision debug, telemetry 실행 안내 |
 
 ### 4.2 `config/`
@@ -115,7 +115,7 @@ uav-onboard/
 
 | 파일 | 역할 |
 |---|---|
-| `PROTOCOL.md` | onboard-GCS protocol v1.4. telemetry JSON, UDP MJPEG chunk header, GCS discovery beacon, reserved command channel 명세 |
+| `PROTOCOL.md` | onboard-GCS protocol v1.5. telemetry JSON, system/camera debug fields, UDP MJPEG chunk header, GCS discovery beacon, reserved command channel 명세 |
 
 `uav-onboard/docs/PROTOCOL.md`와 `uav-gcs/docs/PROTOCOL.md`는 동일하게 유지해야 한다.
 
@@ -292,7 +292,7 @@ uav-gcs/
 
 | 파일 | 역할 |
 |---|---|
-| `PROTOCOL.md` | onboard와 동일한 protocol v1.4 문서 |
+| `PROTOCOL.md` | onboard와 동일한 protocol v1.5 문서 |
 
 ### 5.4 `src/common/`, `src/network/`
 

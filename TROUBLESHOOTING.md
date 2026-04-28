@@ -727,3 +727,32 @@ vcgencmd get_throttled
 ### 추가 판단
 
 Pi Zero 2 W와 Pi Camera만으로 MVP 검증은 가능하지만, ArUco, line tracing, mission 판단, Pixhawk 제어까지 모두 안정적으로 돌리려면 여유가 작다. 실제 비행 단계에서는 GCS 영상 FPS보다 제어 루프와 telemetry 안정성을 우선하고, 필요하면 debug video FPS/quality를 더 낮추거나 line-only 모드로 비행 테스트를 시작한다.
+
+## 17. Raspberry Pi 4 + IMX519-78 전환 체크
+
+### 증상
+
+Pi 4로 교체한 뒤 카메라가 보이지 않거나, `vision_debug_node`가 `failed to start rpicam-vid` 또는 frame read 실패로 종료될 수 있다.
+
+### 우선 확인
+
+```bash
+rpicam-hello --version
+rpicam-hello --list-cameras
+rpicam-still -t 1000 --nopreview -o test_data/images/imx519_smoke.jpg
+rpicam-vid -t 5000 --nopreview --codec mjpeg --width 640 --height 480 --framerate 12 -o /tmp/imx519_test.mjpeg
+```
+
+### 판단
+
+- `rpicam-hello --list-cameras`에 IMX519가 없으면 Astroquad 코드 문제가 아니라 OS/kernel/rpicam/IMX519 driver 또는 CSI cable 문제부터 확인한다.
+- IMX519-78은 autofocus camera이므로 `autofocus_mode`, `lens_position`, `exposure` 설정이 line confidence에 직접 영향을 준다.
+- 실제 미션에서는 continuous autofocus가 focus hunting을 만들 수 있으므로, `manual + lens_position`과 `auto`를 실제 고도에서 비교한다.
+- Pi 4에서도 debug video는 best-effort다. GCS 영상이 끊겨도 onboard line/marker telemetry와 추후 MAVLink control loop가 우선이다.
+
+### 적용된 1차 대응
+
+- `config/vision.toml`에 Pi 4 + IMX519용 `[camera]` 설정을 추가했다.
+- `RpicamMjpegSource`가 rpicam autofocus/focus/exposure/AWB/denoise/orientation 옵션을 받을 수 있게 확장됐다.
+- telemetry v1.5에 `system.*`, `camera.*`, `debug.capture_fps`, `debug.processing_fps`, `debug.video_send_failures`를 추가했다.
+- GCS는 새 system/camera/debug field를 log window에 표시한다.
