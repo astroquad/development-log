@@ -665,11 +665,11 @@ Raspberry Pi, ArUco와 라인 동시:
 5. 흰색 라인은 `--line-mode light_on_dark`, 어두운 라인은 `--line-mode dark_on_light`로 고정해서 비교한다.
 6. 반사광이 심하면 `--line-threshold`와 camera angle을 먼저 튜닝한다.
 
-## 16. v3 테스트 이후 라인 contour 갈라짐, GCS 프레임 드랍, Pi 발열
+## 16. 1.3 테스트 이후 라인 contour 갈라짐, GCS 프레임 드랍, Pi 발열
 
 ### 문제 상황
 
-v3 테스트에서는 약 2m 고도에서도 검은 천 위 흰색 라인, 아이패드 격자, 흰색 진열장 테두리처럼 대비가 충분한 대상은 이전보다 잘 잡혔다. 특히 십자 교차와 L자 형태도 connected contour로 유지되는 방향이 확인됐다.
+1.3 테스트에서는 약 2m 고도에서도 검은 천 위 흰색 라인, 아이패드 격자, 흰색 진열장 테두리처럼 대비가 충분한 대상은 이전보다 잘 잡혔다. 특히 십자 교차와 L자 형태도 connected contour로 유지되는 방향이 확인됐다.
 
 반대로 방 바닥 위 휴지 라인은 여전히 잘 잡히지 않았다. 원인은 휴지 표면과 밝은 목재 바닥의 명도 차이가 작고, 바닥 반사와 카메라 자동 노출 때문에 라인과 배경의 local contrast가 약해지는 것으로 판단한다. 이 실내 테스트는 실제 운동장 흙바닥 대비 조건을 완전히 대표하지 못하므로, 경기장과 비슷한 흙색/무광 배경에서 별도 검증해야 한다.
 
@@ -704,7 +704,7 @@ cmake --build uav-gcs/build-tests
 ctest --test-dir uav-gcs/build-tests --output-on-failure
 ```
 
-OpenCV가 있는 로컬 빌드에서는 `line_detector_tuner`와 `vision_debug_node`도 별도 Release 빌드로 확인했다. 단, v3 이미지 기반 튜너 검증은 GCS overlay가 이미 들어간 screenshot을 사용한 smoke test이므로 실제 raw camera frame 성능을 완전히 대체하지는 않는다.
+OpenCV가 있는 로컬 빌드에서는 `line_detector_tuner`와 `vision_debug_node`도 별도 Release 빌드로 확인했다. 단, 1.3 이미지 기반 튜너 검증은 GCS overlay가 이미 들어간 screenshot을 사용한 smoke test이므로 실제 raw camera frame 성능을 완전히 대체하지는 않는다.
 
 ### Pi 실기 테스트 체크리스트
 

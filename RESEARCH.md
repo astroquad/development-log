@@ -344,7 +344,7 @@ cmake -S uav-onboard -B uav-onboard/build-opencv-local -DCMAKE_BUILD_TYPE=Releas
 cmake --build uav-onboard/build-opencv-local --target line_detector_tuner vision_debug_node
 ```
 
-GCS screenshot 기반 v3 smoke 결과:
+GCS screenshot 기반 1.3 smoke 결과:
 
 | 이미지 | 결과 | 비고 |
 |---|---|---|
