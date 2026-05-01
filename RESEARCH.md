@@ -272,16 +272,20 @@ send_height = 0
 [line]
 enabled = true
 mode = "light_on_dark"
-mask_strategy = "local_contrast"
+mask_strategy = "white_fill"
 roi_top_ratio = 0.08
 lookahead_y_ratio = 0.55
 lookahead_band_ratio = 0.06
 local_contrast_blur = 31
 local_contrast_threshold = 10
+white_v_min = 145
+white_s_max = 90
 min_area_px = 250
 morph_open_kernel = 1
 morph_close_kernel = 7
 morph_dilate_kernel = 1
+fill_close_kernel = 11
+fill_dilate_kernel = 3
 line_run_merge_gap_px = 16
 max_contour_points = 48
 confidence_min = 0.25
@@ -331,6 +335,7 @@ marker_size_mm = 80.0
 - Debug video 송신은 detector frame loop와 분리되어 `5FPS`로 decimation되고 `150us` chunk pacing을 적용한다.
 - 디버깅 중 GCS 화면이 답답하면 `vision_debug_node --video --fps 12`처럼 송신 FPS만 올릴 수 있다. `--fps`는 camera capture FPS가 아니라 GCS debug video send FPS다.
 - Line/intersection 처리는 원본 960x720 전체가 아니라 ROI를 `line.process_width = 480`으로 줄인 work image에서 수행한다.
+- `line.mask_strategy = "white_fill"`은 넓은 흰색 line을 얇은 edge strip이 아니라 채워진 blob으로 잡기 위한 현재 기본값이다. `local_contrast`는 밝기 변화 비교 실험용으로 계속 사용할 수 있다.
 - `intersection_threshold = 0.8`은 front/right/back/left branch ray가 present로 판정되기 위한 기본 score threshold다.
 - `intersection_decision.min_branch_score = 0.72`는 decision layer의 branch evidence 기준이다. 단, `+` 채택은 4방향 모두 `high_confidence_score = 0.85`를 넘어야 하므로 `T -> +` false upgrade를 억제한다.
 - `cruise_window_frames = 6`은 12FPS 기준 약 0.5초 window다. 교차점마다 장시간 정지하지 않고 `L`/`T`/`+`를 node event로 기록하는 것이 목적이다.
@@ -577,11 +582,11 @@ ArUco만 bench tuning:
 최근 작업 기준으로 확인된 검증:
 
 - Windows local `uav-gcs` Release build 성공.
-- Windows local `uav-gcs` tests 통과: `telemetry_line_parse`, `video_reassembler`, `line_overlay`, `intersection_overlay`.
+- Windows local `uav-gcs` tests 통과: `telemetry_line_parse`, `video_reassembler`, `line_overlay`, `intersection_overlay`, `grid_map_tracker`.
 - Local OpenCV build에서 onboard vision tools target build 성공. `vision_debug_node`까지 build 확인.
 - Onboard 기본 tests 통과: `telemetry_line_json`, `line_stabilizer`, `intersection_stabilizer`, `intersection_decision`.
 - Onboard OpenCV tests 통과: `telemetry_line_json`, `line_stabilizer`, `intersection_stabilizer`, `intersection_decision`, `intersection_detector`.
-- GCS parser/overlay tests는 `vision.intersection_decision`과 `vision.grid_node` parse, green decision overlay label까지 포함한다.
+- GCS parser/overlay tests는 `vision.intersection_decision`과 `vision.grid_node` parse, line/intersection overlay primitive, live grid map 누적 렌더링까지 포함한다.
 - Onboard telemetry JSON test는 `vision.intersection_decision`, `vision.grid_node`, `debug.intersection_decision_latency_ms` serialization을 포함한다.
 - `uav-onboard/docs/PROTOCOL.md`와 `uav-gcs/docs/PROTOCOL.md` hash 동일성 확인 완료.
 - `vision_debug_node --help`에서 `--fps` option 노출 확인.
@@ -596,6 +601,9 @@ ArUco만 bench tuning:
 - 끝점 진입 이미지 `edge_entry_rotated_centered`: grid `7 x 6`, entry column `0`, section crop `42/42` event 저장 및 `42/42` expected type 일치, full-field snake 좌표 `42/42` 일치, entry-start snake 좌표 `42/42` 일치.
 - 회전 snake smoke에서는 가장자리 노드가 이미지 경계에서 잘리며 화면 중심에서 밀리는 문제를 피하기 위해 고정 크기 중심 crop을 만들고 이미지 밖은 어두운 배경으로 padding한다. 이는 실제 카메라가 노드를 화면 중심에 둔 상태로 yaw만 회전하는 상황에 더 가깝다.
 - Smoke 과정에서 약한 네 번째 branch가 edge `T`를 `+`로 올리는 false upgrade가 확인되어 `+` 채택 조건을 4방향 모두 `high_confidence_score` 이상으로 강화했다.
+- 2026-05-01 추가 vision/grid smoke에서 사용자 제공 4개 라인 캡처 모두 `white_fill` mask로 검출 성공. 산출물은 `uav-gcs/logs/20260501-214828-vision-grid-smoke/line_screenshots/`에 저장되며, `logs/*`는 `.gitignore`로 추적 제외된다.
+- 같은 smoke에서 연습용 격자 이미지는 `7 x 6`, bottom entry, `entry_col=0`, `entry_row=5`로 검출되었고 `snake_from_entry` node `42/42`, section topology `42/42`가 모두 통과했다. 단계별 crop과 ASCII grid log는 `uav-gcs/logs/20260501-214828-vision-grid-smoke/grid_snake/` 아래에 저장된다.
+- 커밋 전 검증 기준 명령: `ctest --test-dir uav-gcs/build-tests --output-on-failure`, `ctest --test-dir uav-onboard/build-opencv-tests --output-on-failure`(Windows에서는 OpenCV DLL 경로로 `C:\msys64\ucrt64\bin`을 `PATH`에 추가).
 
 문서 최신화 중 확인한 불일치:
 
@@ -605,9 +613,11 @@ ArUco만 bench tuning:
 
 사용자가 GCS에서 캡처한 교차점 테스트 이미지는 어두운 배경 위의 밝은 선과 상대적으로 밝은 나무/흙색 배경 위의 밝은 선을 모두 포함한다. 관찰 결과는 다음과 같다.
 
+이 절의 원인 분석은 `local_contrast`가 기본이던 시점의 관찰이다. 2026-05-01 작업 이후 현재 기본값은 `white_fill`이며, 넓은 흰색 라인을 edge strip이 아니라 채워진 blob으로 잡도록 `white_v_min`, `white_s_max`, `fill_close_kernel`, `fill_dilate_kernel`을 추가했다. `local_contrast`는 비교 실험용 fallback으로 유지한다.
+
 ### 12.1 어두운 배경에서 더 잘 되는 이유
 
-- 현재 `line.mode = light_on_dark`, `mask_strategy = local_contrast` 조합은 밝은 선이 어두운 배경 위에 있을 때 foreground recall이 높다.
+- 당시 `line.mode = light_on_dark`, `mask_strategy = local_contrast` 조합은 밝은 선이 어두운 배경 위에 있을 때 foreground recall이 높았다.
 - 어두운 천/그림자 배경에서는 선 내부와 배경의 local contrast가 커서 ray scoring의 front/right/back/left hit가 길게 이어진다.
 - 밝은 나무/흙색 배경에서는 선과 배경의 명도 차가 작고, 조명 gradient/JPEG block/바닥 무늬가 선과 비슷한 local contrast fragment를 만든다. 이때 branch ray score는 일부 방향만 높거나 center density가 낮아져 `unknown`이 자주 나온다.
 - 같은 흰색 선이라도 배경이 밝으면 threshold mask가 선 내부 전체를 채우기보다 선 가장자리나 반쪽 폭만 foreground로 남기 쉽다.
@@ -655,7 +665,7 @@ ArUco만 bench tuning:
 
 ### 12.6 지금 당장 의미 있는 개선 후보
 
-코드를 바로 바꾸기 전, 다음 실험이 우선이다.
+당시 기준의 개선 후보는 다음과 같았다. 이 중 넓은 흰색 선 fill 보강은 2026-05-01 `white_fill` 기본값으로 반영되었다.
 
 1. 밝은 배경에서 `line.process_width = 320`, `local_contrast_blur = 21~25`, `morph_close_kernel = 5~7` 조합을 비교한다. 넓은 선 내부가 edge만 남는지, branch score가 threshold 주변에서 덜 흔들리는지 본다.
 2. `intersection_threshold = 0.8`은 현재 캡처 기준으로 다소 빡빡하다. `0.70~0.75` 후보를 테스트해 `+`/`T` 누락이 줄어드는지 확인하되, 바닥 무늬 false positive가 늘어나는지도 같이 본다.
@@ -664,12 +674,15 @@ ArUco만 bench tuning:
 5. 2순위는 branch present 판정을 단일 threshold가 아니라 hysteresis/temporal branch EMA로 바꾸는 것이다. 현재 type stabilizer는 최종 type을 안정화하지만 branch 하나가 threshold 주변에서 깜빡이는 근본 원인은 남아 있다.
 6. 3순위는 넓은 테이프/휴지 선을 위해 local contrast mask 이후 fill/close를 선 폭 기준으로 보강하거나, distance transform/skeleton 보조 feature를 붙이는 것이다.
 
-## 13. 2026-05-01 Decision/Grid 구현 결과
+## 13. 2026-05-01 Decision/Grid 및 Vision/Grid smoke 구현 결과
 
 `PLAN.md`의 다음 단계 작업은 detector를 크게 바꾸지 않고, `IntersectionDetector`/`IntersectionStabilizer` 위에 얇은 mission/debug decision layer를 얹는 방향으로 진행했다.
 
 구현된 것:
 
+- `LineMaskBuilder`의 현재 기본 전략은 `white_fill`이다. HSV low-saturation/high-value 조건으로 흰색 라인을 검출하고 close/dilate로 넓은 선 내부를 채워, 사용자 캡처처럼 두꺼운 흰색 라인이 얇은 edge만 남는 문제를 줄였다.
+- `LineDetector`는 전체 contour centroid 대신 anchor/lookahead band의 X projection을 사용한다. L 교차점의 가로 branch가 라인 추적 중심을 끌어당기는 영향을 줄이기 위한 변경이다.
+- `line_detector_tuner`는 `--output`을 받아 `mask_0.png`, `line_overlay.png`, `summary.txt`를 저장하고, `--white-v-min`, `--white-s-max`, `--fill-close`, `--fill-dilate`로 `white_fill` 튜닝값을 재현할 수 있다.
 - `IntersectionDecisionEngine`은 최근 frame queue에서 branch evidence를 누적한다.
 - `+ > T > L > straight > unknown` 우선순위는 적용하되, 단일 frame의 상위 타입 튐을 바로 채택하지 않는다.
 - `+`는 4방향 branch가 모두 `high_confidence_score` 이상일 때만 채택한다. 이는 연습용 edge 이미지에서 확인된 `T -> +` false upgrade를 막기 위한 보수적 guard다.
@@ -682,8 +695,10 @@ ArUco만 bench tuning:
 GCS 반영:
 
 - `vision.intersection_decision`과 `vision.grid_node`를 parser/store/log/overlay가 처리한다.
-- Vision log에는 `[intersection-decision]`과 `[grid-node]`가 표시된다.
-- Intersection overlay에는 `DEC T node (x,y)` 형태의 compact label이 추가된다.
+- Vision log에는 `[intersection-decision]`, `[grid-node]`, `[grid-map]`이 표시된다.
+- `GridMapTracker`는 `vision.grid_node` telemetry를 받아 방문 좌표, 현재 heading marker, 인접 edge를 ASCII grid로 누적 렌더링한다. 처음에는 entry line과 `(0,0)` 주변만 보이고, 새 node가 저장될 때마다 동적으로 확장된다.
+- Line overlay는 magenta contour와 camera-center Y에 고정된 red line-center point, 그리고 camera center에서 line-center point까지의 green horizontal offset line만 기본 표시한다.
+- Intersection overlay는 화면 상단/현재 접근 영역의 교차점 branch 방향만 compact하게 보여준다. branch score text와 긴 decision label은 live overlay에서 제거하고 log에 남긴다.
 
 Smoke 산출물:
 
@@ -691,6 +706,8 @@ Smoke 산출물:
 - `development-log/grid-smoke-20260501/edge_entry_rotated_centered/`
 
 이 산출물에는 `sections.csv`, `snake_full_field.csv`, `snake_from_entry.csv`, `sections/` crop PNG, `snake_full_field_zoom/` 확대 이동 crop PNG, `snake_from_entry_zoom/` 확대 이동 crop PNG가 포함된다. Snake crop은 현재 이동 구간의 camera heading에 맞춰 회전되어, 드론이 yaw를 바꾼 뒤 항상 정면으로 이동하는 운용 가정을 반영한다. 두 이미지 모두 구간별 교차점 판단과 회전 snake 방식 좌표 저장이 최종 smoke 기준으로 통과했다.
+
+추가로 `uav-gcs/logs/20260501-214828-vision-grid-smoke/`에는 이번 작업의 실제 검증 산출물이 저장되었다. 라인 캡처 4장은 모두 검출되었고, 연습용 격자 이미지는 bottom entry 기준 `7 x 6` 전체 `42/42` node와 `42/42` topology 검증을 통과했다. 최종 grid log는 `grid_snake/snake_from_entry_grid_log/step_041_r0_c6_heading_north.txt`이다. 이 폴더는 재현/디버깅용 로컬 산출물이며 git에는 추적하지 않는다.
 
 중요한 해석:
 
@@ -706,7 +723,8 @@ Smoke 산출물:
 
 - Mission/MAVLink/control loop가 아직 없으므로 실제 비행 판단/제어는 구현 전이다.
 - 교차점 decision layer는 구현되었지만 실제 드론 이동 속도에서는 0.5초 window 동안 이동 거리가 생긴다. 속도/FPS/고도 기준으로 window frame 수와 turn zone을 보정해야 한다.
-- 밝은 배경, 넓은 선, threshold 주변 branch score, 회전된 격자에서 detector raw `unknown`/type downgrade는 여전히 남을 수 있다.
+- 밝은 배경과 넓은 흰색 선 검출은 `white_fill`로 크게 개선되었지만, 실제 조명/노출이 달라지면 `white_v_min`, `white_s_max`, fill morphology를 다시 보정해야 한다.
+- threshold 주변 branch score와 회전된 격자에서 detector raw `unknown`/type downgrade는 여전히 남을 수 있다.
 - Local grid coordinate는 저장되지만 official competition origin/axis 변환은 아직 구현되지 않았다.
 - Full snake search policy는 아직 구현되지 않았다. 현재 snake 검증은 camera heading 회전을 반영한 smoke tool의 가정 경로를 tracker에 먹인 것이다.
 - IMX519 focus/exposure는 실제 고도, 속도, 조명에서 다시 calibration해야 한다.
