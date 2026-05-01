@@ -1,6 +1,6 @@
 # Astroquad 트러블슈팅 및 개발 판단 로그
 
-최종 업데이트: 2026-04-29
+최종 업데이트: 2026-05-02
 
 범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석, 해결 방법, 설계 판단을 보고서용 개발로그로 정리한다. 현재 기본 장치는 Raspberry Pi 4 + IMX519-78이며, Raspberry Pi Zero 2 W 관련 내용은 이전 bring-up 단계의 이력으로 남긴다.
 
@@ -944,3 +944,248 @@ GCS discovery는 video destination IP/port를 찾기 위한 기능이다. 하지
 ### 설계 판단
 
 Metadata-only 실행은 향후 mission run에 가장 가까운 형태다. 영상 관제 기능이 꺼져 있을 때는 startup과 처리 경로를 최대한 단순하게 유지한다.
+
+## 22. 넓은 흰색 라인이 얇은 edge만 잡히고 교차점 판단이 흔들림
+
+### 문제 상황
+
+사용자가 제시한 GCS 캡처에서는 굵은 흰색 라인 전체가 magenta overlay로 감싸지지 않고, 한쪽 edge 또는 얇은 strip만 라인으로 잡히는 경향이 있었다. 특히 밝은 목재/흙색 배경에서는 `straight`, `T`, `+`가 `unknown`이나 `L`로 흔들렸다.
+
+### 원인
+
+당시 기본 마스크는 `local_contrast`였다. 이 방식은 배경 대비가 큰 어두운 천 위에서는 잘 동작하지만, 넓은 흰색 테이프/종이처럼 선 내부가 균일하고 배경도 밝은 경우에는 내부 면 전체보다 양쪽 경계 contrast를 더 강하게 잡는다.
+
+그 결과:
+
+- line contour가 실제 선 폭 전체가 아니라 edge 위주로 형성된다.
+- intersection center 후보가 실제 교차점 중심이 아니라 한 branch 쪽으로 밀린다.
+- 4방향 ray score 중 일부 branch가 threshold 주변에서 깜빡인다.
+- `+ -> T`, `T -> L`, `straight -> unknown`처럼 branch 누락형 오분류가 생긴다.
+
+### 해결
+
+`LineMaskBuilder`에 `white_fill` 전략을 추가하고 기본값으로 전환했다.
+
+```toml
+[line]
+mask_strategy = "white_fill"
+white_v_min = 145
+white_s_max = 90
+fill_close_kernel = 11
+fill_dilate_kernel = 3
+```
+
+이 전략은 HSV 기준으로 낮은 saturation, 높은 value 영역을 흰색 라인 후보로 잡고 close/dilate morphology로 내부를 채운다. `local_contrast`는 조명 비교 실험용 fallback으로 남겨 두었다.
+
+또한 `LineDetector`는 전체 contour centroid가 아니라 하단 anchor/lookahead band의 X projection으로 tracking X를 계산하도록 바꿨다. L/T 교차점의 가로 branch가 라인 중심을 끌어당기는 문제를 줄이기 위한 조치다.
+
+### 결과
+
+사용자 제공 4개 라인 캡처에서 굵은 흰색 라인이 더 안정적으로 하나의 blob/contour로 잡혔다. 교차점 판단도 원시 detector 단계에서 branch score가 안정화되어 이전보다 `L`, `T`, `+`, `straight` 구분이 잘 유지된다.
+
+## 23. 교차점 판단 정확도가 올라간 이유와 현재 로직
+
+### 현재 교차점 판단 흐름
+
+교차점 판단은 한 frame만 보고 바로 결정하지 않는다. 현재 흐름은 다음과 같다.
+
+1. `IntersectionDetector`가 shared line mask에서 largest blob과 중심 후보를 찾는다.
+2. 중심 후보 주변에서 camera-relative 4방향 ray score를 계산한다.
+   - front
+   - right
+   - back
+   - left
+3. branch score가 `intersection_threshold` 이상이면 raw branch present로 본다.
+4. `IntersectionStabilizer`가 raw type을 짧게 smoothing한다.
+5. `IntersectionDecisionEngine`이 최근 frame window를 모아 branch evidence를 다시 계산한다.
+6. window 안에서 branch별 `present_frames`, `max_score`, `average_score`를 보고 최종 accepted type을 정한다.
+
+### type 결정 기준
+
+`IntersectionDecisionEngine`은 우선순위를 `+ > T > L > straight > unknown`으로 두지만, 단일 frame에서 상위 type이 잠깐 튀는 것을 바로 채택하지 않는다.
+
+- `+`: front/right/back/left 4방향 모두 충분한 frame 수 동안 보이고, 네 방향 모두 `high_confidence_score` 이상이어야 채택한다.
+- `T`: 가능한 3방향 조합 중 branch evidence가 가장 좋은 mask를 고른다.
+- `L`: 가능한 2방향 직각 조합 중 evidence가 가장 좋은 mask를 고른다.
+- `straight`: front/back 또는 left/right 조합이 충분히 보이면 인정한다.
+- `unknown`: branch evidence가 부족하거나 일관되지 않을 때 남긴다.
+
+현재 주요 설정:
+
+```toml
+[intersection_decision]
+cruise_window_frames = 6
+turn_confirm_frames = 8
+min_branch_score = 0.72
+high_confidence_score = 0.85
+min_cross_branch_frames = 2
+min_t_branch_frames = 2
+min_l_branch_frames = 3
+record_node_once_frames = 18
+```
+
+### 정확도가 좋아진 이유
+
+정확도 개선은 한 가지 수정 때문이 아니라 여러 변경이 겹친 결과다.
+
+- `white_fill`로 넓은 흰색 라인의 내부가 채워져 branch ray가 끊기지 않는다.
+- `+`는 네 번째 branch가 약할 때 바로 채택하지 않도록 `high_confidence_score` guard를 추가했다.
+- `T`와 `L`은 단일 frame branch count가 아니라 최근 window의 branch evidence로 판단한다.
+- line tracking point와 intersection classification을 분리했다. 라인 주행 중심은 anchor band에서 잡고, 교차점 판단은 connected mask topology를 본다.
+- GCS overlay를 간소화해 실제 판단에 중요한 line center, offset, 접근 중인 branch 방향만 보이게 했다.
+
+### 보고서용 요약
+
+초기에는 한 frame의 ray score가 threshold 주변에서 흔들리면 교차점 type도 즉시 흔들렸다. 현재는 넓은 흰색 라인을 채워진 mask로 안정화하고, 최근 frame window에서 branch evidence를 누적해 topology를 결정한다. 특히 `+`는 네 방향 모두 높은 확신이 있을 때만 채택하도록 하여 약한 false branch 때문에 `T`가 `+`로 승격되는 문제를 줄였다.
+
+## 24. GCS overlay 정보가 너무 많아 라인트레이싱 제어용 오차를 보기 어려움
+
+### 문제 상황
+
+기존 GCS 영상 overlay에는 line label, tracking point, intersection branch score, decision label 등 많은 정보가 동시에 표시됐다. 라인트레이싱 제어를 준비하려면 “현재 라인 중심이 카메라 중심에서 얼마나 벗어났는지”가 가장 잘 보여야 하는데, 화면이 복잡했다.
+
+### 해결
+
+Line overlay를 다음 세 요소 중심으로 단순화했다.
+
+- magenta: 현재 선택된 line contour/border
+- red circle: 현재 라인 중심 X
+- green horizontal line: 카메라 중심에서 라인 중심까지의 lateral offset
+
+중요한 표시 규칙은 red circle의 Y가 항상 camera center Y에 고정된다는 점이다. 실제 line tracking point의 세로 위치가 frame 아래쪽/위쪽에 있어도 GCS 표시에서는 같은 수평선 위에 두어, 좌우 오차만 직관적으로 보이게 했다.
+
+교차점 overlay도 간소화했다.
+
+- 화면 상단/현재 접근 영역의 교차점만 표시
+- `IX <type>` 형태의 compact label만 표시
+- branch score 숫자와 긴 decision label은 영상에서 제거하고 log에 남김
+
+### 결과
+
+영상 창에서 라인트레이싱 제어에 필요한 lateral error를 즉시 확인할 수 있게 되었다. 복잡한 판단 값은 vision log에서 확인하는 구조로 역할을 분리했다.
+
+## 25. 빨간 라인 중심점이 좌우 이동에 조금 늦게 따라오는 느낌
+
+### 문제 상황
+
+라인 자체는 놓치지 않지만, 카메라를 좌우로 빠르게 움직였을 때 GCS 영상의 빨간 점과 초록 offset line이 약간 늦게 따라오는 느낌이 있었다.
+
+### 원인
+
+두 가지 지연 요인이 있었다.
+
+1. onboard `LineStabilizer`가 EMA smoothing, velocity limit, jump rejection을 적용한다.
+2. GCS debug video는 `--video`만 켜면 기본 5FPS이고, `--fps 12`를 지정해야 카메라 capture FPS에 가깝게 보인다.
+
+기존 GCS overlay는 filtered `tracking_point_px`를 사용했기 때문에 제어 안정화에는 좋지만, 사람이 화면에서 보는 빨간 점은 raw detector보다 늦어 보일 수 있었다.
+
+### 해결
+
+GCS 영상 overlay의 red circle과 green offset line은 `raw_tracking_point_px`가 있으면 raw 값을 우선 사용하도록 변경했다. telemetry log에는 filtered 값과 raw 값을 모두 남겨, 제어 입력으로 어떤 값을 쓸지는 이후 control loop에서 결정할 수 있게 했다.
+
+실시간 관찰용 권장 실행:
+
+```bash
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark --video --fps 12
+```
+
+### 판단
+
+관제 화면에서는 raw point가 더 직관적이고 빠르다. 반면 실제 제어에는 filtered point가 더 안전할 수 있다. 최종 제어 단계에서는 raw/filtered offset을 모두 기록하면서 lateral controller가 어느 값을 사용할지 별도 실험으로 결정한다.
+
+## 26. GCS grid가 로그 아래에 묻혀 보이지 않음
+
+### 문제 상황
+
+`GridMapTracker`가 ASCII grid를 만들도록 구현했지만, GCS vision log에는 telemetry 값이 너무 많아 grid가 화면 아래로 밀렸다. 사용자가 보기에는 grid가 그려지는 전용 공간이 없는 것처럼 보였다.
+
+### 원인
+
+처음 구현은 `VisionLogFormatter`가 상세 telemetry 문자열 마지막에 `[grid-map]` 텍스트를 붙이는 방식이었다. log window는 하나의 multiline edit control만 사용했기 때문에 grid와 상세 telemetry가 같은 스크롤 영역에서 경쟁했다.
+
+### 해결
+
+GCS `VisionLogWindow`를 두 영역으로 분리했다.
+
+- 상단 고정 pane: `[grid-map]` ASCII map
+- 하단 pane: `[vision]`, `[line]`, `[intersection]`, `[intersection-decision]`, `[grid-node]`, `[video-rx]` 상세 telemetry
+
+### 결과
+
+grid는 항상 vision log window 상단에 남고, 상세 telemetry가 길어져도 grid 표시 영역이 밀리지 않는다.
+
+## 27. GCS grid pane이 한 줄로 붙어서 보임
+
+### 문제 상황
+
+상단 grid pane이 생겼지만 Windows에서 다음처럼 줄바꿈 없이 한 줄로 이어져 보였다.
+
+```text
+[grid-map] nodes=1 current=(0,0) heading=unknowns|@
+```
+
+하단 telemetry도 `[vision] ... [camera] ... [system] ...`이 한 줄로 이어져 표시됐다.
+
+### 원인
+
+Win32 `EDIT` control은 `\n`만 있는 문자열을 안정적인 줄바꿈으로 처리하지 않는다. Windows multiline edit에는 `\r\n` line ending을 넣어야 한다.
+
+### 해결
+
+`VisionLogWindow`에서 UI에 문자열을 넣기 전에 line ending을 정규화했다.
+
+- 입력 문자열의 단독 `\n` 앞에 `\r`을 추가
+- UTF-8 -> UTF-16 변환 전에 정규화
+
+### 결과
+
+상단 grid와 하단 telemetry가 의도한 여러 줄 형태로 표시된다.
+
+## 28. GCS grid가 `nodes=1 current=(0,0) heading=unknown`에서 더 이상 확장되지 않음
+
+### 문제 상황
+
+상단 grid pane 자체는 표시되지만 처음부터 끝까지 다음과 비슷한 상태에 머물렀다.
+
+```text
+[grid-map] nodes=1 current=(0,0) heading=unknown
+```
+
+교차점 판단과 하단 vision telemetry는 계속 갱신되는데, grid는 새 칸을 추가하지 않았다.
+
+### 원인
+
+현재 단계에는 실제 드론 상태머신, IMU heading, MAVLink turn completion event가 없다. 따라서 onboard `GridCoordinateTracker`가 처음 grid node를 local `(0,0)`으로 저장한 뒤에도 `current_heading_ = Unknown` 상태를 유지했다.
+
+기존 좌표 갱신 로직은 heading이 알려져 있을 때만 다음 좌표로 advance한다.
+
+```cpp
+if (current_heading_ != GridHeading::Unknown) {
+    current_coord_ = advance(current_coord_, current_heading_);
+}
+```
+
+heading이 unknown이면 이후 node event가 들어와도 좌표가 계속 `(0,0)`이 된다. GCS `GridMapTracker`는 좌표를 key로 map에 저장하므로 같은 `(0,0)`이 반복되어도 node count가 늘지 않는다.
+
+### 해결
+
+임시 vision-only grid smoke용 heading 추정 로직을 추가했다.
+
+- 첫 node에 heading이 없으면 launch line에서 grid로 진입했다고 보고 local heading을 `north`로 둔다.
+- 첫 node에서 side branch가 보이면 첫 row/column으로 들어가기 위해 side branch를 우선 선택한다.
+- 이후에는 front branch가 있으면 직진한다.
+- front branch가 없고 right/left branch가 있으면 해당 방향으로 90도 회전한다고 가정한다.
+- row 끝에서 한 칸 올라간 뒤 같은 방향으로 한 번 더 회전해야 하는 snake 특성을 위해 `pending_second_turn`을 둔다.
+
+이 로직은 실제 비행 제어가 아니라 수동 카메라 테스트와 GCS grid 렌더링을 위한 임시 추정이다. 향후 MAVLink/IMU/state machine이 들어오면 `notifyTurnCompleted()`나 mission state가 실제 heading을 공급해야 한다.
+
+### 결과
+
+드론 없이 손으로 카메라를 들고 snake 방식으로 이동하는 테스트에서도 node event가 들어올 때마다 local coordinate가 확장될 수 있게 되었다.
+
+### 남은 리스크
+
+- 초기 진입 방향이 bottom-entry가 아니라 다른 방향이면 local map이 회전된 형태로 그려질 수 있다.
+- 실제 드론이 회전 완료를 알려주지 않는 한 heading은 vision-only 추정이다.
+- 공식 좌표계 변환은 아직 구현 전이다.
+- 같은 교차점을 다시 방문하지 않는 실제 snake policy와 visited guard는 mission layer에서 별도로 완성해야 한다.
