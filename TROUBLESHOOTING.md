@@ -1,6 +1,6 @@
 # Astroquad 트러블슈팅 및 개발 판단 로그
 
-최종 업데이트: 2026-05-02
+최종 업데이트: 2026-05-03
 
 범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석, 해결 방법, 설계 판단을 보고서용 개발로그로 정리한다. 현재 기본 장치는 Raspberry Pi 4 + IMX519-78이며, Raspberry Pi Zero 2 W 관련 내용은 이전 bring-up 단계의 이력으로 남긴다.
 
@@ -1190,3 +1190,139 @@ heading이 unknown이면 이후 node event가 들어와도 좌표가 계속 `(0,
 - 공식 좌표계 변환은 아직 구현 전이다.
 - 같은 교차점을 다시 방문하지 않는 실제 snake policy와 visited guard는 mission layer에서 별도로 완성해야 한다.
 - 확실히 회전 완료를 판단하기 애매해서 그리드가 완벽하게 그려지지 않음
+
+## 29. `dark_on_light`에서 굵은 검정 라인이 하나의 라인으로 잡히지 않음
+
+### 문제 상황
+
+2m 고도 탑다운뷰를 가정한 굵은 검정 라인 테스트에서 `--line-mode dark_on_light`로 실행했는데도 검정 라인 전체가 하나의 넓은 contour로 잡히지 않았다. Magenta overlay가 검정 라인의 양쪽 edge 위주로 생기고, red line-center point도 실제 라인 중앙보다 한쪽 edge에 가까웠다.
+
+사용자 캡처 기준 문제 양상:
+
+- 검정 라인 폭 전체가 mask로 채워지지 않음
+- contour 후보가 배경 노이즈와 edge 조각으로 많이 쪼개짐
+- line offset이 실제 중앙보다 크게 치우침
+- `light_on_dark`의 흰색 라인 정확도는 이미 만족스러우므로, 이 경로에는 영향을 주면 안 됨
+
+### 원인
+
+기존 기본 `mask_strategy = "white_fill"`은 이름 그대로 밝은 라인을 채우는 경로가 중심이었다. `dark_on_light`에서는 어두운 선 내부를 직접 채우는 전용 fill 경로가 부족해, local contrast/edge 성분이 더 강하게 남았다.
+
+또한 line 후보 폭 제한이 밝은 라인 기준과 사실상 공유되어 있었다. 2m 고도에서 10cm 정도의 굵은 검정 라인은 화면에서 폭이 넓게 보이므로, 어두운 라인에는 별도 폭 허용치가 필요했다.
+
+정리하면 원인은 두 가지다.
+
+- 검정 라인 내부를 value 기준으로 직접 채우는 `dark_fill` 경로가 없었다.
+- `light_on_dark`와 `dark_on_light`의 morphology/width 튜닝이 완전히 분리되어 있지 않았다.
+
+### 해결
+
+`LineMaskBuilder`와 `LineDetector`를 polarity별로 분리했다.
+
+`light_on_dark` 경로:
+
+- HSV low-saturation/high-value 기반 `white_fill`
+- `white_v_min`, `white_s_max`
+- `fill_close_kernel`, `fill_dilate_kernel`
+- `max_line_width_ratio`
+
+`dark_on_light` 경로:
+
+- low-value 기반 `dark_fill`
+- `dark_v_max`
+- `dark_fill_close_kernel`, `dark_fill_dilate_kernel`
+- `dark_max_line_width_ratio`
+
+현재 핵심 설정:
+
+```toml
+[line]
+mask_strategy = "white_fill"
+
+white_v_min = 145
+white_s_max = 90
+fill_close_kernel = 11
+fill_dilate_kernel = 3
+max_line_width_ratio = 0.22
+
+dark_v_max = 85
+dark_fill_close_kernel = 13
+dark_fill_dilate_kernel = 3
+dark_max_line_width_ratio = 0.34
+```
+
+`mask_strategy = "white_fill"`이더라도 `dark_on_light`에서는 내부적으로 dark fill 경로로 분기한다. 따라서 기본 전략 이름 때문에 검정 라인이 흰색 fill 로직을 타는 구조가 아니다.
+
+`line_detector_tuner`에도 dark 전용 override를 추가했다.
+
+```text
+--dark-v-max
+--dark-fill-close
+--dark-fill-dilate
+--dark-max-width
+```
+
+그리고 회귀 테스트를 추가했다.
+
+- 넓은 검정 라인이 `mask_strategy = "white_fill"` 상태에서도 `dark_on_light`로 정상 검출되는지 확인
+- 기존 넓은 흰색 라인 `light_on_dark` 검출이 그대로 유지되는지 확인
+
+이 테스트는 한쪽 mode 튜닝이 다른 mode 정확도를 깨는 상황을 막기 위한 guard다.
+
+### 결과
+
+사용자 제공 검정 라인 캡처 기준으로 다음처럼 개선됐다.
+
+```text
+before: offset=-62.32px, contours_found=427
+after:  offset=-14.07px, contours_found=8
+```
+
+수정 후 summary:
+
+```text
+detected=true
+tracking_point=(468.43,404.54)
+center_overlay_y=367
+offset=-14.07px
+angle=83.78deg
+confidence=0.83
+contour_points=48
+contour_area=83362.50
+contour_bounds=(350,59,222,626)
+mask_count=1
+contours_found=8
+candidates_evaluated=3
+```
+
+검정 라인이 edge 조각이 아니라 하나의 넓은 line blob으로 잡히며, 배경 노이즈 contour도 크게 줄었다. `uav-onboard` OpenCV tests도 통과했다.
+
+### line mode 해석
+
+`light_on_dark`:
+
+- 어두운 배경 위 밝은 라인을 검출하는 mode
+- 흰색, 연노랑, 연한 회색처럼 saturation이 낮고 value가 높은 라인에 유리
+
+`dark_on_light`:
+
+- 밝은 배경 위 어두운 라인을 검출하는 mode
+- 검정, 진한 회색, 남색처럼 value가 낮은 라인에 유리
+
+`auto`:
+
+- 밝은 라인 후보와 어두운 라인 후보를 모두 만들고, score가 더 좋은 contour를 선택한다.
+- 라인 색이 확정되지 않은 초기 현장 점검에는 유용하다.
+- 실제 대회 주행처럼 라인 색과 배경이 정해져 있으면 `light_on_dark` 또는 `dark_on_light`로 고정하는 편이 더 예측 가능하다.
+
+line mode 옵션을 주지 않으면 현재 config 기본값을 따른다. 현재 기본 config는 `mode = "light_on_dark"`이므로, 옵션을 생략한다고 항상 `auto`가 되는 것은 아니다. `auto`를 쓰려면 CLI나 config에서 명시해야 한다.
+
+### 유색 라인 대응
+
+현재 구현은 특정 색 이름을 직접 인식하는 방식이 아니라, 배경 대비와 brightness polarity를 이용한다.
+
+- 연노랑/연두/하늘색처럼 배경보다 충분히 밝고 value가 높으면 `light_on_dark`로 잡힐 가능성이 있다. 단, 채도가 높으면 `white_s_max` 조건에서 빠질 수 있다.
+- 진한 초록/남색처럼 배경보다 충분히 어두우면 `dark_on_light`로 잡힐 가능성이 있다.
+- 빨강, 진한 초록, 채도 높은 파랑처럼 밝기만으로 분리하기 애매한 색은 현재 light/dark mode만으로는 불안정할 수 있다.
+
+향후 라인 색이 흰색/검정 계열이 아니라 특정 유색으로 확정되면 `red_on_dark`, `green_on_light`처럼 색마다 mode를 늘리기보다, HSV hue range를 설정으로 받는 `color_fill` 전략을 추가하는 편이 낫다. 그래야 색 추가마다 코드를 늘리지 않고 config만 바꿔 현장 색상에 대응할 수 있다.
