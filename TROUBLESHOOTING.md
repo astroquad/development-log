@@ -1189,3 +1189,4 @@ heading이 unknown이면 이후 node event가 들어와도 좌표가 계속 `(0,
 - 실제 드론이 회전 완료를 알려주지 않는 한 heading은 vision-only 추정이다.
 - 공식 좌표계 변환은 아직 구현 전이다.
 - 같은 교차점을 다시 방문하지 않는 실제 snake policy와 visited guard는 mission layer에서 별도로 완성해야 한다.
+- 확실히 회전 완료를 판단하기 애매해서 그리드가 완벽하게 그려지지 않음
