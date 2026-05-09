@@ -1,6 +1,6 @@
 # Astroquad 트러블슈팅 및 개발 판단 로그
 
-최종 업데이트: 2026-05-03
+최종 업데이트: 2026-05-10
 
 범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석, 해결 방법, 설계 판단을 보고서용 개발로그로 정리한다. 현재 기본 장치는 Raspberry Pi 4 + IMX519-78이며, Raspberry Pi Zero 2 W 관련 내용은 이전 bring-up 단계의 이력으로 남긴다.
 
@@ -1326,3 +1326,223 @@ line mode 옵션을 주지 않으면 현재 config 기본값을 따른다. 현�
 - 빨강, 진한 초록, 채도 높은 파랑처럼 밝기만으로 분리하기 애매한 색은 현재 light/dark mode만으로는 불안정할 수 있다.
 
 향후 라인 색이 흰색/검정 계열이 아니라 특정 유색으로 확정되면 `red_on_dark`, `green_on_light`처럼 색마다 mode를 늘리기보다, HSV hue range를 설정으로 받는 `color_fill` 전략을 추가하는 편이 낫다. 그래야 색 추가마다 코드를 늘리지 않고 config만 바꿔 현장 색상에 대응할 수 있다.
+
+## 30. ArUco marker가 교차점 위에 있을 때 line/intersection 판단이 오염됨
+
+### 문제 상황
+
+3x3 격자 경기장 이미지에서 ArUco marker가 교차점 중앙에 놓이면 marker 내부의 흰색/검정 패턴이 line mask에 섞였다.
+
+관찰된 증상은 line polarity별로 달랐다.
+
+- `light_on_dark` white line에서는 marker 내부의 밝은 패턴이 라인처럼 잡혀 `T`/`+` 교차점 판별이 흔들렸다.
+- marker 위쪽을 지날 때 line tracing 중심이 진행 방향 라인이 아니라 좌우 branch 쪽으로 튀는 경우가 있었다.
+- `dark_on_light` black line에서는 교차점 자체는 비교적 유지됐지만, marker 외곽 검정 영역과 라인이 붙으면서 marker 일부만 ArUco 후보로 잡히고 ID 4를 17처럼 오인식하는 경우가 있었다.
+- GCS overlay는 온보드 telemetry를 기준으로 그리므로, 온보드가 오염된 line/marker 결과를 보내면 overlay도 그대로 잘못 표시됐다.
+
+### 원인
+
+기존 line/intersection 판단은 line mask에서 가장 큰 blob과 branch ray score를 안정적으로 계산하는 구조였다. 일반 교차점에서는 성능이 충분했지만, marker가 교차점 중앙에 놓이면 marker 내부 패턴이 line 후보와 같은 polarity를 가지는 문제가 생겼다.
+
+핵심 원인은 세 가지다.
+
+- marker 내부 패턴을 line/intersection 후보에서 제외하지 않아 branch score에 가짜 evidence가 섞였다.
+- live ArUco fallback이 작은 내부 패턴 조각을 먼저 ID 후보로 받아들일 수 있었다.
+- 교차점 근처 line tracing에서 lookahead 영역이 좌우 branch를 더 크게 보면 진행 방향 라인보다 branch를 선택할 수 있었다.
+
+### 해결
+
+기존 line tracing과 교차점 판단 성능을 깨지 않는 것을 최우선 조건으로 두고, marker가 실제로 보이는 경우에만 marker-aware 보정을 적용했다.
+
+온보드 쪽 변경:
+
+- `LineMaskBuilder`/`IntersectionDetector` 경로에서 fresh ArUco marker 영역을 line/intersection mask의 occlusion 영역으로 사용한다.
+- marker 내부의 흰색/검정 패턴은 라인 후보가 아니라 장애물처럼 취급해 branch ray score에 섞이지 않도록 한다.
+- stale marker box가 드론 이동 후 line mask를 계속 지우지 않도록, line mask occlusion에는 fresh detection만 넘긴다. telemetry 표시는 cached marker를 사용할 수 있다.
+- `ArucoDetector` live fallback은 큰 ROI를 먼저 검사하고, marker 크기 plausibility를 통과하지 못하는 부분 후보는 유효 marker로 내보내지 않는다.
+- partial marker로 보이는 후보는 잘못된 ID를 보내기보다 미검출로 처리한다.
+- `aruco.detect_interval_frames = 3`, `fallback_max_components = 12`, `fallback_max_rois = 120`으로 live ArUco 비용과 fallback 폭주를 제한한다.
+- `LineDetector`는 marker/교차점 근처에서 진행 방향 anchor band의 line run을 더 우선해 좌우 branch로 tracking point가 튀는 현상을 줄였다.
+
+GCS 쪽 판단:
+
+- overlay는 계속 GCS에서만 그린다.
+- 온보드는 marker id/corners/center/orientation과 line/intersection telemetry만 보낸다.
+- GCS는 raw camera frame 위에 marker box, line contour, intersection label, grid log를 그린다.
+
+### 검증
+
+검증 기준은 실제 3x3 격자 경기장, 한 칸 4m, 라인 폭 0.1m, marker 0.5m x 0.5m, 고도 약 2m 탑다운 시야를 가정했다.
+
+검증 산출물:
+
+```text
+uav-gcs/logs/20260510-035424-aruco-marker-grid-smoke/
+```
+
+결과:
+
+- `white_light_on_dark`: node valid / coord match / event ready `16/16`.
+- `black_dark_on_light`: node valid / coord match / event ready `16/16`.
+- line segment 검출은 white/black 모두 `15/15`.
+- marker 4개 좌표가 `marker_coords.csv`에 저장됐다.
+- white marker 위쪽 대표 crop에서 line tracking offset이 약 `1px`로 유지됐다.
+- black partial marker 캡처에서는 잘못된 ID를 내지 않고 미검출 처리했다.
+- full marker가 충분히 보이는 black replay crop에서는 정상 ID가 검출됐다.
+
+### 판단
+
+ArUco marker가 교차점 위에 있을 때 line/intersection 판단이 흔들리는 문제는 marker-aware mask, partial marker filter, 진행 방향 anchor-band scoring으로 완화됐다. 중요한 설계 기준은 기존 line-only 교차점 판단 성능을 건드리지 않는 것이다. 따라서 marker가 없거나 fresh marker가 없으면 기존 line/intersection 경로가 그대로 유지된다.
+
+## 31. ArUco+line 동시 실행 시 packet/frame 전송이 매우 느려짐
+
+### 문제 상황
+
+사용자 테스트에서 white/black 모두 line-only 모드는 정상 속도로 GCS에 packet/video를 보냈다.
+
+하지만 다음처럼 line과 ArUco를 동시에 켠 모드에서는 `--fps 12`를 지정해도 GCS에 도착하는 frame이 1FPS 미만, 체감상 약 5초에 1장 수준으로 느려졌다.
+
+```bash
+./build/vision_debug_node --config config --line-mode light_on_dark --video --fps 12
+./build/vision_debug_node --config config --line-mode dark_on_light --video --fps 12
+```
+
+### 현재 상태
+
+2026-05-10 기준으로 onboard 처리 루프의 누적 지연 원인은 해결했다.
+
+원인은 line 자체가 아니라 ArUco generic ROI fallback이었다. ArUco marker가 화면에 없어도 direct detection 결과가 비어 있으면, live frame에서 generic fallback이 주기적으로 여러 ROI를 검사했다. 특히 `dark_on_light` 장면에서는 이 fallback이 약 530ms까지 튀며 camera pipe에 backlog를 만들고, video send가 고르게 나가지 못했다.
+
+적용한 수정:
+
+- `c7cfe1d Throttle live ArUco fallback workload`
+  - generic full fallback을 매 ArUco detection마다 실행하지 않고 낮은 duty cycle로 제한했다.
+  - ROI fallback 내부에서 ROI마다 `cv::aruco::ArucoDetector`를 새로 만들던 비용을 줄이고 detector를 재사용한다.
+  - ROI detect 입력은 color crop 변환 대신 gray crop을 직접 사용한다.
+- `505d409 Cap live ArUco full fallback spikes`
+  - live generic full fallback ROI budget을 `full_fallback_max_rois = 4`로 줄였다.
+  - live generic full fallback에서는 2배 upscale detect를 생략한다.
+  - partial marker 기반 targeted fallback은 유지해, 실제 marker 조각이 보이는 경우의 복구 가능성은 남겼다.
+- `14cf0dd Send every frame when debug FPS matches camera`
+  - `--fps 12`가 camera 12FPS와 같을 때 strict time comparison 때문에 한 프레임씩 건너뛰는 문제를 막고, every processed frame을 video sender에 제출한다.
+
+### 검증
+
+로컬 GCS를 실행한 상태에서 Pi 4의 `/home/astroquad/astroquad/uav-onboard`에 `505d409`를 pull/build한 뒤, 다음 조건으로 185초 이상 관찰했다.
+
+```bash
+./build/vision_debug_node --config config --line-mode dark_on_light --video --fps 12 --gcs-ip 172.20.10.2
+./build/vision_debug_node --config config --line-mode light_on_dark --video --fps 12 --gcs-ip 172.20.10.2
+```
+
+검증 로그:
+
+```text
+uav-gcs/logs/20260510-044407-pi-aruco-longrun-final/
+uav-gcs/logs/20260510-044750-pi-aruco-longrun-final/
+uav-gcs/logs/20260510-045552-pi-aruco-longrun-final/
+uav-gcs/logs/20260510-045927-pi-aruco-longrun-final/
+```
+
+결과:
+
+- `dark_on_light`: `2201` frames, wall `183.3s`, stdout `12.01fps`, `video_sent=2200`, `video_dropped=0`, `video_skipped=0`, `aruco_max=64.43ms`.
+- `light_on_dark`: `2201` frames, wall `183.3s`, stdout `12.01fps`, `video_sent=2200`, `video_dropped=0`, `video_skipped=0`, `aruco_max=63.97ms`.
+- 수정 전 `dark_on_light`에서는 full fallback spike가 약 `573ms`까지 발생했지만, 수정 후에는 12fps budget 안으로 들어왔다.
+- frame 출력이 시간이 갈수록 `12fps -> 5fps -> 1fps -> 5-10초당 1장`으로 무너지는 현상은 재현되지 않았다.
+
+### 남은 분리 이슈
+
+GCS discovery beacon은 위 테스트 환경에서 여전히 Pi가 수신하지 못했다.
+
+```text
+no GCS discovery beacon received; falling back to 255.255.255.255:5600
+```
+
+`--gcs-ip 172.20.10.2`로 unicast를 고정하면 onboard 처리와 video send는 안정적이다. `--gcs-ip` 없이 broadcast fallback을 쓰는 경우 onboard 처리 루프는 안정적이지만, Wi-Fi broadcast packet loss 때문에 GCS 표시 안정성은 떨어질 수 있다.
+
+따라서 이 항목의 onboard ArUco 병목은 해결됐고, 남은 작업은 GCS discovery가 왜 실패하는지 별도 네트워크/Windows 방화벽/브로드캐스트 경로로 분리해서 확인하는 것이다.
+
+## 32. marker가 있는 교차점에서 L 판별과 line tracking 중심 보정
+
+### 문제 상황
+
+지연 문제를 해결한 뒤, marker가 교차점 위에 있을 때 다음 문제가 남아 있었다.
+
+- white line에서는 `+`와 `T` 교차점은 잘 잡히지만 marker가 놓인 `L` 교차점을 제대로 판별하지 못하는 경우가 있었다.
+- black line에서는 교차점 모양은 잘 판단하지만 ArUco marker가 다시 검출되지 않는 경우가 있었다.
+- line tracing overlay에서 marker가 감지된 상황에도 line mask의 무게중심이나 branch contour에 끌려 tracking X가 marker 중심과 어긋날 수 있었다.
+
+### 원인
+
+white `L` 문제는 marker occlusion이 line mask를 지우면서 실제 `L` 중심 후보보다 다른 blob 중심 후보가 더 좋은 후보로 선택될 수 있었기 때문이다. marker가 교차점 중심에 있다는 사실을 intersection center 후보 선택에서 충분히 강하게 반영하지 못했다.
+
+black marker 문제는 marker 외곽의 검정 영역이 black line과 붙어 기본 ArUco contour 후보가 무너지는 경우였다. 이때 교차점 mask topology는 유지되므로 `L`/`T`/`+` 판단은 가능하지만, marker ID는 나오지 않았다.
+
+line tracking 중심 문제는 marker가 검출된 상황에서도 line detector가 기존 projection run 기준 tracking point를 유지했기 때문이다. 교차점 marker 위에서는 실제 제어 기준으로 marker 중심 X가 더 의미 있다.
+
+### 해결
+
+적용 커밋:
+
+```text
+f47e30e Improve marker-centered line and intersection handling
+```
+
+수정 내용:
+
+- `IntersectionDetector`에서 marker occlusion 중심 후보를 더 강하게 반영했다.
+- marker 중심 후보에서 나온 `L`/`T`/`+` type에 bonus를 부여해, marker가 교차점 중앙에 있을 때 실제 marker 주변 branch topology가 선택되도록 했다.
+- `ArucoDetector`에 live 중앙부 template fallback을 추가했다. 기본 OpenCV ArUco 검출이 실패해도 중앙부의 ArUco binary pattern과 template을 비교해 black line 위 marker를 복구한다.
+- `LineDetector`에 `applyMarkerCenterTracking()`을 추가했다. marker가 검출되면 tracking point의 X는 marker center X를 사용하고, Y는 기존 overlay/제어 기준처럼 camera center Y를 유지한다.
+- stabilizer가 marker 중심 보정을 다시 완화하지 않도록 raw line과 filtered line 모두에 marker center 보정을 적용했다.
+
+### 검증
+
+사용자 제공 캡처 기준:
+
+```text
+C:\Users\mseoky\Pictures\Screenshots\white.png
+C:\Users\mseoky\Pictures\Screenshots\black.png
+```
+
+`white.png` 결과:
+
+```text
+markers=1
+marker_id=3 marker_center=(631.50,449.00)
+tracking_point=(631.50,418.50)
+ix_type=L
+ix_valid=true
+ix_detected=true
+```
+
+`black.png` 결과:
+
+```text
+markers=1
+marker_id=1 marker_center=(582.00,386.00)
+tracking_point=(582.00,420.00)
+ix_type=L
+ix_valid=true
+ix_detected=true
+```
+
+전체 grid replay 회귀:
+
+- white: node/event/coord `16/16`, line segment `15/15`, marker 4개 저장 유지.
+- black: node/event/coord `16/16`, line segment `15/15`, marker 4개 저장 유지.
+
+Pi 실시간 검증:
+
+```text
+uav-gcs/logs/20260510-054105-marker-centered-verify/
+uav-gcs/logs/20260510-054244-marker-centered-verify/
+```
+
+- `dark_on_light`: 약 93초, stdout `12.02fps`, video drop `0`, skip `0`.
+- `light_on_dark`: 약 93초, stdout `12.02fps`, video drop `0`, skip `0`.
+
+### 남은 이슈
+
+black line에서 ArUco marker 인식이 깜빡이면서 됐다 안 됐다를 반복하거나, 잠깐만 인식되는 문제가 아직 남아 있다. 현재 단계에서는 교차점 판단과 line tracing은 유지되지만, marker ID 검출 결과의 temporal 안정화는 다음 작업으로 남긴다.
