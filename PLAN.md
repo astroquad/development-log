@@ -1,607 +1,386 @@
-# Astroquad Vision/Grid 다음 개발 계획
+# ArUco marker at intersection 대응 계획
 
-최종 업데이트: 2026-05-01
+최종 업데이트: 2026-05-10
 
-이 문서는 `development-log/RESEARCH.md`, `uav-gcs/README.md`, `uav-onboard/README.md`와 2026-05-01 사용자 요청을 기준으로 작성한 다음 작업 계획이다. 추후 에이전트는 이 파일을 먼저 읽고, 아래 범위 안에서 바로 구현을 진행한다.
+## 목표
 
-## 1. 현재 프로젝트 이해
+3x3 cell 격자 경기장 이미지(`grid_images/black_grid_with_aruco_marker.png`, `grid_images/white_grid_with_aruco_marker.png`)를 2 m 고도 IMX519 top-down 카메라 입력처럼 crop/replay하면서, ArUco marker가 교차점 위에 있어도 onboard가 기존 L/T/+ 교차점 판단 방식을 유지하고 GCS가 marker/intersection/grid overlay와 log를 올바르게 남기도록 만든다.
 
-Astroquad는 Raspberry Pi 4 + IMX519-78 onboard와 Windows GCS를 나눈 C++ 프로젝트다.
+중요 원칙:
 
-- `uav-onboard`: rpicam MJPEG capture, ArUco/line/intersection detection, intersection decision, local grid node telemetry 생성.
-- `uav-gcs`: UDP telemetry/video 수신, raw camera 영상 위 GCS-side overlay, 별도 vision log window 표시.
-- 현재 목표 단계는 실제 Pixhawk/MAVLink 제어가 아니라 비전/디버그/좌표화 완성이다.
-- onboard는 overlay를 그리지 않는다. 모든 marker/line/intersection/debug overlay는 GCS에서 그린다.
-- protocol 문서는 v1.7이며 JSON `protocol_version`은 호환성 때문에 integer `1`이다.
+- `IntersectionDecisionEngine`의 최근 branch evidence window 기반 판단은 유지한다.
+- marker 자체를 "교차점으로 간주"하는 shortcut은 넣지 않는다.
+- marker는 line/intersection detector의 occlusion/false-positive 요인으로만 보정하고, 최종 node 채택은 기존 branch evidence가 결정한다.
+- GCS overlay는 telemetry를 시각화만 한다. mission-critical 판단은 onboard telemetry/state에 남긴다.
 
-이미 구현된 핵심 요소:
+## 현재 확인한 사실
 
-- `uav-onboard/src/vision/LineMaskBuilder.*`: line/intersection 공통 mask 생성.
-- `uav-onboard/src/vision/LineDetector.*`: line following용 contour와 tracking point 산출.
-- `uav-onboard/src/vision/IntersectionDetector.*`: front/right/back/left ray score 기반 `+`, `T`, `L`, `straight` 분류.
-- `uav-onboard/src/mission/IntersectionDecision.*`: 최근 branch evidence window로 node event, turn candidate, front availability, overshoot risk 산출.
-- `uav-onboard/src/mission/GridCoordinateTracker.*`: 첫 안정 node를 local `(0,0)`으로 기록하고 heading 기준 다음 node 좌표를 증가.
-- `uav-gcs/src/telemetry/VisionLogFormatter.*`: vision log window 텍스트 생성.
-- `uav-gcs/src/overlay/LineOverlay.*`, `IntersectionOverlay.*`: 현재 camera overlay primitive 생성.
+- 현재 pipeline은 `ArucoDetector -> LineMaskBuilder -> LineDetector + IntersectionDetector -> IntersectionStabilizer -> IntersectionDecisionEngine -> GridCoordinateTracker -> TelemetryMessage -> GCS overlay/log` 흐름이다.
+- 현재 `ArucoDetector`는 OpenCV `cv::aruco::ArucoDetector`를 원본 gray frame에 바로 적용한다.
+- 현재 `IntersectionDetector`는 line mask에서 center candidate를 찾고, front/right/back/left ray score로 branch mask를 만든다.
+- 현재 `IntersectionDecisionEngine`은 detector의 branch score를 window로 모아 `+`, `T`, `L`, `straight`를 결정한다.
+- 현재 GCS는 marker polygon, line, intersection branch overlay를 이미 갖고 있고, telemetry parser도 `vision.markers`, `vision.intersection`, `vision.intersection_decision`, `vision.grid_node`를 읽는다.
+- `grid_image_smoke`는 기존 smoke 산출물 생성기가 있지만, 현재 geometry 검출이 white line 중심이고 crop 크기도 실제 2 m IMX519 footprint보다 넓다. 이번 검증 목적에는 확장이 필요하다.
+- baseline `aruco_detector_tester` 결과:
+  - `white_grid_with_aruco_marker.png`: `DICT_4X4_50` marker 4개 검출.
+  - `black_grid_with_aruco_marker.png`: marker 0개 검출. 검정 marker 외곽이 검정 grid line과 붙어 OpenCV가 독립 marker contour를 못 잡는 케이스로 보인다.
 
-아직 부족한 핵심 요소:
+## 2026-05-10 실기 캡처에서 추가 확인한 현상
 
-- 전체 grid를 동적으로 누적하는 GCS-side map/ASCII renderer.
-- 실제 snake traversal policy. 현재 `VisionDebugPipeline.cpp`에서 `IntersectionDecisionEngine::update(..., false)`로 `turn_expected`가 항상 `false`다.
-- `GridCoordinateTracker` heading 갱신. 현재 live pipeline에서 `notifyTurnCompleted()` 또는 `setHeading()`을 실제 policy와 연결하지 않는다.
-- 라인 중심점 overlay 단순화와 카메라 중앙 기준 horizontal offset 표시.
-- 굵은 흰색 line을 하나의 채워진 blob으로 더 안정적으로 잡는 mask 개선.
+테스트 조건:
 
-## 2. 사용자 요구사항 정리
+- 모니터에 격자 경기장을 띄우고 IMX519 top-down으로 촬영했다.
+- 화면상의 크기는 2 m 고도에서 경기장을 보는 정도의 비율에 맞췄다.
+- 캡처 파일:
+  - `c:/Users/mseoky/Pictures/Screenshots/black_line_only.png`
+  - `c:/Users/mseoky/Pictures/Screenshots/black_not_line_only.png`
+  - `c:/Users/mseoky/Pictures/Screenshots/white_line_only.png`
+  - `c:/Users/mseoky/Pictures/Screenshots/white_not_line_only.png`
 
-### 2.1 GCS vision log에 동적 grid 표시
+관찰:
 
-GCS 로그 화면에 실시간 ASCII grid를 표시한다.
+- black `+` 교차점:
+  - line-only에서는 ArUco 검출이 꺼져 있으므로 marker overlay가 없는 것이 정상이다.
+  - not-line-only에서도 marker는 전혀 검출되지 않았다.
+  - 교차점 branch 판단은 white보다 안정적이며 `IX +`까지 나오는 편이다.
+  - 원인은 marker의 검정 외곽/몸체가 검정 grid line과 연결되어 표준 ArUco detector가 marker의 독립 사각 contour와 outer quiet zone을 찾지 못하는 것으로 본다.
+- white `T` 교차점:
+  - line-only에서 ArUco marker 내부의 흰색 cell이 line mask foreground로 잡힌다.
+  - 실제 T branch보다 marker 내부 흰색 패턴이 더 강한 후보가 되어 `IX unknown` 또는 잘못된 center/ray가 나온다.
+  - not-line-only에서는 marker가 잡히는 frame도 있지만, intersection detector가 marker polygon을 line mask에서 제거하지 않으므로 여전히 `IX unknown`이 나온다.
+  - marker 검출은 frame마다 잡혔다가 사라지는 flicker가 있다. 현재 캡처 품질에서는 camera blur, display blur, JPEG 압축, focus 오차가 같이 영향을 주는 것으로 본다.
 
-- `s`에서 출발해 처음 grid에 도착한 교점을 local `(0,0)`으로 본다.
-- 처음에는 `s -> (0,0)` 진입 라인만 그릴 수 있다.
-- 새로운 교차점 node event가 들어올 때마다 grid map을 갱신한다.
-- grid 전체 크기는 처음부터 알 수 없으므로 visited/discovered node의 bounding box 기준으로 화면을 확장한다.
-- 현재 드론 위치와 heading을 `>`, `<`, `^`, `v` 중 하나로 표시한다.
-- 방문한 좌표는 누적 저장하고, 이미 방문한 좌표는 snake traversal이 다시 선택하지 않게 한다.
-- 최종적으로 5x5처럼 전체 node를 방문하면 아래와 같은 형태의 ASCII grid가 로그에 보인다.
+추론:
 
-```text
-<---+---+---+---+---+
-|   |   |   |   |   |
-+---+---+---+---+---+
-|   |   |   |   |   |
-+---+---+---+---+---+
-|   |   |   |   |   |
-+---+---+---+---+---+
-|   |   |   |   |   |
-+---+---+---+---+---+
-|   |   |   |   |   |
-+---+---+---+---+---+
-|
-s
-```
+- 문제는 두 층으로 분리해야 한다.
+  - `marker identification`: marker ID/corners를 안정적으로 읽는 문제.
+  - `marker occlusion masking`: marker ID를 못 읽은 frame에서도 marker-like 영역이 line/intersection 판단을 망치지 않게 하는 문제.
+- white 실패는 "marker ID를 읽느냐"보다 "marker 내부 흰색을 line으로 쓰지 않게 하는 것"이 먼저다.
+- black 실패는 소프트웨어 fallback으로 완화할 수 있지만, 검정 line과 marker black border가 물리적으로 붙으면 ArUco가 요구하는 외곽 contrast/quiet zone이 사라진다. 실제 경기장에서는 marker 주변에 흰색 여백 또는 line과 구분되는 mounting patch가 있는지 확인해야 한다.
 
-### 2.2 Snake 순회 정책
+## 전제와 좌표 해석
 
-현재 비전 개발 단계에서는 사람이 top-down camera를 들고 드론처럼 움직인다고 가정한다. 즉, 카메라는 항상 현재 진행 방향을 정면으로 보며 이동한다.
+- 사용자가 말한 3x3은 3x3 cell 경기장으로 해석한다. 따라서 line 교차점은 4x4 lattice가 된다.
+- 실제 cell 길이 4.0 m, line 폭 0.1 m, marker 크기 0.5 m를 검증 tool의 물리 scale로 사용한다.
+- full-field 이미지에서 grid line center 간격을 검출해 `px_per_meter = median_cell_spacing_px / 4.0`으로 환산한다.
+- 2 m 고도 crop은 IMX519 FOV를 config 값으로 둔다. 초기값은 IMX519-78 기준으로 두되, 실제 렌즈/카메라 calibration 후 수치만 바꿀 수 있게 한다.
+- replay 출력 frame 크기는 현재 onboard camera config와 맞춰 `960x720`으로 resize한다.
 
-요구되는 snake 동작:
+## 구현 방안
 
-- 첫 안정 교점 `(0,0)`에서 snake를 시작한다.
-- 한 row를 직진하다가 row 끝 또는 policy상 turn 지점에 도달하면 같은 방향 90도 회전을 두 번 수행한다.
-- 예: 처음 row 끝의 `L` 교차로에서는 우회전, 한 칸 이동, 다시 우회전 후 다음 row를 반대 방향으로 직진한다.
-- 다음 row 끝에서는 좌회전, 한 칸 이동, 다시 좌회전 후 다시 반대 방향으로 직진한다.
-- 이처럼 row가 바뀔 때마다 turn side가 `right -> left -> right -> ...`로 번갈아야 한다.
-- 중요한 점: 전진 branch가 있어도 snake policy상 row 전환이 필요하면 회전해야 한다. 따라서 `front_available == true`만으로 `continue straight`를 결정하면 안 된다.
-- 아직 실제 제어 코드는 작성하지 않는다. 이번 단계에서는 vision/debug telemetry와 grid/snake 상태가 맞게 나오는지 확인하는 것이 목표다.
+### 0. 카메라/입력 품질 baseline을 먼저 고정하기
 
-### 2.3 GCS camera overlay 단순화
+대상 파일:
 
-현재 GCS overlay는 정보가 너무 많다. 다음처럼 줄인다.
-
-- 현재 tracing 중인 line 중심점만 빨간 원으로 표시한다.
-- 빨간 원은 반드시 카메라 화면의 수직 중앙선 높이에 놓는다. 즉 `y = frame_height / 2`로 고정한다.
-- 초록색 라인은 카메라 중심점 `(frame_width / 2, frame_height / 2)`에서 빨간 원까지 수평으로 표시한다.
-- 이 초록색 라인은 나중에 line tracing 제어에서 사용할 lateral offset을 직관적으로 보여주기 위한 것이다.
-- line label, confidence text, branch score text, cyan/yellow debug label처럼 화면을 복잡하게 만드는 정보는 기본 overlay에서 제거하거나 debug option 뒤로 숨긴다.
-- 교차점 overlay는 카메라 중심 기준 위쪽 범위 안에서 포착되는 "앞으로 도착할 교차점" 또는 현재 도착한 교차점의 branch 방향만 간단히 표시한다.
-- 교차점 표시는 모양 또는 방향 요약만 보여준다. 예: `+`, `T`, `L`, `F/R/L` 같은 compact 정보.
-
-### 2.4 굵은 흰색 line 인식 개선
-
-현재는 굵은 흰색 line 전체가 아니라 일부 edge 또는 얇은 strip만 magenta contour로 잡히는 경향이 있다.
-
-목표:
-
-- 첫 번째/두 번째 참고 이미지처럼 분홍색 overlay가 굵은 line 전체 외곽을 하나의 연결된 blob으로 감싸야 한다.
-- 밝은 배경, 넓은 흰색 테이프/종이, 조명 gradient에서도 line 내부가 비지 않게 mask를 보강한다.
-- line tracking point는 contour centroid가 아니라 카메라 중앙 높이의 horizontal scan band에서 line 폭 중심을 사용한다.
-
-## 3. 권장 구현 순서
-
-이번 작업은 아래 순서로 진행한다. 실제 MAVLink 제어는 이 계획의 범위 밖이다.
-
-1. GCS grid map/ASCII renderer를 먼저 만든다.
-2. onboard snake policy/debug state를 만들고 `turn_expected`와 heading 갱신을 연결한다.
-3. GCS overlay를 단순화한다.
-4. line mask를 굵은 흰색 line에 맞게 개선한다.
-5. 이미지 smoke/replay와 unit test를 추가한다.
-
-## 4. GCS 동적 grid map 설계
-
-### 4.1 파일 위치
-
-새 파일 후보:
-
-- `uav-gcs/src/telemetry/GridMapTracker.hpp`
-- `uav-gcs/src/telemetry/GridMapTracker.cpp`
-- `uav-gcs/tests/test_grid_map_tracker.cpp`
-
-수정 후보:
-
-- `uav-gcs/src/telemetry/VisionLogFormatter.hpp`
-- `uav-gcs/src/telemetry/VisionLogFormatter.cpp`
-- `uav-gcs/src/telemetry/TelemetryStore.hpp`
-- `uav-gcs/src/telemetry/TelemetryStore.cpp`
-- `uav-gcs/src/app/VisionDebugApp.cpp`
-- `uav-gcs/CMakeLists.txt`
-
-### 4.2 상태 모델
-
-`GridMapTracker`는 GCS process 안에서 telemetry frame을 순서대로 관찰한다.
-
-필수 상태:
-
-- `std::map<GridCoord, Node>` visited/discovered nodes.
-- `std::set<Edge>` discovered edges.
-- `std::optional<GridCoord> current_coord`.
-- `Heading current_heading`.
-- `bool saw_start`.
-- `GridCoord origin = {0,0}`.
-- `uint32_t last_node_id` 또는 마지막 `frame_seq`로 중복 event 방지.
-
-Node 필드:
-
-- `x`, `y`
-- `topology`
-- `grid_branch_mask`
-- `first_node`
-- `visited_order`
-
-Edge 규칙:
-
-- node event가 들어오면 이전 node와 현재 node 사이 edge를 추가한다.
-- `grid_branch_mask`에 north/east/south/west branch가 있으면 known edge 후보로 저장한다.
-- 단, 반대편 node가 아직 없으면 endpoint를 `unknown`으로 두거나 drawing에서 생략한다. 처음 구현은 known node끼리 연결된 edge만 그려도 된다.
-
-중복 처리:
-
-- `vision.grid_node.valid == true`인 frame만 node event로 처리한다.
-- 같은 `grid_node.id`를 이미 처리했다면 무시한다.
-- `vision.intersection_decision.node.valid`와 `vision.grid_node.valid`가 둘 다 있으면 `vision.grid_node`를 canonical event로 사용한다.
-
-### 4.3 ASCII rendering 규칙
-
-좌표계:
-
-- local `x`는 오른쪽으로 증가한다.
-- local `y`는 아래쪽으로 증가한다.
-- `(0,0)`은 첫 grid node다.
-- official competition origin 변환은 아직 하지 않는다.
-
-Canvas:
-
-- node는 `+` 위치에 둔다.
-- 수평 edge는 `---`, 수직 edge는 `|`로 그린다.
-- 현재 드론 위치는 마지막 node 위치의 `+`를 heading arrow로 대체한다.
-- heading이 unknown이면 `@` 또는 `D`를 사용한다.
-- start `s`는 first node의 arrival heading 반대 방향 바깥에 둔다. arrival heading이 unknown이면 첫 구현은 `(0,0)` 아래에 `s`를 둔다.
-- bounding box는 visited node 기준으로 계산하고 start marker가 들어갈 여백을 추가한다.
-
-렌더링 예:
-
-```text
-[grid-map] local origin=(0,0) nodes=7 current=(2,1) heading=east
-+---+--->
-|   |
-+---+
-|
-s
-```
-
-로그 연결:
-
-- `VisionLogFormatter::formatVisionLog()` 마지막 또는 `[grid-node]` 다음에 `[grid-map]` block을 붙인다.
-- `formatVisionLog()`가 순수 formatter라면 `GridMapTracker`를 `VisionDebugApp`에서 유지하고 `formatVisionLog(frame, stats, grid_map_text)`처럼 넘기는 편이 낫다.
-- 대안으로 `TelemetryStore`가 latest frame뿐 아니라 `GridMapTracker`를 갖게 할 수 있지만, GCS state와 log formatting이 섞일 수 있으므로 처음 구현은 `VisionDebugApp` local state를 권장한다.
-
-### 4.4 테스트
-
-`test_grid_map_tracker.cpp`에서 다음을 검증한다.
-
-- 첫 node `(0,0)`만 들어오면 `s`와 `(0,0)`이 표시된다.
-- `(0,0) -> (1,0) -> (2,0)` event 후 수평 edge와 `>` arrow가 표시된다.
-- row 전환 `(2,0) -> (2,1) -> (1,1)` 후 수직 edge와 `<` arrow가 표시된다.
-- 중복 `grid_node.id`는 node count를 증가시키지 않는다.
-- negative coordinate가 들어와도 bounding box가 깨지지 않는다.
-
-## 5. Onboard snake policy 설계
-
-### 5.1 파일 위치
-
-새 파일 후보:
-
-- `uav-onboard/src/mission/SnakeTraversalPlanner.hpp`
-- `uav-onboard/src/mission/SnakeTraversalPlanner.cpp`
-- `uav-onboard/tests/test_snake_traversal.cpp`
-
-수정 후보:
-
-- `uav-onboard/src/app/VisionDebugPipeline.cpp`
-- `uav-onboard/src/mission/GridCoordinateTracker.*`
-- `uav-onboard/src/mission/IntersectionDecision.*`
-- `uav-onboard/src/protocol/TelemetryMessage.*`
-- `uav-gcs/src/protocol/TelemetryMessage.*`
-- `uav-gcs/tests/test_telemetry_line_parse.cpp`
-- `uav-onboard/tests/test_telemetry_line_json.cpp`
-- `uav-onboard/CMakeLists.txt`
-
-### 5.2 Planner 책임
-
-`SnakeTraversalPlanner`는 실제 제어 명령을 내리지 않고 debug/mission state만 계산한다.
-
-입력:
-
-- 현재 local coord.
-- 현재 heading.
-- accepted topology.
-- `grid_branch_mask`.
-- visited set.
-
-출력:
-
-- `turn_expected`: 다음 intersection decision에서 side turn을 pre-arm할지.
-- `planned_turn`: `left`, `right`, `none`.
-- `planned_heading_after_turn`.
-- `next_coord_candidate`.
-- `visited` update.
-- `sweep_row_index` 또는 `turn_side`.
-
-필수 정책:
-
-- row 내부에서는 현재 heading 방향의 unvisited neighbor가 있으면 직진한다.
-- row 끝에서는 같은 방향 90도 turn을 두 번 수행한다.
-- 첫 row 끝 turn side는 초기 진행 방향 기준으로 오른쪽을 기본값으로 둔다.
-- 다음 row 끝에서는 왼쪽, 그 다음은 오른쪽으로 번갈아 수행한다.
-- 전진 branch가 존재해도 이미 visited이거나 snake policy상 row 전환 지점이면 `turn_expected = true`가 되어야 한다.
-- branch가 존재하지 않는 방향으로는 이동 후보를 만들지 않는다.
-- 이미 visited인 node는 기본적으로 next target으로 선택하지 않는다. 단, 시작 진입 segment `s -> (0,0)`은 grid visited set에 포함하지 않는다.
-
-### 5.3 Heading 연결
-
-현재 live pipeline은 `GridCoordinateTracker` heading이 `Unknown`으로 남기 쉽다.
-
-구현 원칙:
-
-- 첫 node 기록 전에는 initial heading을 config 또는 default로 둔다. vision-only 기본값은 `north` 또는 `east` 중 하나로 명확히 문서화한다.
-- `SnakeTraversalPlanner`가 turn을 계획하면, 실제 제어가 없는 vision-only 모드에서는 다음 node를 기록하기 전에 planner의 expected heading을 `GridCoordinateTracker::setHeading()`에 반영한다.
-- 실제 MAVLink 제어가 붙는 미래 단계에서는 `notifyTurnCompleted()`를 실제 yaw 완료 event와 연결한다.
-
-주의:
-
-- hand-held top-down 테스트에서는 사람이 카메라 yaw를 돌리는 것이 실제 turn completion이다. 지금은 IMU/yaw feedback이 없으므로 planner의 discrete expected heading이 truth source다.
-
-### 5.4 교차점 중복 저장 방지
-
-교차점 node를 한 번 저장한 뒤 같은 물리 교차점이 여러 frame 동안 계속 보이면서 중복 저장되는 것을 막아야 한다.
-
-권장 방식:
-
-- `record_node_once_frames`만으로 막지 말고, 이동 상태에 따른 explicit cooldown state를 둔다.
-- 설정은 초 단위와 frame 단위를 모두 지원한다. 예: `node_ignore_after_straight_ms = 2000`, `node_ignore_after_turn_departure_ms = 2000`.
-- 12FPS 기준 2초는 약 24 frame이다. frame rate가 바뀌어도 같은 시간 의미를 유지하려면 `fps_assumption`으로 frame 수를 계산한다.
-
-직진 계속 시:
-
-- node 저장 후 planner action이 `continue`이면 `IgnoreAfterNodeStraight` 상태로 들어간다.
-- 이 상태에서는 2초 동안 `L/T/+`가 다시 안정적으로 인식되어도 새 `grid_node` event를 만들지 않는다.
-- line tracking, branch score, overlay/log용 raw intersection은 계속 계산하되 mission/grid 저장만 막는다.
-- 2초가 지나고, 현재 frame의 교차점 중심이 turn/record zone을 벗어났거나 line-only cruise 상태로 돌아온 뒤 다음 node를 받을 수 있게 한다.
-
-회전 시:
-
-- node 저장 후 planner action이 `turn_left` 또는 `turn_right`이면 `IgnoreDuringTurn` 상태로 들어간다.
-- 90도 회전 중에는 모든 교차점 저장을 무시한다.
-- 회전 완료를 확인한 뒤 `IgnoreAfterTurnDeparture` 상태로 들어가고, 출발 후 2초 동안 추가 교차점 저장을 무시한다.
-- 즉 회전 케이스의 무시 구간은 `회전 시작 -> 회전 완료 -> 출발 후 2초` 전체다.
-- 회전이 두 번 연속 필요한 snake row 전환에서는 첫 90도 회전, 한 칸 전진, 두 번째 90도 회전을 각각 별도 state로 다루되, 각 turn segment마다 동일한 ignore 규칙을 적용한다.
-
-상태 이름 후보:
-
-```text
-Cruise
-NodeRecorded
-IgnoreAfterNodeStraight
-TurnPending
-IgnoreDuringTurn
-TurnCompleted
-IgnoreAfterTurnDeparture
-```
-
-구현 위치:
-
-- `IntersectionDecisionEngine`은 raw decision과 `event_ready` 후보를 계속 계산한다.
-- 실제 node 저장 허용 여부는 `SnakeTraversalPlanner` 또는 별도 `NodeEventGate`가 결정한다.
-- `GridCoordinateTracker::update()`는 gate가 허용한 event만 받는다.
-- GCS log에는 `node_gate=ignore_straight`, `node_gate=ignore_turn`, `ignore_remaining_ms=...` 같은 compact 상태를 표시한다.
-
-주의:
-
-- 2초는 현재 hand-held/저속 테스트에는 합리적인 보수값이다. 실제 비행에서는 속도, cell 간격, FPS에 맞춰 줄이거나 늘려야 한다.
-- 너무 긴 ignore는 인접 교차점 간격이 짧거나 이동 속도가 빠를 때 다음 node를 놓칠 수 있다.
-- 따라서 완료 기준에는 “2초 고정”이 아니라 “기본 2초, config로 조정 가능”을 넣는다.
-
-### 5.5 수동 회전 완료 인식
-
-현재 드론/IMU/flight-controller 상태가 없으므로 onboard가 실제 yaw 완료를 직접 알 수 없다. 이번 vision-only 단계에서는 아래 중 하나를 사용한다.
-
-1. **Debug-only 고정 시간 방식**
-   - planner가 turn을 결정하면 `expected_heading`을 즉시 또는 `manual_turn_duration_ms` 후 갱신한다.
-   - 그동안 `IgnoreDuringTurn`으로 node 저장을 막는다.
-   - 사람이 그 시간 안에 카메라를 90도 돌린다고 가정한다.
-   - 구현이 가장 쉽지만, 사람이 늦게 돌리면 heading과 실제 화면이 어긋난다.
-
-2. **Vision-only 회전 완료 추정**
-   - turn 시작 후 line detector가 다시 안정적으로 line을 잡고, line center offset이 일정 범위 안이며, line angle이 camera forward axis에 가까운 frame이 `N`개 연속 나오면 turn completed로 본다.
-   - 추가로 planned direction의 branch가 front branch로 바뀌었는지 branch mask transition을 확인한다.
-   - 예: 우회전 계획이면 turn 전 right branch가 turn 후 front branch로 안정적으로 보여야 한다.
-   - 이 방식은 IMU 없이도 hand-held 테스트에 쓸 수 있지만, 영상만으로 정확한 90도 yaw를 보장하지는 않는다.
-
-3. **수동 확인 입력**
-   - GCS command channel이 아직 없으므로 당장 구현한다면 onboard process stdin 또는 임시 keyboard hotkey로 `turn done`을 입력받는다.
-   - 나중에 command channel이 생기면 GCS에서 `TURN_DONE` debug command를 보내도록 바꾼다.
-   - 사람이 직접 회전 완료를 알려주므로 state mismatch가 가장 적다.
-
-권장 순서:
-
-- 1차 구현은 `Debug-only 고정 시간 방식 + Vision-only 안정 조건` 조합으로 한다.
-- 즉 최소 `manual_turn_min_ms` 동안은 무조건 ignore하고, 그 이후 line center/angle이 안정되면 turn completed로 처리한다.
-- 안정 조건이 일정 timeout 안에 충족되지 않으면 GCS log에 `turn_wait_timeout`을 표시하고 수동 확인 입력을 허용한다.
-- 실제 드론이 생기면 이 부분은 Pixhawk yaw target reached 또는 onboard IMU yaw delta 기반 `notifyTurnCompleted()`로 대체한다.
-
-### 5.6 Telemetry 확장 여부
-
-최소 구현은 기존 `vision.grid_node.arrival_heading`, `grid_branch_mask`만 정확히 채워도 GCS grid renderer가 동작한다.
-
-더 나은 debug를 위해 protocol v1.8 후보로 아래 field를 추가할 수 있다.
-
-```json
-"vision": {
-  "snake": {
-    "enabled": true,
-    "state": "row_forward",
-    "current_coord": {"x": 2, "y": 1},
-    "current_heading": "west",
-    "planned_turn": "left",
-    "turn_expected": true,
-    "node_gate": "ignore_turn",
-    "ignore_remaining_ms": 1200,
-    "turn_completion": "vision_stable",
-    "next_coord": {"x": 2, "y": 2},
-    "visited_count": 8
-  }
-}
-```
-
-protocol을 확장하면 반드시 양쪽 문서를 같이 갱신한다.
-
-- `uav-onboard/docs/PROTOCOL.md`
-- `uav-gcs/docs/PROTOCOL.md`
-- `uav-onboard/src/protocol/TelemetryMessage.*`
-- `uav-gcs/src/protocol/TelemetryMessage.*`
-
-처음 작업에서는 protocol 확장을 최소화하고, 필요한 경우에만 `vision.snake`를 추가한다.
-
-## 6. GCS overlay 단순화 설계
-
-### 6.1 Line overlay
-
-수정 위치:
-
-- `uav-gcs/src/overlay/LineOverlay.*`
-- `uav-gcs/tests/test_line_overlay.cpp`
-
-변경 목표:
-
-- magenta contour는 유지하되 line 전체 blob contour만 보여준다.
-- green tracking point와 label은 제거한다.
-- 빨간 원을 `(line.tracking_point_px.x, frame_height / 2)`에 그린다.
-- 초록 line을 `(frame_width / 2, frame_height / 2)`에서 빨간 원까지 그린다.
-- 이때 빨간 원의 y는 telemetry의 `tracking_point_px.y`를 그대로 쓰지 말고 frame center y를 사용한다.
-
-필요 API 변경:
-
-- 현재 `buildLineOverlays(const LineTelemetry&)`는 frame width/height를 모른다.
-- `buildLineOverlays(const LineTelemetry&, int frame_width, int frame_height)` overload를 추가한다.
-- 기존 test/호출부를 새 signature로 옮긴다.
-
-`VisionDebugApp.cpp` 호출부:
-
-```cpp
-auto line_overlays = overlay::buildLineOverlays(
-    marker_frame->line,
-    marker_frame->width,
-    marker_frame->height);
-```
-
-### 6.2 Intersection overlay
-
-수정 위치:
-
-- `uav-gcs/src/overlay/IntersectionOverlay.*`
-- `uav-gcs/tests/test_intersection_overlay.cpp`
-
-변경 목표:
-
-- 기본 overlay에서 branch score text, decision full label, yellow endpoint circles를 제거한다.
-- top/ahead ROI 안에 있는 intersection만 간단히 표시한다.
-- ROI 기준은 첫 구현에서 `intersection.center_px.y <= frame_height * 0.60`으로 둔다. 현재 도착한 교점도 보려면 `turn_zone_y_max`와 맞춰 `0.68`까지 허용할 수 있다.
-- 표시 내용은 center 작은 원과 compact type/direction label만 둔다.
-- branch ray는 짧은 방향 표시만 남기고 점수 텍스트는 제거한다.
-
-필요 API 변경:
-
-- `buildIntersectionOverlays(intersection, decision, frame_width, frame_height)` overload 추가.
-- detailed/debug overlay는 나중에 `ui.toml` option으로 되살릴 수 있게 helper를 분리한다.
-
-### 6.3 UI config 후보
-
-당장 필수는 아니지만 `uav-gcs/config/ui.toml`에 다음 option을 추가할 수 있다.
-
-```toml
-[overlay]
-mode = "clean" # clean or debug
-intersection_ahead_y_max = 0.68
-show_line_label = false
-show_branch_scores = false
-```
-
-현재 config loader가 `vision_debug_main.cpp` 안에 있으므로, option을 늘릴 때는 `VisionDebugOptions`에 반영한다.
-
-## 7. 굵은 흰색 line mask 개선 설계
-
-### 7.1 문제 원인
-
-현재 `local_contrast_blur = 31`과 local contrast mask는 굵은 흰색 line 내부보다 edge contrast를 더 잘 살릴 수 있다. 넓은 테이프/종이는 중앙부가 local background와 비슷하게 계산되어 line 전체가 채워진 blob이 아니라 얇은 strip으로 남는다.
-
-### 7.2 개선 방향
-
-수정 위치:
-
-- `uav-onboard/src/vision/LineMaskBuilder.*`
-- `uav-onboard/src/vision/LineDetector.*`
-- `uav-onboard/src/common/VisionConfig.*`
 - `uav-onboard/config/vision.toml`
-- `uav-onboard/tools/line_detector_tuner.cpp`
-- `uav-onboard/tests/test_intersection_detector.cpp` 또는 신규 line mask test
+- `uav-onboard/tools/vision_debug_node.cpp`
+- `uav-onboard/tools/aruco_detector_tester.cpp`
+- 검증 산출물 `uav-gcs/logs/.../capture_baseline/`
 
-권장 구현:
+방안:
 
-- `LineMaskBuilder`에 wide white line용 mask strategy를 추가한다. 후보 이름: `white_fill` 또는 `local_contrast_fill`.
-- 기존 local contrast mask와 absolute white mask를 union한다.
-- absolute white mask는 HSV 또는 Lab 기반으로 만든다.
-  - HSV 후보: low saturation + high value.
-  - 예: `S <= 90`, `V >= 145`를 시작점으로 두되 config화한다.
-- union mask 이후 close/dilate/fill을 적용해 내부 빈 공간을 메운다.
-- `LineDetector`가 받는 contour는 fill된 mask의 largest connected component가 되도록 한다.
-- `IntersectionDetector::bridgeMask()`는 이미 close/dilate를 추가로 하므로, line detector 쪽 mask도 동일한 `LineMaskBuilder` 결과를 공유하게 유지한다.
+1. 2 m top-down 조건에서 focus sweep을 먼저 수행한다.
+   - `lens_position` 후보를 여러 값으로 돌려 marker corner sharpness, ArUco 검출률, line mask 안정성을 기록한다.
+   - 기존 기본값 `0.67`은 고정값으로 가정하지 않는다.
+2. onboard detection 입력의 JPEG 품질을 올려 비교한다.
+   - 현재 camera `jpeg_quality = 45`는 telemetry/debug에는 가볍지만 ArUco corner와 내부 bit pattern에는 불리할 수 있다.
+   - 2 m marker test에서는 `80~90` 후보를 baseline으로 비교한다.
+   - GCS debug video 품질이 아니라 onboard가 decode하는 camera MJPEG 품질을 기준으로 본다.
+3. shutter/exposure를 blur가 적은 쪽으로 고정한다.
+   - 모니터 촬영 테스트는 flicker/refresh 영향이 있으므로 실제 인쇄 경기장과 분리해서 기록한다.
+   - 움직이는 드론에서는 motion blur가 더 커질 수 있으므로 `shutter_us`, gain, exposure mode 후보를 별도 표로 남긴다.
+4. ArUco detector tester에 blur/contrast 지표를 출력하는 옵션을 추가한다.
+   - Laplacian variance 또는 corner gradient score를 `README.md`/summary에 남긴다.
+   - "검출 실패"와 "영상이 흐림"을 분리해서 판단한다.
 
-config 후보:
+성공 기준:
 
-```toml
-[line]
-mask_strategy = "white_fill"
-white_v_min = 145
-white_s_max = 90
-fill_close_kernel = 11
-fill_dilate_kernel = 3
-```
+- 같은 marker를 300 frame 이상 볼 때 direct ArUco 검출률, held marker 검출률, line decision 성공률을 함께 기록한다.
+- white/black 각각 camera quality/focus 변경 전후 결과를 `uav-gcs/logs`에 남긴다.
 
-`LineConfig`에 field를 추가할 때는 parser 기본값도 함께 추가한다.
+### 1. ArUco detector를 marker-contour 병합과 blur에 강하게 만들기
 
-### 7.3 Tracking point y 고정
+대상 파일:
 
-제어용 tracking point는 카메라 중앙 높이에서 산출되어야 한다.
+- `uav-onboard/src/vision/ArucoDetector.*`
+- `uav-onboard/src/common/VisionConfig.*`
+- `uav-onboard/tools/aruco_detector_tester.cpp`
+- `uav-onboard/tests/` 신규 또는 기존 테스트
 
-- `config/vision.toml`의 `line.lookahead_y_ratio`를 `0.50`으로 바꾸는 것을 1차 후보로 둔다.
-- 더 확실하게 하려면 `LineDetector`에서 source lookahead y를 `height * lookahead_y_ratio`로 계산하되 기본값을 `0.50`으로 변경한다.
-- GCS overlay는 frame center y를 사용하므로, telemetry y가 잠깐 다르더라도 화면 표시는 요구사항을 지킨다.
+방안:
 
-### 7.4 Tool 개선
+1. 기존 원본 frame `detectMarkers`를 1차 경로로 유지한다.
+2. OpenCV ArUco parameter를 config로 확장한다.
+   - `corner_refinement_method`, `corner_refinement_win_size`, `min_corner_distance_rate`, `polygonal_approx_accuracy_rate`, `min_otsu_std_dev`, `error_correction_rate`, `min_distance_to_border` 후보를 노출한다.
+   - blur가 있는 live capture에서는 ROI upscale 후 adaptive threshold를 적용하는 경로를 비교한다.
+3. direct 검출 결과는 temporal stabilizer로 hold한다.
+   - 같은 ID/corner가 최근 N frame 안에서 안정적으로 보였으면 3~6 frame 정도 marker polygon을 유지한다.
+   - held marker는 `source=held`로 표시하고, ID association에는 쓰되 새 ID 발견처럼 취급하지 않는다.
+4. 1차 검출 실패 또는 line polarity가 `dark_on_light`일 때 fallback을 추가한다.
+5. fallback은 dark/bright polarity별 marker candidate ROI를 찾고, grid line과 marker 외곽이 붙은 경우를 분리한다.
+   - dark mask에서 distance transform을 사용해 0.1 m line보다 훨씬 두꺼운 0.5 m marker core 후보를 분리한다.
+   - 후보의 aspect ratio, 면적, side length 범위를 config로 제한한다.
+   - 후보 주변 ROI를 추출하고, marker square 밖으로 이어지는 긴 수평/수직 grid line 성분을 배경색으로 suppress한 뒤 OpenCV ArUco 검출을 다시 수행한다.
+   - 검정 line 위 검정 marker는 독립 contour가 없을 수 있으므로, intersection 주변 "line 폭보다 넓은 검정 사각 plateau"를 후보로 삼아 ROI를 만든다.
+   - ROI에는 인위적인 흰색 quiet zone padding을 붙이고, outside-grid-arm suppression 후 threshold/upscale해서 `detectMarkers`를 다시 시도한다.
+   - 필요하면 inverted ROI도 시도하되, 검출 결과는 중복 제거한다.
+6. marker observation에 품질 정보를 추가할지 검토한다.
+   - 최소 후보: `id`, `center_px`, `corners_px`, `orientation_deg`는 유지.
+   - 추가 후보: `source = direct|roi_fallback|held`, `side_px`, `confidence_like`, `blur_score`, `rejected_reason`.
+   - protocol은 top-level `protocol_version = 1`을 유지하고 optional field만 추가한다.
 
-`line_detector_tuner`는 현재 숫자 결과만 출력한다. mask 개선 검증을 위해 option을 추가한다.
+성공 기준:
 
-후보:
+- white 이미지에서 기존처럼 4개 검출.
+- black 이미지에서 marker 4개 검출.
+- synthetic 또는 real crop에서 marker가 line과 붙어도 중복 검출이 생기지 않음.
+- 실기 white not-line-only 캡처처럼 direct 검출이 flicker되어도 held polygon은 line masking에 계속 공급된다.
 
-```powershell
-.\build\line_detector_tuner.exe --config config --image sample.png --mask white_fill --output out
-```
+### 2. marker-like occluder mask를 line mask보다 먼저 만들기
 
-출력:
+대상 파일:
 
-- `mask.png`
-- `overlay.png`
-- detected contour point count, bounding box, area, tracking x/y, offset
+- `uav-onboard/src/vision/ArucoDetector.*`
+- `uav-onboard/src/vision/LineMaskBuilder.*`
+- `uav-onboard/src/vision/VisionTypes.hpp`
+- `uav-onboard/src/app/VisionDebugPipeline.cpp`
+- 신규 `MarkerMaskBuilder` 또는 `MarkerStabilizer`
 
-## 8. Smoke/replay 검증 계획
+방안:
 
-### 8.1 입력 이미지
+1. marker ID가 읽힌 경우:
+   - marker polygon을 line mask의 ignore/occlusion 영역으로 변환한다.
+   - polygon을 marker 외곽보다 line width 1~2배만큼 확장한다.
+2. marker ID가 안 읽힌 경우:
+   - black square candidate, high-contrast square candidate, 이전 held marker polygon으로 `marker_like_occluder`를 만든다.
+   - white line mode에서는 검정 square 내부의 흰색 ArUco bit pattern을 line foreground에서 제거한다.
+   - black line mode에서는 검정 marker body가 line foreground로 합쳐지는 것을 occlusion으로 취급한다.
+3. `LineMaskBuilder`는 marker 영역 내부를 foreground로 쓰지 않는다.
+   - `light_on_dark`: marker polygon 내부의 흰색 bit cell을 제거한다.
+   - `dark_on_light`: marker polygon 내부의 검정 body를 제거한다.
+   - 제거 후 끊긴 line은 `IntersectionDetector`의 branch ray scoring에서 occlusion bridge로 보정한다.
+4. debug telemetry에 marker mask 상태를 추가한다.
+   - `marker_mask_source=direct|fallback|held|none`
+   - `marker_mask_count`
+   - `marker_mask_area_px`
+   - `marker_mask_used_for_line=yes/no`
 
-사용자 첨부 이미지와 기존 smoke 산출물을 기준으로 한다.
+성공 기준:
 
-- 굵은 흰색 line close-up 캡처 2장.
-- 현재 얇게 인식되는 GCS 캡처 1장.
-- `development-log/grid-smoke-20260501/mid_entry_rotated_centered/`
-- `development-log/grid-smoke-20260501/edge_entry_rotated_centered/`
+- `white_line_only.png`와 같은 조건에서 marker 내부 흰색 pattern이 line contour로 선택되지 않는다.
+- `white_not_line_only.png`처럼 marker가 검출된 frame에서도 intersection detector가 marker 내부가 아니라 실제 T branch를 기준으로 판단한다.
+- marker ID가 순간적으로 사라져도 held/fallback mask 때문에 line decision이 흔들리지 않는다.
 
-원본 이미지 파일 경로는 사용자 환경의 한글 경로에 있으므로, 테스트 데이터로 쓸 경우 repo 내부 `uav-onboard/test_data/images/` 또는 `development-log/` 아래에 복사해서 상대 경로로 관리한다.
+### 3. line/intersection 판단은 marker-aware occlusion 보정만 추가하기
 
-### 8.2 Onboard test
+대상 파일:
 
-실행 후보:
+- `uav-onboard/src/vision/IntersectionDetector.*`
+- `uav-onboard/src/vision/LineMaskBuilder.*`
+- `uav-onboard/src/vision/VisionTypes.hpp`
+- `uav-onboard/src/app/VisionDebugPipeline.cpp`
+- `uav-onboard/tests/test_intersection_detector.cpp`
+
+방안:
+
+1. `IntersectionDetector::detect`에 marker observations 또는 marker occlusion polygons를 전달할 수 있는 overload를 추가한다.
+2. marker polygon을 `LineMaskGeometry`의 work 좌표로 변환하고, line 폭만큼 expand한 occlusion mask를 만든다.
+3. branch ray scoring에서 marker 영역 안의 sample은 denominator에서 제외하거나 marker 뒤쪽부터 scoring을 시작한다.
+   - 목적은 marker 때문에 line이 끊겨도 branch score가 과도하게 낮아지지 않게 하는 것이다.
+   - 반대로 검정 marker body가 큰 foreground blob으로 잡혀 `+`로 false-upgrade되는 것도 막아야 한다.
+4. center candidate 선택에서는 marker blob 중심만으로 교차점 candidate가 되지 않도록 한다.
+   - line mask component centroid 후보를 쓰되, marker occlusion 영역 내부 foreground density는 center validity score에서 감점 또는 제외한다.
+5. white T 교차점 전용 보강:
+   - marker polygon과 실제 line이 겹친 방향은 "occluded branch candidate"로 표시하고, polygon 바깥쪽 ray가 충분히 이어지면 branch present로 인정한다.
+   - marker 내부 foreground는 branch 증거가 아니라 occlusion hole로만 취급한다.
+6. black + 교차점 전용 보강:
+   - marker body가 line과 붙은 큰 검정 component를 `+` branch 자체로 쓰지 않는다.
+   - branch present는 marker polygon 바깥의 4방향 line continuity로 판단한다.
+7. marker-aware detector가 내보내는 것은 여전히 `IntersectionDetection.branches[].score/present`, `branch_mask`, `type`이다. `IntersectionDecisionEngine`은 수정하지 않는 것을 기본 방침으로 한다.
+
+성공 기준:
+
+- marker 없는 기존 L/T/+/straight 테스트가 그대로 통과.
+- marker가 중심을 가리는 L/T/+ synthetic 테스트가 light/dark polarity 모두 통과.
+- marker가 검정 line과 붙은 black-grid crop에서도 branch mask가 marker square 때문에 `+`로 잘못 올라가지 않음.
+- 실제 캡처 기준:
+  - black `+`: line-only와 not-line-only 모두 `decision.accepted_type = +`.
+  - white `T`: line-only와 not-line-only 모두 `decision.accepted_type = T`.
+  - white not-line-only에서 marker ID가 검출되든 held되든 intersection 판단은 `unknown`으로 떨어지지 않음.
+
+### 4. marker와 grid node association 저장하기
+
+대상 파일:
+
+- `uav-onboard/src/mission/GridCoordinateTracker.*`
+- `uav-onboard/src/protocol/TelemetryMessage.*`
+- `uav-gcs/src/protocol/TelemetryMessage.*`
+- `uav-gcs/src/telemetry/TelemetryStore.*`
+- `uav-gcs/src/telemetry/VisionLogFormatter.*`
+
+방안:
+
+1. `GridNodeEvent` 또는 별도 `MarkerNodeAssociation`에 node와 marker 연결 정보를 optional로 저장한다.
+2. association 조건:
+   - `intersection_decision.event_ready == true`인 frame 또는 최근 N frame 안의 marker를 대상으로 한다.
+   - marker center와 accepted intersection center의 거리가 marker side 또는 node radius 기반 threshold 이내여야 한다.
+   - 같은 node lockout 기간에는 같은 marker를 중복 기록하지 않는다.
+3. telemetry optional field 예시:
+   - `vision.grid_node.marker_id`
+   - `vision.grid_node.marker_center_px`
+   - `vision.grid_node.marker_distance_px`
+   - `vision.grid_node.marker_associated`
+   - 또는 `vision.marker_node` 별도 object
+4. GCS parser는 field가 없어도 기존 telemetry를 정상 처리하게 default 값을 둔다.
+5. marker association은 mission 판단을 바꾸지 않고 log/overlay/추후 mission policy 입력으로만 저장한다.
+
+성공 기준:
+
+- marker가 있는 교차점에서 node event가 발생하면 marker id와 local coord가 같은 telemetry packet 또는 같은 replay step 산출물에 기록된다.
+- marker가 frame 안에 있어도 아직 node event가 아니면 grid node에 연결하지 않는다.
+
+### 5. GCS overlay와 vision log 개선
+
+대상 파일:
+
+- `uav-gcs/src/overlay/MarkerOverlay.*`
+- `uav-gcs/src/overlay/IntersectionOverlay.*`
+- `uav-gcs/src/app/VisionDebugApp.cpp`
+- `uav-gcs/src/telemetry/VisionLogFormatter.*`
+- `uav-gcs/tests/test_intersection_overlay.cpp`
+- 신규 marker/grid overlay 테스트
+
+방안:
+
+1. 기존 marker polygon overlay는 유지한다.
+2. marker mask/held/fallback 상태를 overlay에 구분해 표시한다.
+   - direct ArUco: 기존 녹색 marker polygon.
+   - held marker: 점선 또는 다른 색상.
+   - fallback occluder only: ID 없는 사각 mask를 얇은 회색/주황색 box로 표시.
+3. associated marker가 있으면 교차점 label 또는 marker label에 node coord를 같이 표시한다.
+   - 예: `ID 2 node(1,2)` 또는 `M2 @(1,2)`.
+4. `IntersectionOverlay`가 현재 decision 인자를 거의 쓰지 않으므로, accepted decision label을 실제 overlay에 반영한다.
+   - detector raw type과 decision accepted type이 다르면 둘 다 보이게 한다.
+5. `VisionLogFormatter`에 marker-node association과 marker mask 상태를 추가한다.
+   - `[grid-node] ... marker_id=2 marker_dist=...`
+   - `[marker-mask] source=direct|fallback|held|none count=... area=... used_for_line=yes`
+   - `[markers] ... associated_node=(x,y)` 또는 별도 `[marker-node]` line
+6. grid map pane은 기본 ASCII 구조를 유지하되, marker id 표시가 필요하면 node line에만 남기고 map 문자는 과도하게 복잡하게 만들지 않는다.
+
+성공 기준:
+
+- GCS video overlay에서 marker outline, branch rays, accepted node label이 서로 모순 없이 보인다.
+- log만 봐도 어떤 marker가 어떤 local grid node에 저장됐는지 확인 가능하다.
+
+## 검증/replay 계획
+
+### 검증 tool 확장
+
+기존 `grid_image_smoke`를 확장하거나 새 tool `marker_grid_replay`를 만든다. 기존 tool을 과하게 복잡하게 만들면 새 tool이 낫다.
+
+필수 기능:
+
+1. 입력:
+   - `--image ../../grid_images/black_grid_with_aruco_marker.png`
+   - `--image ../../grid_images/white_grid_with_aruco_marker.png`
+   - `--line-mode dark_on_light|light_on_dark`
+   - `--cell-m 4.0 --line-width-m 0.1 --marker-m 0.5 --altitude-m 2.0`
+   - `--camera-width 960 --camera-height 720`
+   - `--fov-mode diagonal|horizontal --fov-deg <value>`
+2. geometry:
+   - white grid는 bright line mask로 line centers 검출.
+   - black grid는 dark line mask로 line centers 검출.
+   - 3x3 cell이면 4x4 intersection lattice로 expected topology를 만든다.
+3. replay:
+   - full-field image를 고정하고 drone crop center를 snake path를 따라 이동시킨다.
+   - crop은 camera heading 기준으로 회전해 현재 onboard의 "진행 방향 앞쪽" 판단과 맞춘다.
+   - 각 node마다 approach frames를 여러 장 만든다. centered crop 한 장만 쓰지 않는다.
+   - `frame_seq`, `timestamp_ms = frame_seq * 83`으로 12 FPS window 판단을 재현한다.
+4. detector 실행:
+   - ArUco, line, intersection, stabilizer, decision, grid tracker를 실제 pipeline과 최대한 같은 순서로 호출한다.
+   - GCS overlay builder도 호출해 overlay PNG를 만든다.
+5. 산출물:
+   - `uav-gcs/logs/<timestamp>-aruco-marker-grid-smoke/black/`
+   - `uav-gcs/logs/<timestamp>-aruco-marker-grid-smoke/white/`
+   - 각 폴더에 `README.md`, `config.json`, `geometry.csv`, `crop_manifest.csv`, `telemetry.jsonl`, `summary.csv`, `failures.csv`, `grid_map.txt`, `frames/`, `overlays/` 저장.
+
+### Acceptance criteria
+
+white/black 각각:
+
+- marker 검출률: full-field 및 replay crop에서 expected marker가 검출되어야 한다.
+- marker mask 안정성: direct marker 검출이 실패한 frame에서도 held/fallback occluder mask가 line 판단에 공급되어야 한다.
+- marker-node association: marker가 놓인 교차점에서 `marker_id -> local_coord`가 기록되어야 한다.
+- node 판단: marker가 있는 교차점에서도 expected L/T/+와 `decision.accepted_type`이 일치해야 한다.
+- branch mask: marker 때문에 `L -> T/+`, `T -> +`로 false-upgrade되지 않아야 한다.
+- snake 좌표: replay path의 expected local coord와 `GridCoordinateTracker` node coord가 일치해야 한다.
+- overlay: 각 marker event 주변 frame의 overlay PNG에서 marker polygon, branch rays, accepted decision, node label이 같은 위치를 가리켜야 한다.
+- 성능: 추가 ArUco fallback과 marker-aware scoring 후에도 12 FPS 기준 frame budget을 넘는 frame이 summary에 표시되어야 하며, 평균 processing latency 목표는 83 ms 미만으로 둔다.
+
+### 권장 실행 명령
+
+초기 baseline:
 
 ```powershell
 cd uav-onboard
-cmake -S . -B build-tests -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
-cmake --build build-tests
-ctest --test-dir build-tests --output-on-failure
+$env:PATH="C:\msys64\ucrt64\bin;$env:PATH"
+.\build-opencv-tests\aruco_detector_tester.exe --config config --image ..\grid_images\white_grid_with_aruco_marker.png
+.\build-opencv-tests\aruco_detector_tester.exe --config config --image ..\grid_images\black_grid_with_aruco_marker.png
 ```
 
-OpenCV tools smoke:
+구현 후 검증 예시:
 
 ```powershell
-.\build\line_detector_tuner.exe --config config --image test_data/images/line_wide_white.png --mask white_fill --output test_data/logs/line_wide_white
-.\build\grid_image_smoke.exe --config config --image test_data/images/grid_sample.png --output test_data/logs/grid_smoke --scenario sample
+cd uav-onboard
+$env:PATH="C:\msys64\ucrt64\bin;$env:PATH"
+cmake --build build-opencv-tests
+ctest --test-dir build-opencv-tests --output-on-failure
+.\build-opencv-tests\marker_grid_replay.exe --config config --image ..\grid_images\white_grid_with_aruco_marker.png --line-mode light_on_dark --output ..\uav-gcs\logs\<timestamp>-aruco-marker-grid-smoke\white
+.\build-opencv-tests\marker_grid_replay.exe --config config --image ..\grid_images\black_grid_with_aruco_marker.png --line-mode dark_on_light --output ..\uav-gcs\logs\<timestamp>-aruco-marker-grid-smoke\black
 ```
 
-검증 기준:
-
-- wide white line의 contour가 line 양쪽 edge만이 아니라 line 전체 blob 외곽을 감싼다.
-- `tracking_point.y`가 frame center 또는 config `lookahead_y_ratio = 0.50`에 맞는다.
-- `intersection` branch mask가 `+`/`T`/`L`에서 이전보다 덜 누락된다.
-- `GridCoordinateTracker` heading이 unknown으로 남지 않는다.
-- snake path coordinate가 `snake_full_field.csv`, `snake_from_entry.csv`에서 expected와 일치한다.
-
-### 8.3 GCS test
-
-실행 후보:
+GCS 테스트:
 
 ```powershell
 cd uav-gcs
-cmake -S . -B build-tests -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+$env:PATH="C:\msys64\ucrt64\bin;$env:PATH"
 cmake --build build-tests
 ctest --test-dir build-tests --output-on-failure
 ```
 
-검증 기준:
+실기 캡처 회귀 테스트:
 
-- `test_line_overlay`는 red center circle과 green horizontal offset line을 확인한다.
-- `test_intersection_overlay`는 score text 없이 compact branch/type 표시를 확인한다.
-- `test_grid_map_tracker`는 node event sequence를 ASCII grid로 정확히 렌더링한다.
-- `VisionLogFormatter`가 grid map block을 포함해도 기존 packet/line/intersection 로그가 깨지지 않는다.
+```powershell
+cd uav-onboard
+$env:PATH="C:\msys64\ucrt64\bin;$env:PATH"
+.\build-opencv-tests\marker_frame_replay.exe --config config --image "c:\Users\mseoky\Pictures\Screenshots\black_line_only.png" --line-mode dark_on_light --expected +
+.\build-opencv-tests\marker_frame_replay.exe --config config --image "c:\Users\mseoky\Pictures\Screenshots\black_not_line_only.png" --line-mode dark_on_light --expected + --enable-aruco
+.\build-opencv-tests\marker_frame_replay.exe --config config --image "c:\Users\mseoky\Pictures\Screenshots\white_line_only.png" --line-mode light_on_dark --expected T
+.\build-opencv-tests\marker_frame_replay.exe --config config --image "c:\Users\mseoky\Pictures\Screenshots\white_not_line_only.png" --line-mode light_on_dark --expected T --enable-aruco
+```
 
-## 9. 구현 시 주의사항
+## 작업 순서
 
-- 이번 단계에서 Pixhawk/MAVLink control loop를 구현하지 않는다.
-- onboard critical path에 GCS video drawing이나 heavy logging을 넣지 않는다.
-- debug video는 best-effort다. mission 판단에 필요한 grid/snake state는 telemetry 이전에 onboard에서 계산한다.
-- GCS grid renderer는 표시용이다. 최종 mission policy source of truth는 onboard snake planner가 되어야 한다.
-- official competition origin/axis 변환은 이번 범위 밖이다. 모든 좌표는 local exploration coordinate다.
-- branch bit 순서는 기존 코드를 따른다.
-  - camera branch: front=bit0, right=bit1, back=bit2, left=bit3.
-  - grid branch: north=bit0, east=bit1, south=bit2, west=bit3.
-- `+` false upgrade guard는 유지한다. 약한 네 번째 branch 때문에 `T`를 `+`로 올리는 회귀를 만들지 않는다.
-- GCS overlay를 줄이더라도 vision log에는 tuning에 필요한 raw 값이 남아야 한다.
-- 한글 경로 이미지를 자동 테스트에 직접 의존하지 않는다. 필요한 sample은 repo 내부 test data로 복사해 상대 경로를 사용한다.
-- node 저장 후 ignore/cooldown 중에도 detector 자체는 계속 돌린다. 무시하는 것은 grid node 저장과 mission event 생성뿐이다.
-- 수동 hand-held 회전 단계에서는 fixed-time, vision-stable, manual-confirm 중 어떤 turn completion source를 썼는지 telemetry/log에 남긴다.
+1. 실기 캡처 4장을 baseline 회귀 입력으로 등록한다. 현재 실패/성공 상태를 `uav-gcs/logs/<timestamp>-marker-live-capture-baseline/`에 남긴다.
+2. 카메라 focus/JPEG/exposure baseline을 잡고, blur score와 ArUco 검출률을 함께 기록한다.
+3. marker stabilizer와 marker-like occluder mask를 먼저 구현한다. 이 단계의 목표는 white T에서 marker 내부 흰색 pattern을 line으로 쓰지 않게 하는 것이다.
+4. marker-aware line/intersection scoring을 구현하고 synthetic L/T/+ marker occlusion unit test 및 실기 캡처 4장 회귀 테스트를 통과시킨다.
+5. ArUco detector fallback을 구현하고 `aruco_detector_tester`로 black/white full-field 검출을 통과시킨다.
+6. black marker가 계속 실패하면 소프트웨어 fallback 결과와 함께 물리 설계 변경안을 판단한다.
+   - black line 위 marker에는 흰색 quiet zone/mounting patch를 추가한다.
+   - marker black border가 black grid line과 직접 닿지 않게 최소 여백을 둔다.
+   - 가능하면 marker를 line 위가 아니라 교차점 중심의 별도 흰색 plate 위에 붙인다.
+7. marker-node association telemetry를 추가하고 onboard/GCS protocol parser 테스트를 갱신한다.
+8. GCS overlay/log에 association 및 marker-mask 상태 표시를 추가하고 overlay 테스트를 갱신한다.
+9. marker grid replay를 2 m IMX519 crop 방식으로 실행해 `uav-gcs/logs`에 black/white 결과를 남긴다.
+10. 결과를 `development-log/RESEARCH.md` 또는 별도 검증 메모에 요약한다.
 
-## 10. 완료 기준
+## 리스크와 판단 기준
 
-작업 완료로 보려면 다음이 충족되어야 한다.
-
-- GCS vision log에 node event가 들어올 때마다 ASCII grid가 갱신된다.
-- 첫 node는 local `(0,0)`으로 표시되고 `s` 진입 segment가 보인다.
-- 현재 좌표와 heading arrow가 보인다.
-- snake traversal은 visited node를 재방문 대상으로 고르지 않는다.
-- 전진 branch가 있어도 policy상 row 전환 지점이면 `turn_expected` 또는 planned turn이 표시된다.
-- node 저장 후 직진이면 기본 2초 동안 같은 교차점이 재저장되지 않는다.
-- 회전이면 90도 회전 중과 회전 후 출발 기본 2초 동안 교차점이 재저장되지 않는다.
-- 직진/회전 ignore 시간은 config로 조정 가능하다.
-- hand-held 테스트에서 turn completion source가 fixed-time, vision-stable, manual-confirm 중 무엇인지 로그로 확인된다.
-- GCS camera overlay는 red line-center circle + green horizontal offset line + compact intersection 방향 표시만 기본으로 보여준다.
-- 빨간 원의 y 좌표는 항상 frame center y다.
-- 굵은 흰색 line sample에서 magenta contour가 line 전체 blob을 감싼다.
-- `uav-gcs`와 `uav-onboard` 관련 tests가 통과한다.
-- README 또는 protocol을 바꾼 경우 양쪽 문서가 동기화된다.
+- black grid 이미지처럼 marker 외곽이 검정 line과 완전히 붙으면 표준 ArUco 검출만으로는 부족하다. fallback이 실패하면 실제 경기장 marker 주변에 밝은 quiet zone을 확보하는 물리 설계 변경도 후보로 남긴다.
+- white grid에서는 marker 내부 흰색 bit가 line mask foreground와 같은 polarity라서, ArUco ID 검출률이 좋아져도 marker polygon을 line mask에서 제거하지 않으면 T 판단은 계속 깨질 수 있다.
+- ArUco 검출 flicker는 marker ID 저장 문제뿐 아니라 line masking 문제도 만든다. direct 검출 결과만 쓰지 말고 held/fallback occluder mask를 별도 상태로 유지해야 한다.
+- 모니터 촬영은 실제 인쇄 경기장보다 blur, refresh artifact, moire가 클 수 있다. 다만 이번 캡처는 detector가 견뎌야 할 worst-case 회귀 입력으로 보관한다.
+- IMX519 FOV와 실제 focus/exposure가 다르면 2 m crop footprint가 달라진다. replay tool은 FOV를 config화하고, 실제 카메라 calibration 값으로 교체 가능해야 한다.
+- debug video는 best-effort라 검증의 기준이 아니다. 최종 pass/fail은 replay telemetry/log/summary와 onboard state 기준으로 판단한다.
+- marker-aware 보정은 detector layer에 국한한다. decision layer까지 marker special-case가 들어가면 현재 안정화된 branch evidence 정책을 흔들 수 있으므로 마지막 수단으로 둔다.
