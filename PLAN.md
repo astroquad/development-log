@@ -1,6 +1,6 @@
 # ArUco marker at intersection 대응 계획
 
-최종 업데이트: 2026-05-10
+최종 업데이트: 2026-05-13
 
 ## 목표
 
@@ -114,6 +114,11 @@ ArucoDetector
    - black line 위 marker 주변에 흰색 quiet zone 또는 mounting patch를 둔다.
    - marker black border가 black grid line과 직접 닿지 않게 최소 여백을 둔다.
    - 가능하면 marker를 line 위가 아니라 교차점 중심의 별도 흰색 plate 위에 붙인다.
+4. fresh detection이 가끔 성공하지만 frame마다 깜빡이는 경우에는 ROI를 키우지 않고 marker temporal hold로 안정화한다.
+   - `MarkerStabilizer`가 최근 marker를 `aruco.hold_frames` 동안 유지한다.
+   - 기본값은 `hold_frames = 9`이며, 12FPS 기준 약 0.75초다.
+   - stale marker가 line mask를 지우지 않도록 occlusion mask에는 fresh detection만 사용한다.
+   - line tracking X 보정에는 기존 detection interval 안의 marker만 사용하고, 더 오래 hold된 marker는 ID telemetry 안정화용으로만 쓴다.
 
 성공 기준:
 
@@ -250,3 +255,7 @@ ctest --test-dir build-tests --output-on-failure
 - black line에서는 software fallback만으로 ArUco 검출이 어려울 수 있다. marker black border와 black grid line이 붙으면 물리적으로 quiet zone이 사라지기 때문이다.
 - 모니터 촬영은 실제 인쇄 경기장보다 blur, refresh artifact, moire가 크다. 실기 캡처는 worst-case 회귀 입력으로 쓰되, 최종 튜닝은 실제 경기장 재질과 조명에서 다시 해야 한다.
 - marker-aware 보정은 detector layer에 국한한다. decision layer special-case는 현재 안정적인 branch evidence 정책을 흔들 수 있으므로 사용하지 않는다.
+
+## 아직 해결하지 못한 것
+- 검정 격자 기준 ArUco marker ID의 짧은 깜빡임은 `MarkerStabilizer` hold로 1차 완화했다.
+- marker가 거의 한 번도 fresh detection되지 않는 조건은 아직 남을 수 있다. 이 경우에는 software hold가 아니라 marker 주변 흰색 quiet zone/plate 같은 물리 조건 또는 중앙부 template fallback 주기 튜닝이 필요하다.

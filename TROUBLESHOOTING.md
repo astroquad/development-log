@@ -1546,3 +1546,47 @@ uav-gcs/logs/20260510-054244-marker-centered-verify/
 ### 남은 이슈
 
 black line에서 ArUco marker 인식이 깜빡이면서 됐다 안 됐다를 반복하거나, 잠깐만 인식되는 문제가 아직 남아 있다. 현재 단계에서는 교차점 판단과 line tracing은 유지되지만, marker ID 검출 결과의 temporal 안정화는 다음 작업으로 남긴다.
+
+## 33. `dark_on_light`에서 ArUco marker ID가 짧게 깜빡이는 문제
+
+### 문제 상황
+
+`dark_on_light`에서는 검정 라인과 ArUco marker의 검정 외곽이 붙어 보인다. 이 경우 OpenCV ArUco 검출이 marker quiet zone과 외곽 contour를 안정적으로 분리하지 못해, marker가 실제로 화면 중앙에 있어도 ID가 한두 detection 주기마다 사라질 수 있다.
+
+ROI를 더 넓히거나 fallback ROI 개수를 늘리면 31번 문제처럼 ArUco generic fallback 비용이 다시 커질 수 있으므로, CPU 사용량을 크게 늘리는 방식은 피해야 한다.
+
+### 해결
+
+온보드에 `MarkerStabilizer`를 추가했다.
+
+- ArUco가 fresh detection을 낸 프레임에서는 기존처럼 즉시 marker를 갱신한다.
+- detection 주기 사이 또는 `dark_on_light`에서 일시적으로 미검출된 프레임에서는 최근 marker를 짧게 hold한다.
+- fresh marker가 없을 때는 line/intersection mask용 occlusion에는 넘기지 않는다. 즉, 오래된 marker box가 line mask를 계속 지우지는 않는다.
+- line tracking X 보정에는 기존 detection interval 안의 marker만 사용한다. 더 오래 hold된 marker는 marker ID telemetry 안정화용으로만 남긴다.
+- hold 길이는 `[aruco] hold_frames`로 설정한다. 기본값은 `9`이며, 12FPS 기준 약 0.75초다.
+
+핵심은 “더 많이 찾는 것”이 아니라 “이미 맞게 잡힌 ID를 짧게 안정화하는 것”이다. 따라서 ArUco ROI budget, fallback component 수, camera ROI는 늘리지 않는다.
+
+### 검증
+
+Windows OpenCV test build 기준:
+
+```powershell
+$env:PATH="C:\msys64\ucrt64\bin;$env:PATH"
+cmake --build build-opencv-tests
+ctest --test-dir build-opencv-tests --output-on-failure
+.\build-opencv-tests\aruco_detector_tester.exe --config config --image ..\grid_images\black_grid_with_aruco_marker.png
+.\build-opencv-tests\aruco_detector_tester.exe --config config --image ..\grid_images\white_grid_with_aruco_marker.png
+```
+
+결과:
+
+- `marker_stabilizer` 포함 onboard OpenCV tests `6/6` 통과.
+- `black_grid_with_aruco_marker.png`: marker 4개 검출.
+- `white_grid_with_aruco_marker.png`: marker 4개 검출.
+
+### 현장 튜닝 기준
+
+- marker ID가 1-2 detection 주기만 비는 정도면 `hold_frames = 9`를 유지한다.
+- 드론 이동 속도가 빨라 stale marker가 오래 남는 느낌이면 `hold_frames = 6`으로 낮춘다.
+- marker가 거의 한 번도 fresh detection되지 않는다면 hold로는 해결되지 않는다. 이 경우에는 ROI를 넓히기보다 marker 주변에 흰색 quiet zone/plate를 물리적으로 확보하거나, 중앙부 template fallback을 더 자주 돌리는 별도 튜닝을 검토한다.

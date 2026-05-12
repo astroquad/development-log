@@ -136,6 +136,7 @@ IMX519 camera
 | Marker mask | `line.marker_mask_enabled = true`, marker 내부 패턴을 line/intersection 후보에서 제외 |
 | ArUco live interval | `aruco.detect_interval_frames = 3`, live frame에서는 매 frame 전체 검출을 피함 |
 | ArUco fallback bound | `aruco.fallback_max_components = 12`, `fallback_max_rois = 120` |
+| ArUco marker hold | `aruco.hold_frames = 9`, 검정 라인 위 marker ID flicker를 CPU 추가 없이 짧게 안정화 |
 
 `--fps`는 camera capture FPS가 아니라 debug video send FPS다. Camera capture FPS를 바꾸려면 config 또는 별도 camera option을 확인한다.
 
@@ -211,6 +212,7 @@ Network discovery/broadcast가 막히면:
 - 2026-05-10 사용자 제공 `white.png`는 marker-aware 정적 검증에서 `ix_type=L`, marker center 기반 tracking point로 확인했다.
 - 2026-05-10 사용자 제공 `black.png`는 template fallback으로 marker ID가 검출됨을 확인했다.
 - 2026-05-10 Pi 4 + IMX519 + local GCS 조건에서 `f47e30e` 적용 후 ArUco+line `dark_on_light`, `light_on_dark`를 각각 약 93초 실행했다. 두 모드 모두 stdout 기준 약 `12.02fps`, video drop `0`, skip `0`으로 유지됐다.
+- 2026-05-13 `MarkerStabilizer`를 추가해 `dark_on_light`에서 ArUco marker ID가 detection 주기마다 짧게 깜빡이는 문제를 `hold_frames = 9`로 완화했다. ROI/fallback budget은 늘리지 않았다.
 
 Smoke 산출물 위치:
 
@@ -249,14 +251,14 @@ Windows에서 OpenCV DLL이 필요하면 테스트 전에 `PATH`에 `C:\msys64\u
 - `white_fill`/`dark_fill`은 개선되었지만 실제 배경과 조명에 따라 HSV threshold와 morphology 재튜닝이 필요할 수 있다.
 - Branch ray score가 threshold 주변에 있거나 격자가 회전되어 보이면 `+`/`T`/`L` downgrade가 여전히 생길 수 있다.
 - ArUco marker가 frame 가장자리에서 많이 잘리거나 blur가 심하면 잘못된 ID를 내지 않도록 미검출 처리될 수 있다.
-- black line에서 ArUco marker 인식이 깜빡이거나 잠깐만 인식되는 현상이 아직 남아 있다. 현재는 교차점 판단과 line tracing은 유지되지만, marker ID telemetry의 temporal 안정화는 추후 별도 작업으로 남긴다.
+- black line에서 ArUco marker가 거의 한 번도 fresh detection되지 않는 물리 조건은 아직 남아 있을 수 있다. 짧은 flicker는 `MarkerStabilizer` hold로 완화했지만, fresh detection 자체가 없으면 흰색 quiet zone/plate 같은 물리 보정 또는 중앙부 template fallback 주기 튜닝이 필요하다.
 - GCS discovery beacon이 Pi에서 수신되지 않는 경우가 있다. 이때 onboard는 `255.255.255.255` broadcast fallback으로 video를 보내므로, 안정적인 관제 테스트에서는 `--gcs-ip <laptop-ip>`로 unicast를 고정하는 편이 낫다.
 - Debug video packet loss는 정상적으로 발생할 수 있다. Mission 판단은 telemetry와 onboard state 기준으로 봐야 한다.
 - GCS video latency는 clock sync 없이 정확히 측정하지 않는다.
 
 추천 다음 작업:
 
-1. black line에서 ArUco marker 인식이 깜빡이거나 잠깐만 인식되는 문제를 marker temporal cache/stabilizer 관점에서 해결한다.
+1. `dark_on_light` marker hold를 Pi 실시간 캡처에서 검증하고, 필요하면 `hold_frames`를 6-12 범위에서 조정한다.
 2. GCS discovery beacon이 Pi에서 수신되지 않는 원인을 확인하고, 가능하면 `--gcs-ip` 없이도 unicast 전환되도록 고친다.
 3. 실제 경기장과 유사한 frame set으로 `intersection_threshold`, `process_width`, white/dark fill threshold를 비교한다.
 4. `grid_image_smoke`를 단일 이미지 crop이 아니라 실제 연속 frame/replay 입력까지 확장한다.
