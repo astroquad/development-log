@@ -760,8 +760,8 @@ rpicam-vid -t 5000 --nopreview --codec mjpeg --width 640 --height 480 --framerat
 ### 판단
 
 - `rpicam-hello --list-cameras`에 IMX519가 없으면 Astroquad 코드 문제가 아니라 OS/kernel/rpicam/IMX519 driver 또는 CSI cable 문제부터 확인한다.
-- IMX519-78은 autofocus camera이므로 `autofocus_mode`, `lens_position`, `exposure` 설정이 line confidence에 직접 영향을 준다.
-- 실제 미션에서는 continuous autofocus가 focus hunting을 만들 수 있으므로, `manual + lens_position`과 `auto`를 실제 고도에서 비교한다.
+- 현재 Pi image에서는 IMX519 센서와 `ak7375` lens driver가 잡히지만 libcamera AF algorithm이 없어 `autofocus_mode`/`lens_position`은 적용되지 않을 수 있다.
+- 이 경우 `/dev/v4l-subdev1`의 `focus_absolute` V4L2 control을 사용한다.
 - Pi 4에서도 debug video는 best-effort다. GCS 영상이 끊겨도 onboard line/marker telemetry와 추후 MAVLink control loop가 우선이다.
 
 ### 적용된 1차 대응
@@ -772,6 +772,41 @@ rpicam-vid -t 5000 --nopreview --codec mjpeg --width 640 --height 480 --framerat
 - GCS는 새 system/camera/debug field를 log window에 표시한다.
 - 현재 성능 우선 기본값은 `camera.width=960`, `camera.height=720`, `camera.fps=12`, `camera.jpeg_quality=45`, `debug_video.enabled=false`, `debug_video.send_fps=5`, `debug_video.chunk_pacing_us=150`이다.
 - GCS video latency/age 표시는 제거했다. GCS camera overlay는 `frame N`만 표시한다.
+
+### 2026-05-13 focus 확인
+
+Pi에서 다음 로그가 확인됐다.
+
+```text
+Could not set AF_MODE - no AF algorithm
+Could not set LENS_POSITION - no AF algorithm
+lp -1.00
+```
+
+즉 `rpicam --lens-position` 경로는 현재 image에서 동작하지 않는다. 하지만 media topology에는 lens subdevice가 있다.
+
+```text
+entity 4: ak7375 10-000c
+device node name /dev/v4l-subdev1
+focus_absolute min=0 max=4095
+```
+
+`v4l2-ctl -d /dev/v4l-subdev1 --set-ctrl focus_absolute=<value>`로 초점이 움직이는 것을 확인했고, 현재 테스트 장면에서는 대략 다음 결과가 나왔다.
+
+```text
+focus_absolute=1984 -> focus metric 약 1127
+focus_absolute=2048 -> focus metric 약 1184
+focus_absolute=3072 -> focus metric 약 352
+focus_absolute=4095 -> focus metric 약 337
+```
+
+현장값은 카메라 높이/대상 거리마다 달라질 수 있으므로 `1984~2112` 근처에서 다시 좁게 sweep한다. 현재 config에는 conservative하게 `focus_absolute = 1984`를 넣었다.
+
+코드 변경:
+
+- `[camera] focus_absolute`와 `focus_device`를 추가했다.
+- `RpicamMjpegSource`가 rpicam 실행 전에 `v4l2-ctl`로 focus를 적용한다.
+- current config에서는 먹지 않는 rpicam AF 옵션을 비워두고 `lens_position = -1.0`으로 둔다.
 
 ## 18. GCS 영상 창이 `waiting for video stream...`에 머무르지만 vision log는 계속 갱신됨
 
