@@ -1,571 +1,567 @@
 # Current Step Plan
 
-최종 업데이트: 2026-05-14
+최종 업데이트: 2026-05-15
 
-이 문서는 `RESEARCH.md`를 바탕으로 작성한 **다음 구현 계획서**다. 사용자가 이 계획을 검토하고 승인하기 전까지 코드는 작성하지 않는다.
+이 문서는 `RESEARCH.md`를 바탕으로 작성한 **Gazebo + GCS 테스트 환경 구현 계획서**다. 사용자가 승인하기 전까지 코드는 수정하지 않는다. 승인 후에는 이 문서의 순서대로 진행한다.
 
-## Current Task
+## Goal
 
-현재 스텝의 목표는 Astroquad onboard runtime을 Gazebo SITL과 실제 Raspberry Pi 4 + Pixhawk1 환경 사이에서 쉽게 전환할 수 있는 구조로 확장하는 것이다.
-
-우선순위:
+현재 우선 목표는 라인 트레이싱 MAVLink 제어 성능 튜닝이 아니라, 아래 테스트 환경을 안정적으로 만드는 것이다.
 
 ```text
-1. MAVLink heartbeat false-positive abort 해결
-2. Gazebo camera 기반 vision 입력 경로 설계/구현
-3. 기존 Raspberry Pi 4 + IMX519 vision 코드 재사용 구조 정리
-4. 실행 옵션/설정만 바꿔 SITL과 실제 환경을 오갈 수 있는 runtime profile 정리
+Windows 11
+  -> uav_gcs_vision_debug.exe --config config
+  -> telemetry UDP 14550 대기
+  -> MJPEG video UDP 5600 대기
+
+WSL Ubuntu
+  -> fly_test.sh
+  -> Gazebo Sim + ArduCopter SITL
+  -> Iris + downward camera
+  -> 폭 10cm 흰색 직선 라인
+  -> 출발 지점 기준 3m 전방에 50cm x 50cm ArUco ID 1 marker
+
+uav-onboard
+  -> Gazebo downward camera frame 수신
+  -> 기존 onboard vision 처리
+  -> GCS로 raw/top-down camera video 송출
+  -> GCS로 line/marker/intersection telemetry 송출
+  -> 이후 같은 vision 결과로 line_follow_node SITL 제어 검증
 ```
 
-이번 단계의 핵심은 **ROS는 사용하지 않지만 ROS식 역할 분리**를 지키는 것이다.
+## Non-Goals
 
-```text
-FrameSource
-  -> VisionProcessor
-  -> Mission
-  -> Control
-  -> AutopilotAdapter
-
-Vision/Flight telemetry
-  -> GCS publisher
-```
-
-Vision module은 image를 perception result로 바꾸는 일만 담당한다. MAVLink 제어 명령은 계속 mission/control/autopilot 경계를 통해서만 나간다.
-
-## Current Status
-
-이미 완료된 것:
-
-- OpenCV/opencv_contrib `4.10.0`이 `/usr/local` 기본 C++ OpenCV로 설치됐다.
-- `uav-onboard`는 `BUILD_TOOLS=ON`으로 전체 빌드된다.
-- `line_follow_node`, `vision_debug_node`, `aruco_detector_tester`가 같은 OpenCV 4.10에 링크된다.
-- 기존 unit test는 `7/7` 통과했다.
-- Gazebo + ArduCopter SITL에서 Astroquad `line_follow_node`만으로 다음 smoke sequence를 확인했다.
-
-```text
-heartbeat 수신
-  -> GUIDED
-  -> arm
-  -> takeoff
-  -> fake line input 기반 BODY_NED velocity command
-  -> LAND
-  -> COMPLETE
-```
-
-현재 남은 문제:
-
-- 기본 `pixhawk_heartbeat_lost_ms = 2000`에서 mission 중 `pixhawk heartbeat lost` false-positive abort가 발생할 수 있다.
-- 원인은 Gazebo heartbeat를 사용자가 직접 설정하지 않아서가 아니라, 현재 MAVLink receive path가 SITL telemetry stream을 충분히 drain하지 못하는 구조에 가깝다.
-- 현재 `line_follow_node`는 `--vision fake`만 구현되어 있고, Gazebo camera image 기반 line/ArUco 인식은 아직 연결되지 않았다.
-- 기존 `VisionDebugPipeline`은 Raspberry Pi camera debug runtime으로는 잘 동작하지만, mission/control 입력으로 바로 쓰기에는 camera loop, processing, telemetry/video publish가 한 클래스에 묶여 있다.
-- `--target pixhawk1`과 `serial://...` parsing은 있지만 serial transport 자체는 아직 구현되어 있지 않다.
-
-## Scope
-
-이번 계획에서 구현할 것:
-
-- `AutopilotMavlinkAdapter`와 `UdpMavlinkTransport`의 MAVLink receive path를 개선한다.
-- heartbeat가 다른 telemetry message에 밀려 stale로 보이는 문제를 줄인다.
-- SITL smoke test가 임시 safety timeout override 없이 완료되는지 확인한다.
-- 기존 vision 코드를 재사용 가능한 `VisionProcessor` 형태로 분리하는 계획을 코드에 반영한다.
-- `line_follow_node` 또는 후속 onboard runtime이 fake/gazebo/rpicam vision source를 선택할 수 있게 만든다.
-- Gazebo camera frame을 OpenCV `cv::Mat`으로 받아 기존 line/ArUco detector에 넣을 수 있는 source abstraction을 추가한다.
-- GCS telemetry/video 송신은 기존 `UdpTelemetrySender`, `UdpMjpegStreamer`를 재사용하는 방향으로 연결한다.
-- SITL과 실제 Raspberry Pi 4 환경을 config/CLI profile로 전환할 수 있게 정리한다.
-
-이번 계획에서 구현하지 않을 것:
+이번 승인 스텝에서 하지 않는다.
 
 - F450 정밀 Gazebo model 제작.
-- 실제 IMX519 광학계와 완전히 동일한 Gazebo lens/distortion calibration.
-- GPS-denied EKF 튜닝 전체.
-- Optical flow sensor Gazebo plugin 세팅.
-- 실제 Pixhawk1 props-on 비행.
+- 실제 IMX519 lens distortion 정밀 재현.
+- optical flow/range Gazebo plugin 정밀 튜닝.
+- Pixhawk1 serial transport 구현.
+- 실기체 props-on 비행.
 - GCS UI 대규모 개편.
-- Vision module이 MAVLink command를 직접 보내는 구조.
+- Vision module에서 MAVLink command를 직접 보내는 구조.
+- Protocol v1.8 확정. 기존 v1.7 telemetry/video wire format을 우선 유지한다.
 
-## Architecture Target
+## Design Rules
 
-목표 runtime 구조:
+- 실기체 기본값을 Gazebo 값으로 덮지 않는다.
+- Raspberry Pi 4 + IMX519 경로는 계속 `rpicam` source로 유지한다.
+- Gazebo/SITL 값은 `runtime.sitl.toml`, Gazebo asset, CLI option에서만 선택한다.
+- `VisionProcessor`는 image를 perception result로만 바꾼다.
+- GCS video/telemetry 송출은 관제/debug publisher이며 mission-critical 경로가 아니다.
+- `vision_debug_node`에는 MAVLink 제어 코드를 넣지 않는다.
+- `line_follow_node`는 같은 vision publisher를 재사용하되, mission/control/autopilot 경계는 유지한다.
 
-```text
-FrameSource
-  FakeFrameSource        # unit/smoke test
-  GazeboCameraSource     # SITL camera topic/frame
-  RpicamFrameSource      # Raspberry Pi 4 + IMX519
+## Target Commands
 
-VisionProcessor
-  ArucoDetector
-  LineMaskBuilder
-  LineDetector
-  LineStabilizer
-  IntersectionDetector
-  MarkerStabilizer
+승인 후 구현이 끝나면 다음 명령이 동작해야 한다.
 
-Mission
-  LineFollowMission
-  future: marker hover / grid mission
+Windows GCS:
 
-Control
-  GuidedVelocityController
-
-Autopilot
-  UdpMavlinkTransport    # SITL
-  SerialMavlinkTransport # Pixhawk1, later step
-  AutopilotMavlinkAdapter
-
-Publishers
-  UdpTelemetrySender
-  UdpMjpegStreamer
+```powershell
+cd astroquad\uav-gcs
+.\build\uav_gcs_vision_debug.exe --config config
 ```
 
-중요한 경계:
+WSL Gazebo/SITL:
 
-- `FrameSource`는 frame을 가져오기만 한다.
-- `VisionProcessor`는 `VisionResult`만 만든다.
-- `Mission`은 상태 전이와 mission event만 판단한다.
-- `Control`은 `VisionResult`/mission state를 velocity setpoint로 바꾼다.
-- `AutopilotAdapter`만 MAVLink packet을 만들고 보낸다.
-- `TelemetryPublisher`는 관측/상태를 GCS로 보낼 뿐 제어하지 않는다.
-
-## Step 1: Heartbeat Receive Path Fix
-
-### Problem
-
-현재 구조:
-
-```text
-line_follow loop
-  -> autopilot.poll(1)
-  -> SafetyMonitor checks last_heartbeat_time
+```bash
+bash ~/fly_test.sh
 ```
 
-`AutopilotMavlinkAdapter::poll()`은 호출당 MAVLink message 하나만 처리한다. `UdpMavlinkTransport::recvMessage()`도 UDP datagram 안에서 첫 MAVLink frame을 찾으면 바로 반환한다.
+WSL vision-only GCS smoke:
 
-SITL/MAVProxy stream에는 heartbeat 외에도 `LOCAL_POSITION_NED`, `DISTANCE_SENSOR`, `GLOBAL_POSITION_INT` 등이 들어온다. message queue가 밀리면 heartbeat가 실제로는 들어오고 있어도 `last_heartbeat_time`이 제때 갱신되지 않아 safety monitor가 abort할 수 있다.
+```bash
+WINDOWS_GCS_IP="$(ip route | awk '/default/ {print $3; exit}')"
 
-### Planned Changes
-
-1. `UdpMavlinkTransport`가 한 UDP datagram 안의 MAVLink frame을 모두 보존하도록 pending queue를 둔다.
-2. `recvMessage()`는 pending queue가 있으면 먼저 반환하고, 없을 때만 socket에서 새 datagram을 읽는다.
-3. `AutopilotMavlinkAdapter::poll(timeout_ms)`는 첫 message를 timeout 안에서 기다린 뒤, 같은 loop에서 non-blocking drain을 수행한다.
-4. drain에는 무한 loop 방지를 위한 max message budget 또는 time budget을 둔다.
-5. heartbeat 처리 시 `last_heartbeat_time`, mode, armed state가 계속 갱신되는지 log/debug 확인 경로를 둔다.
-6. Safety timeout은 끄지 않는다. receive starvation을 고친 뒤에도 SITL jitter가 있으면 profile별 timeout만 분리한다.
-
-### Candidate Interface
-
-기존 public API는 유지한다.
-
-```cpp
-bool AutopilotMavlinkAdapter::poll(int timeout_ms);
+cd ~/astroquad/uav-onboard
+./build/vision_debug_node \
+  --config config \
+  --target sitl \
+  --vision gazebo \
+  --line-mode light_on_dark \
+  --video \
+  --gcs-ip "$WINDOWS_GCS_IP"
 ```
 
-동작만 다음처럼 바꾼다.
+WSL marker-only fixture smoke:
 
-```text
-poll(timeout_ms)
-  -> wait one message up to timeout_ms
-  -> process it
-  -> recv pending/non-blocking messages with timeout 0
-  -> process up to max_drain_messages
-  -> return whether any message was processed
+```bash
+cd ~/astroquad/uav-onboard
+./build/vision_debug_node \
+  --config config \
+  --target sitl \
+  --vision gazebo \
+  --aruco-only \
+  --video \
+  --gcs-ip "$WINDOWS_GCS_IP"
 ```
 
-### Validation
+WSL vision-driven flight smoke:
 
-- Fake transport unit test를 추가해 heartbeat가 non-heartbeat message 뒤에 있어도 한 번의 poll/drain에서 갱신되는지 확인한다.
-- UDP transport pending queue는 가능하면 datagram 안에 여러 MAVLink frame이 있는 case를 test한다.
-- 기존 `ctest` 전체 통과를 확인한다.
-- `fly_test.sh` + `line_follow_node --target sitl`을 기본 config로 실행해 `pixhawk heartbeat lost` 없이 `COMPLETE` 되는지 확인한다.
+```bash
+cd ~/astroquad/uav-onboard
+./build/line_follow_node \
+  --config config \
+  --target sitl \
+  --vision gazebo \
+  --video \
+  --gcs-ip "$WINDOWS_GCS_IP"
+```
+
+기존 실기체 vision debug는 계속 유지한다.
+
+```bash
+./build/vision_debug_node --config config --line-only --line-mode light_on_dark --video
+```
+
+## Work Breakdown
+
+### Phase 0: Preflight Snapshot
+
+목적: 사용자가 만든 변경과 현재 작업 상태를 건드리지 않고 기준점을 확인한다.
+
+작업:
+
+- `development-log`, `uav-onboard`, `uav-gcs` 각각 `git status --short` 확인.
+- `/home/mseoky/test_aruco_marker` asset 확인.
+- 현재 `vision_debug_node --help`, `line_follow_node --help` option 확인.
+- Gazebo version과 world load 가능 여부 확인.
+
+검증:
+
+```bash
+find /home/mseoky/test_aruco_marker -maxdepth 1 -type f -printf '%f\n' | sort
+gz sim --versions
+```
 
 성공 기준:
 
 ```text
-[mavlink] heartbeat ok ...
-[mavlink] GUIDED confirmed
-[mavlink] armed
-[mission] TAKEOFF ...
-[mission] LINE_FOLLOW
-[mission] LAND reason=duration complete
-[mission] COMPLETE
+aruco1.png
+aruco2.png
+aruco3.png
+aruco4.png
+Vmarker.png
 ```
 
-## Step 2: Runtime Profile 정리
+### Phase 1: Gazebo Course Asset 정리
 
-현재 `line_follow_node`에는 다음 경로가 있다.
+목적: Gazebo world가 요구한 물리 조건을 명확히 갖게 한다.
 
-```bash
---target sitl
---target pixhawk1
---autopilot udp://0.0.0.0:14550
---autopilot serial:///dev/serial0:115200
---vision fake
-```
-
-이를 다음처럼 확장한다.
-
-```bash
-./build/line_follow_node --config config --target sitl --vision gazebo
-./build/line_follow_node --config config --target pixhawk1 --vision rpicam
-./build/line_follow_node --config config --target sitl --vision fake
-```
-
-목표 profile:
+변경 파일:
 
 ```text
-target=sitl
-  autopilot: udp://0.0.0.0:14550
-  vision: gazebo or fake
-  frame source: Gazebo camera topic/source
-  safety: SITL-friendly timeout, still failsafe enabled
-
-target=pixhawk1
-  autopilot: serial:///dev/serial0:115200
-  vision: rpicam
-  frame source: Raspberry Pi 4 + IMX519
-  safety: real vehicle conservative timeout
+uav-onboard/sim/gazebo/models/astroquad_vision_course/model.config
+uav-onboard/sim/gazebo/models/astroquad_vision_course/model.sdf
+uav-onboard/sim/gazebo/models/astroquad_vision_course/materials/textures/aruco1.png
+uav-onboard/sim/gazebo/models/astroquad_vision_course/materials/textures/aruco2.png
+uav-onboard/sim/gazebo/models/astroquad_vision_course/materials/textures/aruco3.png
+uav-onboard/sim/gazebo/models/astroquad_vision_course/materials/textures/aruco4.png
+uav-onboard/sim/gazebo/models/astroquad_vision_course/materials/textures/aruco_id1.png
+uav-onboard/sim/gazebo/models/astroquad_vision_course/materials/textures/Vmarker.png
+uav-onboard/sim/gazebo/models/astroquad_static_downward_camera/model.config
+uav-onboard/sim/gazebo/models/astroquad_static_downward_camera/model.sdf
+uav-onboard/sim/gazebo/worlds/astroquad_iris_vision.sdf
+uav-onboard/sim/gazebo/worlds/astroquad_line_camera_fixture.sdf
+uav-onboard/sim/gazebo/worlds/astroquad_marker_center_fixture.sdf
+uav-onboard/sim/gazebo/README.md
 ```
 
-설정 파일 방향:
+구현 내용:
 
-```text
-config/
-  autopilot.toml
-  mission.toml
-  safety.toml
-  vision.toml
-  network.toml
-  runtime.sitl.toml      # optional overlay
-  runtime.pixhawk1.toml  # optional overlay
-```
-
-원칙:
-
-- 코드 수정 없이 CLI option 또는 config overlay만으로 SITL/실기 전환.
-- 같은 mission/control/autopilot code path를 SITL과 실제 환경에서 공유.
-- source별 차이는 `FrameSource`, transport, camera parameter, safety profile 안에만 둔다.
-
-## Step 3: Existing Vision Code Reuse
-
-### Reusable Today
-
-현재 코드에서 그대로 재사용할 수 있는 부분:
-
-```text
-src/vision/ArucoDetector.*
-src/vision/LineMaskBuilder.*
-src/vision/LineDetector.*
-src/vision/LineStabilizer.*
-src/vision/IntersectionDetector.*
-src/vision/IntersectionStabilizer.*
-src/mission/IntersectionDecisionEngine.*
-src/mission/GridCoordinateTracker.*
-src/network/UdpTelemetrySender.*
-src/video/UdpMjpegStreamer.*
-src/protocol/TelemetryMessage.*
-```
-
-### Needs Refactor
-
-`src/app/VisionDebugPipeline.*`는 다음 역할이 한 클래스 안에 섞여 있다.
-
-```text
-Raspberry Pi camera open/read
-JPEG decode
-ArUco detection
-line detection
-intersection detection
-telemetry build/send
-debug video send
-runtime loop
-```
-
-따라서 `VisionDebugPipeline` 전체를 `line_follow_node`에 그대로 넣기보다는, 내부 processing block을 아래처럼 분리한다.
-
-```text
-VisionProcessor
-  input: cv::Mat image + frame metadata
-  output: VisionResult + timing/debug metrics
-```
-
-그 다음:
-
-```text
-vision_debug_node
-  RpicamFrameSource
-  -> VisionProcessor
-  -> telemetry/video publish
-
-line_follow_node or onboard_runtime
-  Fake/Gazebo/Rpicam FrameSource
-  -> VisionProcessor
-  -> Mission
-  -> Control
-  -> Autopilot
-  -> telemetry/video publish
-```
-
-이렇게 하면 Raspberry Pi 4에서 이미 정상 동작한 detector logic은 유지하고, camera/source/runtime loop만 분리할 수 있다.
-
-## Step 4: Gazebo Camera-Based Vision Plan
-
-### Goal
-
-Gazebo 안에서 아래 흐름을 만든다.
-
-```text
-Gazebo world
-  line texture / marker plane
-  Iris downward camera
-
-Gazebo camera frame
-  -> GazeboCameraSource or OpenCvFrameSource
-  -> VisionProcessor
-  -> LineFollowMission
-  -> GuidedVelocityController
-  -> MAVLink BODY_NED velocity command
-```
-
-첫 버전은 F450 정밀 모델이 아니라 Iris에 downward camera를 붙여 검증한다. 목적은 실제 dynamics 재현이 아니라 **vision -> mission -> control -> autopilot 경계가 end-to-end로 맞는지 확인**하는 것이다.
-
-### Gazebo World
-
-새 test world 또는 model override를 만든다.
-
-```text
-world:
-  runway/ground plane
-  high contrast line
-  ArUco marker plane
-
-vehicle:
-  Iris base
-  downward-facing RGB camera
-  camera pose: body center 하단, optical axis down
-  resolution/fps: vision.toml과 맞춤
-```
-
-초기 권장값:
-
-```text
-resolution: 960x720 또는 640x480
-fps: 12
-line: light_on_dark 또는 dark_on_light 중 하나로 고정
-marker: DICT_4X4_50
-```
-
-### Camera Source
-
-ROS 없이 진행하므로 후보는 두 가지다.
-
-1. Preferred: Gazebo Transport subscriber
-   - `gz::transport`로 camera image topic을 subscribe한다.
-   - `gz::msgs::Image`를 `cv::Mat`으로 변환한다.
-   - Gazebo topic 이름은 config로 둔다.
-
-2. Fallback: OpenCV-readable stream/device
-   - Gazebo camera output을 GStreamer/stream/device로 노출할 수 있을 때 `OpenCvFrameSource`로 읽는다.
-   - local 개발환경에서 Gazebo transport dependency가 복잡하면 임시 fallback으로 사용한다.
-
-계획상 우선순위는 Gazebo Transport subscriber다. Gazebo가 이미 `gz sim`으로 실행 중이므로, ROS bridge 없이 Gazebo native transport를 쓰는 편이 구조적으로 맞다.
-
-### FrameSource Interface
-
-공통 interface 예시:
-
-```cpp
-struct Frame {
-    cv::Mat image_bgr;
-    std::uint32_t frame_id;
-    std::uint64_t timestamp_ms;
-    int width;
-    int height;
-};
-
-class FrameSource {
-public:
-    virtual bool open(const RuntimeConfig& config) = 0;
-    virtual bool read(Frame& frame) = 0;
-    virtual std::string lastError() const = 0;
-};
-```
-
-구현체:
-
-```text
-FakeFrameSource
-GazeboCameraSource
-RpicamFrameSource
-```
+- `/home/mseoky/test_aruco_marker`의 PNG asset을 repo 안 Gazebo model texture directory로 복사한다.
+- `astroquad_vision_course` model을 새로 만든다.
+- dark ground plane을 course model에 둔다.
+- 흰색 line은 폭 `0.10m`, 길이 `7.0m`로 둔다.
+- 기본 course marker는 검증된 `aruco_id1.png`를 사용한다. 구현 중 확인 결과 `/home/mseoky/test_aruco_marker/aruco2.png`가 OpenCV `DICT_4X4_50` 실제 ID 1이었다.
+- marker physical size는 `0.50m x 0.50m`.
+- marker pose는 시작점 기준 전방 `3.0m`에 둔다.
+- `Vmarker.png`는 이번 world에 기본 배치하지 않는다. vertiport 후보 asset으로만 보관한다.
+- `astroquad_iris_vision.sdf`는 inline course visual을 줄이고 `model://astroquad_vision_course`를 include한다.
+- `astroquad_line_camera_fixture.sdf`와 `astroquad_marker_center_fixture.sdf`는 ArduPilot 없이 고정 하향 camera로 detector smoke를 빠르게 돌리는 fixture다.
 
 주의:
 
-- `RpicamFrameSource`는 기존 `RpicamMjpegSource`를 감싸서 재사용한다.
-- `GazeboCameraSource`는 BGR/RGB format 변환을 명확히 처리한다.
-- Vision code는 source가 Gazebo인지 IMX519인지 알 필요가 없어야 한다.
+- marker texture가 Gazebo material mapping에서 뒤집히면 SDF pose yaw 또는 texture orientation을 조정한다.
+- plane texture mapping이 Gazebo에서 반복/타일링되면 fallback으로 marker를 box-cell geometry로 생성하되, source image는 `aruco_id1.png` 기준으로 유지한다.
+- line detector smoke와 marker detector smoke를 분리할 수 있게 fixture world를 둔다.
 
-## Step 5: Line Follow + ArUco Hover Path
-
-MVP에 맞춘 Gazebo camera mission 흐름:
-
-```text
-takeoff
-  -> line detected
-  -> line center/angle로 forward/yaw/lateral correction
-  -> ArUco marker detected
-  -> marker center 근처에서 3초 hover
-  -> land
-```
-
-구현 순서:
-
-1. `VisionResult`에서 line detection을 `LineControlInput`으로 변환한다.
-2. 기존 `GuidedVelocityController`가 fake input 대신 실제 line input을 받게 한다.
-3. ArUco marker detection event를 mission input으로 전달한다.
-4. mission에 `MarkerHover` state를 추가한다.
-5. marker center error가 threshold 안에 들어오면 zero velocity를 3초 유지한다.
-6. hover 완료 후 LAND로 전환한다.
-
-중요:
-
-- ArUco를 발견했다고 vision module이 직접 hover command를 보내지 않는다.
-- Vision은 marker id/center/corners/confidence만 제공한다.
-- Hover 판단은 mission이 한다.
-- Zero velocity command는 control/autopilot 경계를 통해 나간다.
-
-## Step 6: Raspberry Pi 4 + IMX519 Compatibility
-
-실기 runtime 목표:
+검증:
 
 ```bash
-./build/line_follow_node --config config --target pixhawk1 --vision rpicam
+cd ~/astroquad/uav-onboard
+
+GZ_SIM_SYSTEM_PLUGIN_PATH="$HOME/ardupilot_gazebo/build:${GZ_SIM_SYSTEM_PLUGIN_PATH:-}" \
+GZ_SIM_RESOURCE_PATH="$HOME/ardupilot_gazebo/models:$HOME/ardupilot_gazebo/worlds:$PWD/sim/gazebo/models:$PWD/sim/gazebo/worlds:${GZ_SIM_RESOURCE_PATH:-}" \
+timeout 20s gz sim -s -v4 -r sim/gazebo/worlds/astroquad_iris_vision.sdf
 ```
 
-실제 환경에서 달라지는 것:
+성공 기준:
+
+- world load 중 fatal error 없음.
+- `iris_with_downward_camera`와 `astroquad_vision_course`가 포함됨.
+- known warning인 upstream `gz_frame_id` warning 외 새로운 asset missing error 없음.
+
+### Phase 2: `fly_test.sh`를 Astroquad World 기준으로 정리
+
+목적: 사용자가 `bash ~/fly_test.sh`만 실행해도 Astroquad vision world와 ArduCopter SITL이 같이 뜨게 한다.
+
+변경 파일:
 
 ```text
-autopilot transport: UDP -> serial
-camera source: GazeboCameraSource -> RpicamFrameSource
-camera parameters: simulated camera -> IMX519 tuning
-safety profile: SITL -> real vehicle
+uav-onboard/scripts/fly_test.sh
+/home/mseoky/fly_test.sh
+uav-onboard/README.md
+uav-onboard/sim/gazebo/README.md
 ```
 
-같게 유지할 것:
+구현 내용:
+
+- repo 안에 versioned `scripts/fly_test.sh`를 만든다.
+- home-level `/home/mseoky/fly_test.sh`는 repo script를 호출하는 thin wrapper로 바꾸거나, 같은 내용으로 갱신한다.
+- `GAZEBO_WORLD_FILE`을 `iris_runway.sdf`가 아니라 `astroquad_iris_vision.sdf`로 바꾼다.
+- `GZ_SIM_SYSTEM_PLUGIN_PATH`에 `$HOME/ardupilot_gazebo/build`를 포함한다.
+- `GZ_SIM_RESOURCE_PATH`에 다음을 포함한다.
 
 ```text
-VisionProcessor
-Line/Aruco detector config schema
-Mission state machine
-GuidedVelocityController
-Telemetry schema
-GCS debug video path
+$HOME/ardupilot_gazebo/models
+$HOME/ardupilot_gazebo/worlds
+$HOME/astroquad/uav-onboard/sim/gazebo/models
+$HOME/astroquad/uav-onboard/sim/gazebo/worlds
 ```
 
-추가로 필요한 실기 전 단계:
+- script 출력에서 MAVLink UDP 14550과 Astroquad JSON telemetry UDP 14550을 구분해서 설명한다.
+- Windows GCS IP 확인 방법을 script 출력에 안내한다.
 
-- `SerialMavlinkTransport` 구현.
-- props-off Pixhawk1 bench test.
-- heartbeat/mode/arm/takeoff command가 serial에서 정상 동작하는지 확인.
-- Raspberry Pi 4에서 camera 단독 test, vision 단독 test, GCS telemetry/video test를 먼저 실행.
-- 실기체는 `GUIDED` 진입, EKF local estimate, rangefinder/flow availability를 별도 preflight gate로 확인.
+검증:
 
-## Planned File Changes
+```bash
+bash ~/fly_test.sh
+```
 
-예상 변경 대상:
+성공 기준:
+
+- Gazebo가 Astroquad course world를 연다.
+- ArduCopter SITL/MAVProxy console이 열린다.
+- script가 onboard 실행 예시를 `--target sitl --vision gazebo` 기준으로 출력한다.
+
+### Phase 3: Runtime Profile Loader 정리
+
+목적: `vision_debug_node`와 `line_follow_node`가 같은 target/source profile을 해석하게 한다.
+
+변경 파일 후보:
 
 ```text
-uav-onboard/src/autopilot/
-  UdpMavlinkTransport.*
-  AutopilotMavlinkAdapter.*
-
-uav-onboard/src/vision/ 또는 src/app/
-  VisionProcessor.*
-  FrameSource abstraction
-  GazeboCameraSource.*      # Gazebo transport dependency가 가능할 경우
-  RpicamFrameSource.*       # existing RpicamMjpegSource wrapper
-
-uav-onboard/tools/
-  line_follow_node.cpp
-  vision_debug_node.cpp     # VisionProcessor 재사용에 맞춘 최소 조정
-
-uav-onboard/config/
-  runtime.sitl.toml
-  runtime.pixhawk1.toml
-  vision.toml               # source별 override가 필요할 경우
-  safety.toml               # profile별 timeout 분리 방식 반영
-
-uav-onboard/tests/
-  heartbeat/poll drain 관련 test
-  VisionProcessor smoke test
+uav-onboard/src/common/RuntimeProfileConfig.hpp
+uav-onboard/src/common/RuntimeProfileConfig.cpp
+uav-onboard/CMakeLists.txt
+uav-onboard/config/runtime.sitl.toml
+uav-onboard/config/runtime.pixhawk1.toml
+uav-onboard/tools/vision_debug_node.cpp
+uav-onboard/tools/line_follow_node.cpp
 ```
 
-문서 변경:
+구현 내용:
+
+- `--target sitl|pixhawk1` parsing을 `vision_debug_node`에도 추가한다.
+- `--vision fake|gazebo|rpicam` parsing을 `vision_debug_node`에도 추가한다.
+- 기존 `vision_debug_node --config config --line-only --line-mode light_on_dark --video`는 default `rpicam`으로 계속 동작하게 한다.
+- `runtime.sitl.toml` default vision은 `gazebo`로 바꾼다.
+- fake smoke가 필요하면 CLI에서 `--vision fake`로 명시한다.
+- runtime overlay가 다음 값을 덮어쓸 수 있게 한다.
+  - `[runtime].vision`
+  - `[vision.source].gazebo_topic`
+  - `[vision.source].read_timeout_ms`
+  - `[debug_video].send_fps`
+  - `[debug_video].jpeg_quality`
+  - `[line_follow].duration_s`
+  - `[line_follow].forward_mps`
+  - `[marker_hover].hold_s`
+  - `[marker_hover].center_tolerance_px`
+
+권장 `runtime.sitl.toml`:
+
+```toml
+[runtime]
+target = "sitl"
+vision = "gazebo"
+
+[transport]
+kind = "udp"
+listen_host = "0.0.0.0"
+listen_port = 14550
+
+[vision.source]
+gazebo_topic = "/world/astroquad_iris_vision/model/iris_with_downward_camera/link/downward_camera_link/sensor/downward_camera/image"
+read_timeout_ms = 500
+
+[debug_video]
+send_fps = 12
+jpeg_quality = 70
+
+[line_follow]
+forward_mps = 0.3
+duration_s = 15.0
+
+[marker_hover]
+hold_s = 3.0
+center_tolerance_px = 80.0
+```
+
+검증:
+
+```bash
+cd ~/astroquad/uav-onboard
+./build/vision_debug_node --help
+./build/line_follow_node --help
+```
+
+성공 기준:
+
+- `vision_debug_node` help에 `--target`과 `--vision`이 보인다.
+- 기존 rpicam 명령은 option conflict 없이 유지된다.
+- `line_follow_node --target sitl --vision fake`도 여전히 가능하다.
+
+### Phase 4: `vision_debug_node`를 Gazebo FrameSource에 연결
+
+목적: MAVLink 제어 없이도 Gazebo camera frame을 GCS로 보내고 overlay를 확인한다.
+
+변경 파일 후보:
 
 ```text
-development-log/
-  RESEARCH.md
-  PLAN.md
+uav-onboard/src/app/VisionDebugPipeline.hpp
+uav-onboard/src/app/VisionDebugPipeline.cpp
+uav-onboard/tools/vision_debug_node.cpp
+uav-onboard/src/vision/FrameSource.hpp
+uav-onboard/src/vision/GazeboCameraSource.*
+uav-onboard/src/vision/RpicamFrameSource.*
+uav-onboard/CMakeLists.txt
 ```
 
-변경 금지/주의:
+구현 내용:
 
-- 기존 detector algorithm을 불필요하게 재작성하지 않는다.
-- Raspberry Pi에서 동작하던 ArUco/line detector API를 OpenCV 4.5 구 API로 되돌리지 않는다.
-- Vision module에서 MAVLink command를 보내지 않는다.
-- SITL 편의를 위해 safety를 제거하지 않는다.
+- `VisionDebugPipelineOptions`에 `vision_source`를 추가한다.
+- `vision_source=rpicam`이면 `RpicamFrameSource`를 사용한다.
+- `vision_source=gazebo`이면 `GazeboCameraSource`를 사용한다.
+- `vision_source=fake`는 `vision_debug_node`에서는 smoke/debug 용도로만 허용하거나 unsupported로 명확히 에러 처리한다.
+- `RpicamFrameSource`의 `jpeg_data`가 있으면 기존처럼 raw MJPEG를 GCS로 보낸다.
+- `GazeboCameraSource`는 BGR frame만 있으므로 `cv::imencode(".jpg", ...)`로 JPEG를 만들어 `UdpMjpegStreamer`에 넣는다.
+- telemetry JSON shape은 v1.7 그대로 유지한다.
+- `camera.sensor_model` 또는 `debug.note`에 source가 `gazebo`임을 남긴다.
+- `--line-only`를 쓰면 ArUco marker detection은 꺼진다. marker 검증은 `--aruco-only` 또는 detector 둘 다 켠 default run에서 한다.
 
-## Implementation Order
+검증:
 
-### Phase 1: Heartbeat 안정화
+Gazebo 실행 후:
 
-1. `UdpMavlinkTransport` pending message queue 설계.
-2. `recvMessage()`가 datagram 내 여러 MAVLink frame을 잃지 않도록 수정.
-3. `AutopilotMavlinkAdapter::poll()` drain behavior 추가.
-4. heartbeat 관련 unit test 추가.
-5. `ctest` 실행.
-6. Gazebo SITL smoke test를 기본 config로 재실행.
+```bash
+cd ~/astroquad/uav-onboard
+./build/vision_debug_node \
+  --config config \
+  --target sitl \
+  --vision gazebo \
+  --line-only \
+  --line-mode light_on_dark \
+  --count 30
+```
 
-### Phase 2: VisionProcessor 분리
+성공 기준:
 
-1. `VisionDebugPipeline` 내부 processing logic을 읽고 독립 가능한 입력/출력 구조를 정한다.
-2. `VisionProcessor`를 추가해 `cv::Mat`과 frame metadata를 `VisionResult`로 변환한다.
-3. `vision_debug_node`가 새 processor를 사용해 기존 GCS telemetry/video 동작을 유지하는지 확인한다.
-4. 기존 detector unit/smoke test가 유지되는지 확인한다.
+```text
+source=gazebo
+frame 증가
+line=yes
+decode/frame read fatal error 없음
+```
 
-### Phase 3: FrameSource profile 추가
+Windows GCS를 켠 상태:
 
-1. `FrameSource` interface 추가.
-2. `FakeFrameSource` 또는 fake vision adapter 유지.
-3. `RpicamFrameSource`를 기존 `RpicamMjpegSource` 기반으로 추가.
-4. Gazebo image topic 확인 후 `GazeboCameraSource` 추가.
-5. `--vision fake|gazebo|rpicam` option을 실제 source 선택으로 연결한다.
+```bash
+./build/vision_debug_node \
+  --config config \
+  --target sitl \
+  --vision gazebo \
+  --line-mode light_on_dark \
+  --video \
+  --gcs-ip "$WINDOWS_GCS_IP"
+```
 
-### Phase 4: Gazebo camera world
+성공 기준:
 
-1. Iris downward camera가 붙은 test model/world를 만든다.
-2. 바닥 line과 ArUco marker plane을 배치한다.
-3. Gazebo camera topic이 frame을 내보내는지 확인한다.
-4. `GazeboCameraSource -> VisionProcessor` 단독 smoke를 먼저 돌린다.
-5. line/marker detection 결과를 GCS telemetry 또는 console log로 확인한다.
+- Windows GCS camera window에 Gazebo top-down frame이 뜬다.
+- line overlay가 표시된다.
+- vision log에서 telemetry seq가 증가한다.
+- `[video-rx] completed`가 증가한다.
 
-### Phase 5: Vision-driven flight
+### Phase 5: ArUco ID 1 Fixture Smoke
 
-1. fake line input 대신 `VisionResult.line`을 `GuidedVelocityController` input으로 변환한다.
-2. line lost 시 `SafetyMonitor`가 land로 전환하는지 확인한다.
-3. marker detection을 mission event로 전달한다.
-4. marker hover 3초 state를 추가한다.
-5. Gazebo에서 line follow + marker hover + land sequence를 검증한다.
+목적: Gazebo marker texture가 실제 onboard ArUco detector에서 ID 1로 검출되는지 먼저 분리 검증한다.
 
-### Phase 6: Real target 준비
+변경 파일:
 
-1. `--target pixhawk1 --vision rpicam` profile을 완성한다.
-2. `SerialMavlinkTransport` 구현 계획을 별도 세부 계획으로 분리한다.
-3. Raspberry Pi 4에서 build/runtime dependency 확인 절차를 작성한다.
-4. props-off Pixhawk1 bench test checklist를 작성한다.
+```text
+uav-onboard/sim/gazebo/worlds/astroquad_marker_center_fixture.sdf
+uav-onboard/config/runtime.sitl.toml
+```
 
-## Validation Plan
+구현 내용:
 
-### Build/Test
+- marker-center fixture world에서 `aruco_id1.png`가 camera FOV 중앙 근처에 보이도록 둔다.
+- 필요하면 `runtime.sitl.toml`의 gazebo topic을 fixture world name에 맞춰 override할 방법을 문서화한다.
+- detector가 ID 1을 못 읽으면 texture orientation, alpha channel, border margin, material lighting을 순서대로 확인한다.
+- `Vmarker.png`는 이 smoke에 쓰지 않는다.
+
+검증:
+
+```bash
+cd ~/astroquad/uav-onboard
+GZ_SIM_SYSTEM_PLUGIN_PATH="$HOME/ardupilot_gazebo/build:${GZ_SIM_SYSTEM_PLUGIN_PATH:-}" \
+GZ_SIM_RESOURCE_PATH="$HOME/ardupilot_gazebo/models:$HOME/ardupilot_gazebo/worlds:$PWD/sim/gazebo/models:$PWD/sim/gazebo/worlds:${GZ_SIM_RESOURCE_PATH:-}" \
+gz sim -v4 -r sim/gazebo/worlds/astroquad_marker_center_fixture.sdf
+```
+
+다른 터미널:
+
+```bash
+./build/vision_debug_node \
+  --config config \
+  --target sitl \
+  --vision gazebo \
+  --aruco-only \
+  --count 30
+```
+
+성공 기준:
+
+```text
+markers=1
+marker_id=1
+```
+
+GCS 성공 기준:
+
+- marker box/corners/center overlay가 표시된다.
+- log에 marker ID 1이 표시된다.
+
+### Phase 6: `line_follow_node`에 GCS Publisher 연결
+
+목적: SITL 제어 중에도 GCS에서 같은 Gazebo camera/vision overlay를 볼 수 있게 한다.
+
+변경 파일 후보:
+
+```text
+uav-onboard/tools/line_follow_node.cpp
+uav-onboard/src/app/VisionDebugPipeline.*
+uav-onboard/src/app/VisionDebugPublisher.hpp
+uav-onboard/src/app/VisionDebugPublisher.cpp
+uav-onboard/CMakeLists.txt
+uav-onboard/src/protocol/TelemetryMessage.*
+```
+
+구현 내용:
+
+- `line_follow_node`에 다음 option을 추가한다.
+  - `--gcs-ip <ip>`
+  - `--video`
+  - `--no-video`
+  - `--no-telemetry`
+  - `--telemetry-port <n>`
+  - `--video-port <n>`
+- `VisionDebugPipeline` 안의 telemetry/video 송출 코드를 그대로 복사하지 않는다.
+- 공통 publisher component를 만든다.
+- `vision_debug_node`와 `line_follow_node`가 같은 publisher를 사용하게 한다.
+- 초기 구현은 protocol v1.7 shape를 유지한다.
+- mission/autopilot state는 당장 필수 field로 추가하지 않는다. 필요하면 `debug.note`에 `line_follow_node source=gazebo` 정도만 남긴다.
+- `VisionResult.line`은 기존처럼 `GuidedVelocityController` input으로 사용한다.
+- marker ID 1 centered event가 들어오면 기존 `MarkerHover` state로 연결한다.
+
+검증:
+
+```bash
+cd ~/astroquad/uav-onboard
+./build/line_follow_node \
+  --config config \
+  --target sitl \
+  --vision gazebo \
+  --video \
+  --gcs-ip "$WINDOWS_GCS_IP"
+```
+
+성공 기준:
+
+- MAVLink sequence:
+
+```text
+[mavlink] heartbeat ok
+[mavlink] GUIDED confirmed
+[mavlink] armed
+[mission] TAKEOFF
+[mission] LINE_FOLLOW
+```
+
+- GCS:
+
+```text
+camera frame 표시
+line overlay 표시
+telemetry seq 증가
+video completed frame 증가
+```
+
+### Phase 7: End-To-End Marker Hover Flight
+
+목적: 3m 전방 ID 1 marker가 실제 flight path에서 검출되고 hover/land까지 이어지는지 확인한다.
+
+사전 조건:
+
+- Phase 1-6 성공.
+- Windows GCS UDP firewall 허용.
+- `runtime.sitl.toml` line-follow duration이 12-15초 이상.
+- marker fixture에서 `marker_id=1` 검출 성공.
+
+실행:
+
+```bash
+bash ~/fly_test.sh
+```
+
+다른 터미널:
+
+```bash
+cd ~/astroquad/uav-onboard
+./build/line_follow_node \
+  --config config \
+  --target sitl \
+  --vision gazebo \
+  --video \
+  --gcs-ip "$WINDOWS_GCS_IP"
+```
+
+성공 기준:
+
+```text
+[mavlink] heartbeat ok
+[mavlink] GUIDED confirmed
+[mavlink] armed
+[mission] TAKEOFF
+[mission] LINE_FOLLOW
+[vision] marker id=1 centered=yes
+[mission] MARKER_HOVER
+[mission] LAND reason=marker hover complete
+[mission] COMPLETE
+```
+
+GCS 성공 기준:
+
+- top-down camera가 계속 표시된다.
+- line overlay가 line-follow 중 유지된다.
+- marker ID 1 overlay가 보인다.
+- video/telemetry 수신이 mission loop를 막지 않는다.
+
+## Build And Test Plan
+
+기본 build/test:
 
 ```bash
 cd ~/astroquad/uav-onboard
@@ -574,130 +570,94 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-### SITL Heartbeat Smoke
+추가 unit/integration test 후보:
 
-```bash
-cd ~
-bash ./fly_test.sh
+```text
+tests/test_runtime_profile_config.cpp
+tests/test_vision_debug_publisher.cpp
 ```
 
-다른 터미널:
+추가 test가 과도하면 최소한 기존 12개 test가 계속 통과해야 한다.
 
-```bash
-cd ~/astroquad/uav-onboard
-./build/line_follow_node --config config --target sitl --vision fake
-```
+## Failure Triage
 
-성공 기준:
+Gazebo world가 열리지 않음:
 
-- 임시 `/tmp` safety override 없이 완료.
-- `pixhawk heartbeat lost` abort 없음.
-- Gazebo에서 takeoff/move/land 확인.
+- `GZ_SIM_RESOURCE_PATH`에 `uav-onboard/sim/gazebo/models`가 있는지 확인.
+- `GZ_SIM_SYSTEM_PLUGIN_PATH`에 `ardupilot_gazebo/build`가 있는지 확인.
+- missing texture/model error를 먼저 해결.
 
-### Gazebo Camera Vision Smoke
+Gazebo camera frame timeout:
 
-예상 실행:
+- `gz topic -l | grep downward_camera` 확인.
+- world name이 바뀌면 `runtime.sitl.toml`의 topic도 같이 바꾼다.
+- camera sensor `always_on=true`, `update_rate=12` 확인.
 
-```bash
-cd ~/astroquad/uav-onboard
-./build/line_follow_node --config config --target sitl --vision gazebo
-```
+GCS에 video가 안 뜸:
 
-성공 기준:
+- `--video`가 켜졌는지 확인.
+- `--gcs-ip`가 Windows GCS IP인지 확인.
+- Windows Defender Firewall inbound UDP 5600/14550 허용 확인.
+- GCS log의 `video_sent`, `chunks_last`, `[video-rx] completed` 확인.
 
-- Gazebo camera frame 수신.
-- line detection telemetry/log 확인.
-- ArUco detection telemetry/log 확인.
-- 아직 비행 제어를 붙이기 전에도 vision 단독 smoke가 가능해야 한다.
+Line은 보이는데 marker가 안 잡힘:
 
-### Vision-Driven Flight Smoke
+- `--line-only`를 쓰고 있지 않은지 확인.
+- `--aruco-only`로 fixture부터 분리 검증.
+- marker texture orientation과 border margin 확인.
+- `aruco1.png` alpha channel/material lighting이 Gazebo render에서 흐려지지 않는지 확인.
 
-성공 기준:
+MAVLink는 되는데 GCS 송출 때문에 loop가 느려짐:
 
-- takeoff 후 실제 Gazebo camera image 기반 line input 사용.
-- line center error에 따라 BODY_NED velocity/yaw-rate command 생성.
-- ArUco marker 감지 시 mission이 hover state로 전환.
-- 3초 hover 후 land.
-- GCS에 vision/flight telemetry가 송신된다.
-
-### Raspberry Pi Compatibility Check
-
-실기 전 확인:
-
-```bash
-./build/vision_debug_node --config config --count 100
-./build/line_follow_node --config config --target pixhawk1 --vision rpicam
-```
-
-성공 기준:
-
-- IMX519 frame capture 정상.
-- 기존 line/ArUco detector 결과 유지.
-- GCS telemetry/video 송신 정상.
-- Pixhawk1 serial 연결은 별도 bench test에서 검증.
+- video send FPS를 `runtime.sitl.toml [debug_video].send_fps`로 낮춘다.
+- publisher는 latest-frame/drop-old 구조를 유지한다.
+- mission/control loop가 video send thread를 기다리지 않게 한다.
 
 ## Acceptance Criteria
 
-- 기본 SITL config에서 heartbeat false-positive abort가 재현되지 않는다.
-- MAVLink receive path는 heartbeat 외 telemetry stream이 많아도 state cache를 안정적으로 갱신한다.
-- 기존 vision detector code는 재사용되고, mission/control/autopilot 경계는 유지된다.
-- Gazebo camera frame을 `VisionProcessor`에 넣을 수 있는 구조가 생긴다.
-- `--target`과 `--vision` 또는 profile config만으로 SITL/Gazebo와 Raspberry Pi/IMX519 경로를 선택할 수 있다.
-- Vision telemetry/video를 GCS로 보내는 기존 경로를 유지하거나 재사용할 수 있다.
-- 코드 구현 후 `BUILD_TOOLS=ON` build와 unit test가 통과한다.
+승인 스텝 완료 조건:
 
-## Implementation Result
+- `~/fly_test.sh`가 Astroquad Gazebo vision world를 실행한다.
+- world에는 폭 10cm 흰색 직선 라인이 있다.
+- world에는 출발 지점 기준 3m 전방에 50cm x 50cm `aruco_id1.png`/ID 1 marker가 있다.
+- `vision_debug_node --target sitl --vision gazebo --video`가 Windows GCS에 Gazebo top-down camera를 보낸다.
+- GCS가 기존 overlay로 line telemetry를 표시한다.
+- marker-center fixture에서 `marker_id=1` 검출이 확인된다.
+- `line_follow_node --target sitl --vision gazebo --video` 실행 중에도 GCS video/telemetry가 유지된다.
+- 기존 `vision_debug_node --config config --line-only --line-mode light_on_dark --video` rpicam 경로는 깨지지 않는다.
+- `cmake --build build`와 `ctest --test-dir build --output-on-failure`가 통과한다.
 
-2026-05-14 구현/검증 결과:
+## After This Step
 
-- Phase 1 heartbeat receive path를 수정했다. `UdpMavlinkTransport`는 한 datagram 안의 MAVLink frame을 pending queue에 보존하고, `AutopilotMavlinkAdapter::poll()`은 첫 message 이후 non-blocking drain을 수행한다.
-- Phase 2 `VisionProcessor`를 추가해 기존 ArUco/line/intersection detector와 stabilizer를 재사용 가능한 processing block으로 분리했다. `VisionDebugPipeline`은 기존 GCS telemetry/video 동작을 유지하면서 새 processor를 사용한다.
-- Phase 3 `FrameSource` abstraction과 `FakeFrameSource`, `GazeboCameraSource`, `RpicamFrameSource`를 추가했다. `line_follow_node`는 `--vision fake|gazebo|rpicam`, `--vision-smoke-count`, `runtime.sitl.toml`, `runtime.pixhawk1.toml` profile을 지원한다.
-- Phase 4 Gazebo Iris wrapper world를 추가했다. Downward camera topic은 `config/vision.toml`의 `[source].gazebo_topic`으로 설정되어 있고, Gazebo transport frame을 OpenCV `cv::Mat`으로 변환해 `VisionProcessor`에 넣는다.
-- Phase 5 `VisionResult.line`을 `GuidedVelocityController` 입력으로 변환하고, ArUco marker centered event를 mission에 전달하는 `MarkerHover` state를 추가했다. Hover 완료 후 LAND로 전환한다.
-- Phase 6 real target 준비로 `--target pixhawk1 --vision rpicam` profile과 serial endpoint 안내를 정리했다. `SerialMavlinkTransport` 구현과 props-off Pixhawk1 bench test는 별도 승인 스텝으로 남긴다.
+다음 승인 후보:
 
-검증:
+1. Protocol v1.8 설계: mission state, autopilot mode/armed/altitude/range, runtime profile field 추가.
+2. `SerialMavlinkTransport` 구현과 Pixhawk1 props-off bench test.
+3. Raspberry Pi 4에서 `--target pixhawk1 --vision rpicam` camera/vision/GCS 송출 smoke.
+4. Gazebo marker 여러 개와 `Vmarker.png` vertiport visual fixture 설계.
 
-```text
-cmake --build build
-ctest --test-dir build --output-on-failure
--> 12/12 tests passed
-```
+## Implementation Result 2026-05-15
 
-SITL fake smoke:
+완료:
 
-```text
-[mavlink] heartbeat ok system=1 component=1 mode=STABILIZE
-[mavlink] GUIDED confirmed
-[mavlink] armed
-[mission] TAKEOFF target=1.2m
-[mission] LINE_FOLLOW
-[mission] LAND reason=duration complete
-[mission] COMPLETE
-```
+- `astroquad_iris_vision.sdf` main world가 Gazebo Sim 8.10에서 load되고 downward camera topic을 publish함.
+- `astroquad_vision_course`에 폭 10cm 흰색 line과 3m 전방 50cm x 50cm ID 1 marker를 배치함.
+- static camera fixture 2개를 추가해 ArduPilot 없이 detector를 검증할 수 있게 함.
+- `vision_debug_node --target sitl --vision gazebo`가 Gazebo frame을 읽고 GCS telemetry/video publisher를 통해 MJPEG를 송출함.
+- `line_follow_node --target sitl --vision gazebo --video`가 SITL heartbeat, GUIDED, arm, takeoff, line-follow, land, complete까지 통과함.
+- `fly_test.sh`는 repo script로 이동하고 home wrapper가 이를 호출한다. MAVProxy map module은 기본 비활성화하고 `MAVPROXY_MAP=1`로 opt-in하게 했다.
 
-Gazebo camera vision smoke:
+검증 결과:
 
 ```text
-[vision] frame=1 source=gazebo size=640x480 line=yes offset_px=-0.666656 angle_deg=90 markers=0
+cmake --build build: passed
+ctest --test-dir build --output-on-failure: 12/12 passed
+marker fixture: marker_id=1, line=yes, video_sent 증가 확인
+main world: default Gazebo topic frame read 확인
+line_follow_node SITL: heartbeat ok -> GUIDED -> armed -> TAKEOFF -> LINE_FOLLOW -> LAND -> COMPLETE
 ```
 
-Gazebo vision-driven flight smoke:
+주의:
 
-```text
-[vision] source=gazebo opened
-[mavlink] heartbeat ok system=1 component=1 mode=STABILIZE
-[mavlink] GUIDED confirmed
-[mavlink] armed
-[mission] TAKEOFF target=1.2m
-[mission] LINE_FOLLOW
-[mission] LAND reason=duration complete
-[mission] COMPLETE
-```
-
-남은 제한:
-
-- Gazebo ground smoke에서는 ArUco marker가 카메라 시야에 들어오는 위치까지 검증하지 못했다. `MarkerHover` 전이는 unit test로 검증했고, marker placement/flight path 조정은 다음 승인 스텝에서 다룬다.
-- `SerialMavlinkTransport`는 이번 PLAN의 구현 범위가 아니라 별도 세부 계획/bench test 대상으로 유지한다.
-- `line_follow_node`의 GCS telemetry/video wire schema는 새 field 없이 기존 `vision_debug_node` protocol과 호환되도록 유지했다. 실제 mission runtime에서 flight 상태 telemetry field를 추가하는 일은 protocol v1.8 후보로 분리한다.
+- `/home/mseoky/test_aruco_marker/aruco1.png`는 실제 detector ID 4로 확인됨. active ID 1 texture는 `aruco2.png`를 복사한 `aruco_id1.png`다.
+- 메인 world에서 지상 초기 camera frame은 카메라가 낮아 `line=no`가 나올 수 있다. 실제 line-follow 검증은 takeoff 후 `line=yes`로 확인했다.
