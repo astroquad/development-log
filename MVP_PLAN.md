@@ -1,6 +1,6 @@
 # Astroquad MVP Plan
 
-최종 업데이트: 2026-05-13
+최종 업데이트: 2026-05-15
 
 이 문서는 72시간 실기체 MVP와 1주일 기술개발계획서 작성 계획을 관리한다. 전체 시스템 기준은 `SYSTEM_SPEC.md`를 따른다.
 
@@ -73,6 +73,13 @@ MTF-01 optical flow/range가 Pixhawk/ArduPilot에서 안정적으로 인식되�
 - staging executable이 같은 vision library를 링크해 line offset을 읽을 수 있다.
 - detector 코드를 복사한 파일이 생기지 않는다.
 
+현재 상태:
+
+- `FrameSource` 계열은 `fake`, `gazebo`, `rpicam`으로 분리되어 있다.
+- `VisionProcessor`가 ArUco/line/intersection vision result를 생성한다.
+- `VisionDebugPublisher`가 `vision_debug_node`와 `line_follow_node`에서 GCS telemetry/video 송출에 재사용된다.
+- Gazebo vision-only smoke와 SITL line-follow smoke는 통과했으며, line-follow 제어 성능 튜닝은 별도 작업이다.
+
 ## 5. P2 MAVLink Adapter 최소 구현
 
 최소 기능:
@@ -90,6 +97,12 @@ MTF-01 optical flow/range가 Pixhawk/ArduPilot에서 안정적으로 인식되�
 
 - SITL에서 arm -> GUIDED -> takeoff -> 짧은 전진 velocity -> land 가능
 - props off Pixhawk bench에서 heartbeat/mode/arm command path 확인
+
+현재 상태:
+
+- UDP SITL transport와 MAVLink adapter는 staging 구현됨.
+- `line_follow_node --target sitl --vision gazebo --video`에서 heartbeat, GUIDED, arm, takeoff, line-follow, land, complete까지 확인됨.
+- Raspberry Pi/Pixhawk 실기체용 serial transport와 props-off bench 검증은 남아 있다.
 
 ## 6. P3 축소 Mission State Machine
 
@@ -113,6 +126,11 @@ ABORT
 - `any -> ABORT`: heartbeat loss, RC takeover, severe failsafe.
 
 이 상태머신은 전체 mission state machine의 축소판이다. full snake, marker revisit, grid exploration 상태는 이 MVP에 넣지 않는다.
+
+현재 상태:
+
+- 축소 상태머신은 `LineFollowMission`으로 구현되어 SITL smoke에 사용된다.
+- marker hover transition은 존재하지만, line-follow 제어 튜닝 전이므로 실기체 MVP gate는 여전히 짧은 직선 추종 + 안전 착륙이다.
 
 ## 7. P4 Line-Follow Controller와 Safety
 

@@ -1,6 +1,6 @@
 # Astroquad System Spec
 
-최종 업데이트: 2026-05-13
+최종 업데이트: 2026-05-15
 
 이 문서는 `uav-onboard`와 `uav-gcs`를 모두 포함하는 전체 시스템 기준 문서다. Repo별 세부 책임은 각 repo의 `PROJECT_SPEC.md`를 따른다.
 
@@ -71,6 +71,14 @@ Debug/staging 실행 파일:
 - `vision_debug_node`: camera/vision/telemetry/debug video bring-up.
 - `video_streamer`: raw MJPEG transport smoke tool.
 - `mission_node` 또는 `line_follow_node`: 임시 staging target 허용. 안정화 후 `uav_onboard`로 흡수한다.
+
+Gazebo/SITL staging:
+
+- WSL에서 `bash ~/fly_test.sh`로 Astroquad Gazebo vision world와 ArduCopter SITL을 실행한다.
+- main world는 Iris 하향 camera, 어두운 ground, 폭 10cm 흰색 직선 line, 출발점 기준 3m 전방 50cm x 50cm ArUco ID 1 marker를 포함한다.
+- `vision_debug_node --target sitl --vision gazebo --video`는 Gazebo 하향 camera frame을 GCS로 보내고 기존 line/marker/intersection overlay telemetry를 유지한다.
+- `line_follow_node --target sitl --vision gazebo --video`는 같은 vision/GCS path와 MAVLink UDP SITL control path를 함께 검증하는 staging executable이다.
+- 실기체 기본값은 Raspberry Pi 4 + IMX519 + Pixhawk1이며, Gazebo 값은 runtime profile 또는 CLI option으로만 선택한다.
 
 ### uav-gcs
 
@@ -192,6 +200,8 @@ Fallback:
 구현됨:
 
 - Pi 4 + IMX519 `rpicam-vid` MJPEG frame capture
+- Gazebo `FrameSource`와 SITL runtime profile
+- Astroquad Gazebo vision course/fixtures
 - UDP JSON telemetry send/receive
 - opt-in UDP MJPEG debug video send/receive
 - GCS discovery beacon and video unicast switch
@@ -204,13 +214,14 @@ Fallback:
 - `GridCoordinateTracker`
 - GCS marker/line/intersection overlay
 - GCS `[intersection-decision]`, `[grid-node]`, `[grid-map]` log display
+- SITL MAVLink UDP heartbeat/mode/arm/takeoff/body-velocity/land staging path
 
 미구현 또는 staging:
 
 - full mission state machine
-- Pixhawk/MAVLink control loop
-- line-follow control backend
-- safety monitor
+- Pixhawk serial MAVLink transport
+- line-follow control backend tuning
+- safety monitor expansion
 - GCS command channel
 - full snake mission policy
 - marker revisit policy
