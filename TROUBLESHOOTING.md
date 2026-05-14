@@ -1,6 +1,6 @@
 # Astroquad 트러블슈팅 및 개발 판단 로그
 
-최종 업데이트: 2026-05-10
+최종 업데이트: 2026-05-15
 
 범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석, 해결 방법, 설계 판단을 보고서용 개발로그로 정리한다. 현재 기본 장치는 Raspberry Pi 4 + IMX519-78이며, Raspberry Pi Zero 2 W 관련 내용은 이전 bring-up 단계의 이력으로 남긴다.
 
@@ -1625,3 +1625,207 @@ ctest --test-dir build --output-on-failure
 - marker ID가 1-2 detection 주기만 비는 정도면 `hold_frames = 9`를 유지한다.
 - 드론 이동 속도가 빨라 stale marker가 오래 남는 느낌이면 `hold_frames = 6`으로 낮춘다.
 - marker가 거의 한 번도 fresh detection되지 않는다면 hold로는 해결되지 않는다. 이 경우에는 ROI를 넓히기보다 marker 주변에 흰색 quiet zone/plate를 물리적으로 확보하거나, 중앙부 template fallback을 더 자주 돌리는 별도 튜닝을 검토한다.
+
+## 34. `line_follow_node`가 `vx=0.25`를 찍는데 Gazebo 기체가 멈춘 것처럼 보임
+
+### 문제 상황
+
+`line_follow_node` control log에는 다음처럼 전진 명령이 계속 출력됐다.
+
+```text
+state=LINE_FOLLOW mode=GUIDED ... vx=0.25 vy=0 vz_down=0 yaw_rate=0
+```
+
+하지만 Gazebo camera 화면에서는 기체가 라인 중간이나 ArUco marker 근처에서 더 이상 앞으로 가지 않는 것처럼 보였다.
+
+### 원인
+
+초기 MAVLink UDP transport가 “마지막으로 packet을 보낸 peer”를 다음 command 송신 대상으로 사용했다. SITL, GCS, Mission Planner/MAVProxy가 같은 주변 port를 쓰면 GCS heartbeat가 마지막 packet이 될 수 있고, 이때 `SET_POSITION_TARGET_LOCAL_NED` command가 ArduPilot이 아니라 GCS 쪽으로 나갈 수 있었다.
+
+겉으로는 onboard log에 `vx`가 찍히지만 실제 ArduPilot에는 command가 들어가지 않으므로, 화면에서는 멈춘 것처럼 보인다.
+
+### 해결
+
+- `MavlinkTransport::pinPeerFromLastMessage()` 경로를 추가했다.
+- `AutopilotMavlinkAdapter`는 target system/component의 autopilot heartbeat를 확인한 뒤 command peer를 고정한다.
+- GCS/Mission Planner heartbeat는 command peer를 가로채지 못하게 했다.
+- control log에 `mode`, `local_xy`, `vel_ned`를 추가해 “명령을 보냈는지”와 “실제 local position이 움직였는지”를 같이 본다.
+- `test_udp_mavlink_transport`에 GCS heartbeat가 peer를 hijack하지 않는 회귀 테스트를 추가했다.
+
+### 검증
+
+SITL에서 `local_xy`가 0m 부근에서 약 3m 부근까지 증가하고, `MARKER_APPROACH -> MARKER_HOVER -> LAND -> COMPLETE`까지 진행되는 것을 확인했다.
+
+### 재발 확인법
+
+- `vx=0.25`인데 `local_xy`가 거의 변하지 않으면 MAVLink command peer, SITL routing, heartbeat source를 먼저 본다.
+- `mode=GUIDED`가 풀렸거나 `vel_ned`가 0으로 붙어 있으면 ArduPilot이 command를 거부하거나 받지 못하는 상태로 본다.
+- 로그에 아직 `line_ahead`가 출력되면 오래된 binary를 실행 중인 것이다. `cmake --build build` 후 다시 실행한다.
+
+## 35. 화면 위쪽 line이 끊겼다고 판단해 line-follow가 너무 일찍 멈춤
+
+### 문제 상황
+
+하향 camera 화면에서 현재 중심 아래/주변에는 라인이 선명하게 보이는데, 화면 위쪽이나 marker 주변이 끊긴 것처럼 보이면 기체가 더 이상 전진하지 않는 경우가 있었다.
+
+### 원인
+
+초기 상태머신은 `line_ahead` 같은 전방 라인 존재 조건을 별도로 보려 했다. marker나 화면 crop 때문에 위쪽 line segment가 부분적으로 끊겨 보이면, 실제로는 계속 따라갈 라인이 남아 있어도 “앞에 라인이 없다”고 판단할 수 있었다.
+
+### 해결
+
+라인 추종 중에는 `line_detected`가 true인 동안 무조건 계속 전진/추종하도록 단순화했다.
+
+- `line_ahead` gating 제거.
+- 라인이 완전히 잡히지 않을 때만 line lost timer를 진행.
+- ArUco marker가 보이면 `MARKER_APPROACH`로 들어가되, marker가 잠깐 사라지고 line은 보이면 line-follow fallback으로 계속 진행.
+- line이 더 이상 잡히지 않고 marker도 없으면 안전 착륙한다.
+
+### 판단
+
+현재 축소 MVP에서는 “전방에 라인이 이어지는지”보다 “하향 camera에서 추종 가능한 라인이 현재 보이는지”가 더 안정적인 기준이다. full grid/snake 단계에서 분기점 판단이 필요해지면 line/intersection detector 출력으로 별도 state를 추가한다.
+
+## 36. `vision_debug_node`와 `line_follow_node`를 동시에 실행해 GCS telemetry/video가 꼬임
+
+### 문제 상황
+
+`vision_debug_node --video`와 `line_follow_node --video`를 같이 실행하면 GCS 화면/telemetry가 중간에 멈추거나, 서로 다른 source의 overlay가 섞여 보이는 것처럼 혼란스러운 현상이 있었다.
+
+### 원인
+
+두 프로그램 모두 Gazebo camera frame을 읽고 같은 GCS telemetry/video port로 송신할 수 있다. GCS는 mission source를 독점적으로 구분해 합성하는 구조가 아니므로, 두 onboard-like sender를 동시에 띄우면 frame/vision log/telemetry가 경쟁한다.
+
+### 해결
+
+운영 기준을 분리했다.
+
+- 비행 없는 vision-only smoke: `vision_debug_node --target sitl --vision gazebo --video`
+- 실제 SITL 비행 smoke: `line_follow_node --target sitl --vision gazebo --video`
+
+`line_follow_node --video`는 camera capture, vision 처리, GCS telemetry, GCS video 송신을 모두 포함한다. 비행 중에는 `vision_debug_node`를 별도로 실행하지 않는다.
+
+## 37. `LAND` 진입 후 GCS 영상이 멈춤
+
+### 문제 상황
+
+ArUco marker에서 3초 hover 후 `LAND`로 들어가면 GCS 영상이 멈췄다. 착륙 시작부터 바닥에 닿기 전까지의 상황을 GCS에서 볼 수 없었다.
+
+### 원인
+
+초기 구현은 mission state가 `LAND/COMPLETE`로 넘어가면 control loop가 종료되면서 frame capture와 debug video publish도 함께 끝났다. 따라서 ArduPilot은 착륙 중이어도 GCS 영상 송신은 이미 중단됐다.
+
+### 해결
+
+`LAND` command를 보낸 뒤에도 autopilot disarm 또는 timeout까지 frame을 계속 읽고 GCS video/telemetry를 송신하는 landing video drain 구간을 추가했다.
+
+정상 로그 예:
+
+```text
+[mission] LAND
+[mission] LAND reason=marker hover complete
+[gcs] landing_video_frames=84
+[mission] COMPLETE
+```
+
+### 판단
+
+Debug video는 mission-critical 경로는 아니지만, 착륙 관제에는 필요하다. 앞으로도 state machine 종료와 video publisher 생명주기는 분리해서 본다.
+
+## 38. 이륙 전에는 GCS 영상이 안 나오고 takeoff 후에야 비전이 시작됨
+
+### 문제 상황
+
+`line_follow_node` 실행 후 heartbeat, GUIDED, arm, takeoff가 진행되는 동안에는 GCS camera 화면이 갱신되지 않고, 이륙 후 line-follow control이 시작될 때부터 영상이 나왔다.
+
+### 원인
+
+초기 `line_follow_node`는 takeoff sequence 이후 control loop에 들어가면서 frame capture와 GCS publish를 시작했다. 라인 추종에는 이륙 후 영상만 필요하지만, 운용 관점에서는 시동 직후부터 camera/GCS link 상태를 확인하는 편이 맞다.
+
+### 해결
+
+GCS publisher를 연 직후 startup video streaming 구간을 추가했다. 이 구간은 MAVLink heartbeat/arm/takeoff가 진행되는 동안에도 frame을 읽고 GCS로 보낸다.
+
+정상 로그 예:
+
+```text
+[gcs] startup video streaming until line-follow control starts
+[gcs] startup_video_frames=200
+[mission] LINE_FOLLOW
+```
+
+### 주의
+
+startup video는 관제 편의 기능이다. 이륙 전부터 비전 결과가 보이더라도 mission state는 takeoff 완료 후 `LINE_FOLLOW`부터 제어에 사용한다.
+
+## 39. Gazebo camera zoom/FOV 튜닝 위치
+
+### 문제 상황
+
+실기체 IMX519 camera는 같은 고도에서도 Gazebo 기본 camera보다 라인이 더 굵게 보였다. 반대로 zoom-in을 너무 많이 하면 line은 크게 보이지만 ArUco marker 접근/landing 상황에서 시야가 좁아져 운용이 불편했다.
+
+### 설정 위치
+
+Gazebo Iris 하향 camera FOV는 다음 파일에서 조정한다.
+
+```text
+uav-onboard/sim/gazebo/models/iris_with_downward_camera/model.sdf
+```
+
+핵심 값:
+
+```xml
+<horizontal_fov>1.15</horizontal_fov>
+```
+
+튜닝 기준:
+
+- 값이 작을수록 zoom-in. 라인/marker가 더 크게 보인다.
+- 값이 클수록 zoom-out. 더 넓은 영역이 보이고 라인/marker는 작게 보인다.
+- line/marker 물리 크기는 바꾸지 않는다. 실기체 camera에 맞출 때는 camera FOV만 조정한다.
+- Gazebo model SDF 변경 후에는 Gazebo/SITL을 재시작한다. C++ rebuild는 FOV-only 변경에는 필요 없다.
+
+## 40. Raspberry Pi 4 + Pixhawk1에서 현재 `line_follow_node`를 옵션만 바꿔 바로 쓸 수 있는지
+
+### 현재 판단
+
+부분적으로만 가능하다.
+
+가능한 것:
+
+- Raspberry Pi 4 + IMX519 `rpicam-vid` 기반 camera capture.
+- onboard line/ArUco/intersection vision 처리.
+- GCS telemetry/video 송신.
+- `line_follow_node --target sitl --vision gazebo --video`로 검증된 mission/control 구조.
+
+바로 안 되는 것:
+
+- `--target pixhawk1 --vision rpicam`만으로 Pixhawk1에 직접 제어 명령을 보내는 native serial MAVLink transport는 아직 구현되지 않았다.
+- 현재 code path에서 serial endpoint를 선택하면 “serial transport intentionally not implemented”로 종료한다.
+
+코드 수정 없이 실기체 경로를 억지로 열 수 있는 조건:
+
+- 별도 MAVLink router/bridge가 Pixhawk USB/TELEM serial을 UDP endpoint로 변환한다.
+- `line_follow_node`는 그 UDP endpoint를 `--autopilot udp://...`로 사용한다.
+- 이 경우에도 ArduPilot heartbeat, GUIDED, arm, local position, RC takeover, land command가 props-off bench에서 먼저 검증되어야 한다.
+
+예시:
+
+```bash
+./build/line_follow_node \
+  --config config \
+  --target pixhawk1 \
+  --vision rpicam \
+  --video \
+  --gcs-ip <gcs-ip> \
+  --autopilot udp://0.0.0.0:14550
+```
+
+### 실기체 전 필수 gate
+
+- MTF-01 optical flow/range가 ArduPilot EKF local estimate에 안정적으로 들어오는지 확인한다.
+- GUIDED mode에서 `LOCAL_POSITION_NED`가 정상 갱신되는지 확인한다.
+- props-off 상태에서 heartbeat, mode change, arm inhibit, land, RC takeover를 확인한다.
+- GCS video는 broadcast보다 unicast `--gcs-ip <laptop-ip>`를 우선 사용한다.
+- 실기체 IMX519 시야에 맞게 camera focus/lens/FOV와 line width를 다시 튜닝한다.
+
+결론: vision/GCS 쪽은 Raspberry Pi 4에서 이어서 쓸 준비가 되어 있지만, 실제 Pixhawk 제어는 native serial transport 구현 또는 외부 UDP bridge 절차 확정 없이는 “옵션만 변경해서 바로 자동비행” 단계가 아니다.

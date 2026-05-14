@@ -77,7 +77,10 @@ Gazebo/SITL staging:
 - WSL에서 `bash ~/fly_test.sh`로 Astroquad Gazebo vision world와 ArduCopter SITL을 실행한다.
 - main world는 Iris 하향 camera, 어두운 ground, 폭 10cm 흰색 직선 line, 출발점 기준 3m 전방 50cm x 50cm ArUco ID 1 marker를 포함한다.
 - `vision_debug_node --target sitl --vision gazebo --video`는 Gazebo 하향 camera frame을 GCS로 보내고 기존 line/marker/intersection overlay telemetry를 유지한다.
-- `line_follow_node --target sitl --vision gazebo --video`는 같은 vision/GCS path와 MAVLink UDP SITL control path를 함께 검증하는 staging executable이다.
+- `line_follow_node --target sitl --vision gazebo --video`는 같은 vision/GCS path와 MAVLink UDP SITL control path를 함께 검증하는 staging executable이다. 비행 중에는 camera, vision, telemetry, video 송신을 이 프로세스 하나가 담당한다.
+- `line_follow_node`는 이륙 전 startup video, 비행 중 overlay video, 착륙 중 landing video를 모두 GCS로 보낸다.
+- `vision_debug_node`와 `line_follow_node`를 동시에 GCS video/telemetry sender로 실행하지 않는다.
+- Gazebo Iris camera zoom은 `uav-onboard/sim/gazebo/models/iris_with_downward_camera/model.sdf`의 `<horizontal_fov>`에서 조정한다. 작은 값은 zoom-in, 큰 값은 zoom-out이다.
 - 실기체 기본값은 Raspberry Pi 4 + IMX519 + Pixhawk1이며, Gazebo 값은 runtime profile 또는 CLI option으로만 선택한다.
 
 ### uav-gcs
@@ -215,19 +218,48 @@ Fallback:
 - GCS marker/line/intersection overlay
 - GCS `[intersection-decision]`, `[grid-node]`, `[grid-map]` log display
 - SITL MAVLink UDP heartbeat/mode/arm/takeoff/body-velocity/land staging path
+- SITL line-follow mission staging: 2m takeoff/altitude hold, line-follow, ArUco marker approach, 3초 marker hover, land, complete
+- MAVLink UDP command peer pinning. Autopilot heartbeat peer에 command 송신 대상을 고정해 GCS heartbeat가 command peer를 가로채지 못하게 한다.
+- `line_follow_node` startup video와 landing video streaming
 
 미구현 또는 staging:
 
 - full mission state machine
-- Pixhawk serial MAVLink transport
-- line-follow control backend tuning
+- Pixhawk native serial MAVLink transport
+- 실기체 Pixhawk/MTF-01/GUIDED local estimate bench 검증
 - safety monitor expansion
 - GCS command channel
 - full snake mission policy
 - marker revisit policy
 - official coordinate conversion
 
-## 9. 보고서 작성 기준
+## 9. Raspberry Pi 4 실기체 전환 판단
+
+현재 온보드 코드는 Raspberry Pi 4에서 vision/GCS path를 재사용할 수 있도록 구성되어 있다.
+
+바로 사용할 수 있는 것:
+
+- IMX519 `rpicam-vid` MJPEG capture
+- onboard line/ArUco/intersection vision 처리
+- GCS telemetry/video 송신
+- `line_follow_node`의 mission/control state 구조
+
+아직 옵션 변경만으로 바로 실기체 자동비행까지 이어지지 않는 것:
+
+- `--target pixhawk1 --vision rpicam`은 native serial Pixhawk MAVLink transport가 필요하다.
+- 현재 serial transport는 intentionally not implemented 상태이므로, 직접 serial 제어 경로는 추가 구현이 필요하다.
+- 코드 수정 없이 시도하려면 별도 MAVLink router/bridge가 Pixhawk serial/USB를 UDP endpoint로 노출해야 한다. 이때 `line_follow_node`는 `--autopilot udp://...`로 그 endpoint를 사용한다.
+
+실기체 gate:
+
+- MTF-01 optical flow/range가 ArduPilot EKF local estimate에 안정적으로 반영되어야 한다.
+- GUIDED mode에서 `LOCAL_POSITION_NED`와 altitude source가 정상 갱신되어야 한다.
+- props-off 상태에서 heartbeat, mode change, arm inhibit, land, RC takeover를 검증한다.
+- prop 장착 전 GCS unicast video, camera focus/FOV, line width, detector threshold, controller gain을 현장 조건에 맞춘다.
+
+결론: Raspberry Pi 4에서 vision과 GCS 송신은 이어서 쓸 수 있지만, native serial transport 구현 또는 외부 UDP bridge 절차 확정 없이는 “실행 옵션만 바꿔 바로 자동비행” 단계가 아니다.
+
+## 10. 보고서 작성 기준
 
 1차 기술개발계획서는 다음 흐름을 따른다.
 

@@ -14,7 +14,7 @@
 MTF-01 bring-up
   -> 자동 이륙
   -> 짧은 직선 line follow
-  -> line end, line lost, timeout, operator abort 중 하나에서 안전 착륙
+  -> 종료 marker 또는 line end/lost/timeout/operator abort 중 하나에서 안전 착륙
 ```
 
 MVP 밖으로 뺀 것:
@@ -101,8 +101,10 @@ MTF-01 optical flow/range가 Pixhawk/ArduPilot에서 안정적으로 인식되�
 현재 상태:
 
 - UDP SITL transport와 MAVLink adapter는 staging 구현됨.
-- `line_follow_node --target sitl --vision gazebo --video`에서 heartbeat, GUIDED, arm, takeoff, line-follow, land, complete까지 확인됨.
-- Raspberry Pi/Pixhawk 실기체용 serial transport와 props-off bench 검증은 남아 있다.
+- `line_follow_node --target sitl --vision gazebo --video`에서 heartbeat, GUIDED, arm, 2m takeoff, line-follow, ArUco approach, 3초 hover, land, complete까지 확인됨.
+- MAVLink UDP transport는 autopilot heartbeat를 보낸 peer에 command 송신 대상을 고정한다. GCS/Mission Planner heartbeat가 같은 UDP port 주변에 섞여도 command peer를 가로채지 않아야 한다.
+- `line_follow_node` control log는 `mode`, `local_xy`, `vel_ned`, `vx/vy/vz/yaw_rate`를 출력해 실제 이동과 명령 송신을 함께 확인할 수 있다.
+- Raspberry Pi/Pixhawk 실기체용 native serial transport와 props-off bench 검증은 남아 있다.
 
 ## 6. P3 축소 Mission State Machine
 
@@ -112,6 +114,8 @@ MTF-01 optical flow/range가 Pixhawk/ArduPilot에서 안정적으로 인식되�
 IDLE
 TAKEOFF
 LINE_FOLLOW
+MARKER_APPROACH
+MARKER_HOVER
 LAND
 COMPLETE
 ABORT
@@ -121,7 +125,10 @@ ABORT
 
 - `IDLE -> TAKEOFF`: CLI/config start 또는 임시 command.
 - `TAKEOFF -> LINE_FOLLOW`: 목표 고도 도달.
+- `LINE_FOLLOW -> MARKER_APPROACH`: ArUco marker detected.
 - `LINE_FOLLOW -> LAND`: line end 감지, line lost timeout, runtime timeout, operator abort 중 하나.
+- `MARKER_APPROACH -> MARKER_HOVER`: marker center가 tolerance 안으로 들어옴.
+- `MARKER_HOVER -> LAND`: 3초 hover 완료.
 - `LAND -> COMPLETE`: 착륙 완료.
 - `any -> ABORT`: heartbeat loss, RC takeover, severe failsafe.
 
@@ -130,7 +137,9 @@ ABORT
 현재 상태:
 
 - 축소 상태머신은 `LineFollowMission`으로 구현되어 SITL smoke에 사용된다.
-- marker hover transition은 존재하지만, line-follow 제어 튜닝 전이므로 실기체 MVP gate는 여전히 짧은 직선 추종 + 안전 착륙이다.
+- `line_ahead` 같은 화면 위쪽 line 존재 조건은 제거했다. 라인 추종 중에는 `line_detected`가 true인 한 계속 전진/추종하고, 라인이 더 이상 잡히지 않을 때 착륙한다.
+- marker가 잠깐 안 보여도 line이 보이면 `MARKER_APPROACH`에서 line-follow fallback으로 계속 전진한다.
+- 실기체 MVP gate는 여전히 짧은 직선 추종 + 안전 착륙이며, full snake/revisit은 제외한다.
 
 ## 7. P4 Line-Follow Controller와 Safety
 
@@ -151,7 +160,15 @@ Control 입력:
 완료 기준:
 
 - SITL 또는 fake vision replay에서 line offset sign에 맞는 제어 명령이 나온다.
+- SITL에서 2m altitude hold, line-follow, marker approach, marker hover, land, complete가 반복 통과한다.
 - props off bench에서 command inhibit/land path가 확인된다.
+
+현재 상태:
+
+- `GuidedVelocityController`는 normalized line center error와 axial line angle error를 받아 body-frame forward/lateral/yaw-rate setpoint를 만든다.
+- 2m altitude hold는 local altitude, relative altitude, distance sensor 순으로 가능한 값을 사용한다.
+- SITL에서는 `cmake --build build`, `ctest --test-dir build --output-on-failure`, Gazebo line-follow smoke가 통과했다.
+- 안전 확장, RC takeover 감지, battery failsafe, real Pixhawk serial transport는 남아 있다.
 
 ## 8. P5 GCS Scope 축소
 
@@ -162,6 +179,7 @@ Control 입력:
 - `uav_gcs_vision_debug`로 line offset, video, telemetry, Pixhawk state 확인.
 - mission start는 onboard CLI/config 또는 임시 local trigger로 처리.
 - emergency는 RC takeover, Pixhawk mode switch, kill/land 절차를 우선.
+- 비행 중 GCS 영상/telemetry는 `line_follow_node --video` 하나가 담당한다. `vision_debug_node`는 비행 없는 vision-only smoke 전용이며 동시에 실행하지 않는다.
 
 미루는 것:
 
@@ -177,23 +195,22 @@ Control 입력:
 순서:
 
 1. Props off: Pi-Pixhawk heartbeat, mode, arm inhibit, RC takeover 확인.
-2. Manual/assisted: MTF-01 range/flow 기반 안정 hover 확인.
-3. Auto takeoff only: 이륙 후 즉시 land.
-4. Short line follow: 2-5m 직선 라인에서 저속 추종.
-5. Line end/timeout land: line 끝 또는 timeout에서 안전 착륙.
+2. Native serial transport 또는 외부 MAVLink router 기반 UDP bridge 중 실제 연결 방식을 확정.
+3. Manual/assisted: MTF-01 range/flow 기반 안정 hover 확인.
+4. Auto takeoff only: 이륙 후 즉시 land.
+5. Short line follow: 2-5m 직선 라인에서 저속 추종.
+6. Line end/timeout/marker land: line 끝, marker, 또는 timeout에서 안전 착륙.
 
 이 gate 전에는 교차점 회전, snake, marker revisit을 시도하지 않는다.
 
 ## 10. 개발 우선순위
 
 1. MTF-01 bring-up gate 통과.
-2. `VisionPipeline` 분리.
-3. MAVLink adapter 최소 구현.
-4. GUIDED body velocity line-follow controller 구현.
-5. 축소 상태머신 구현.
-6. GCS command 축소, 관제/로그 집중.
-7. props off bench -> auto takeoff/land -> short line follow -> line end landing.
-8. full snake/marker revisit은 MVP 이후 진행.
+2. Raspberry Pi 4에서 `line_follow_node --target pixhawk1 --vision rpicam` 실기체 경로가 막히는 지점 확인.
+3. Pixhawk native serial transport 구현 또는 MAVLink router/UDP bridge 운용 절차 확정.
+4. props off bench -> auto takeoff/land -> short line follow -> marker/line end landing.
+5. GCS command 축소, 관제/로그 집중.
+6. full snake/marker revisit은 MVP 이후 진행.
 
 ## 11. 1주일 기술개발계획서 작성 계획
 
