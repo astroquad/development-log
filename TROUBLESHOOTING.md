@@ -711,11 +711,11 @@ Raspberry Pi, ArUco와 라인 동시:
 
 ```powershell
 cmake --build uav-onboard/build
-cmake --build uav-onboard/build-tests
-ctest --test-dir uav-onboard/build-tests --output-on-failure
+cmake --build uav-onboard/build
+ctest --test-dir uav-onboard/build --output-on-failure
 cmake --build uav-gcs/build
-cmake --build uav-gcs/build-tests
-ctest --test-dir uav-gcs/build-tests --output-on-failure
+cmake --build uav-gcs/build
+ctest --test-dir uav-gcs/build --output-on-failure
 ```
 
 OpenCV가 있는 로컬 빌드에서는 `line_detector_tuner`와 `vision_debug_node`도 별도 Release 빌드로 확인했다. 단, 1.3 이미지 기반 튜너 검증은 GCS overlay가 이미 들어간 screenshot을 사용한 smoke test이므로 실제 raw camera frame 성능을 완전히 대체하지는 않는다.
@@ -1608,10 +1608,10 @@ Windows OpenCV test build 기준:
 
 ```powershell
 $env:PATH="C:\msys64\ucrt64\bin;$env:PATH"
-cmake --build build-opencv-tests
-ctest --test-dir build-opencv-tests --output-on-failure
-.\build-opencv-tests\aruco_detector_tester.exe --config config --image ..\grid_images\black_grid_with_aruco_marker.png
-.\build-opencv-tests\aruco_detector_tester.exe --config config --image ..\grid_images\white_grid_with_aruco_marker.png
+cmake --build build
+ctest --test-dir build --output-on-failure
+.\build\aruco_detector_tester.exe --config config --image ..\grid_images\black_grid_with_aruco_marker.png
+.\build\aruco_detector_tester.exe --config config --image ..\grid_images\white_grid_with_aruco_marker.png
 ```
 
 결과:
