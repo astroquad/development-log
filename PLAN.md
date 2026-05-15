@@ -1,530 +1,548 @@
 # Astroquad Implementation Plan
 
-최종 업데이트: 2026-05-15
+최종 업데이트: 2026-05-15 KST, Pixhawk serial bench 이후
 
-이 문서는 `RESEARCH.md` 기반으로 다음 에이전트가 바로 구현에 착수할 수 있도록 작성한 구체 계획서다.
+이 문서는 `development-log/RESEARCH.md`를 기반으로 다음 에이전트가 구체적인 작업을 진행하기 위한 실행 계획이다. 목표는 **현재 SITL에서 검증된 mission/control 흐름을 유지하면서, Raspberry Pi 4와 실제 Pixhawk1 사이의 MAVLink serial 연결과 no-arm bench 검증 경로를 안전하게 완성하는 것**이다.
 
-중요: 이 문서를 작성하는 현재 단계에서는 **코드를 수정하지 않는다.** 다음 작업 턴에서만 아래 계획에 따라 구현한다.
+현재 요청 조건:
 
-## 0. 이번 작업 목표
+- 코드 수정은 Raspberry Pi에서 직접 하지 않는다.
+- 코드 수정은 로컬 PC repo에서 수행하고, commit/push 후 Raspberry Pi에서 `git pull`로 받아 테스트한다.
+- Pixhawk parameter 변경은 Raspberry Pi에서 직접 수행해도 된다.
+- 단, 적용할 Pixhawk 설정 값은 repo에 설정 파일로 남겨 원격 저장소에 보존한다.
+- 시뮬레이터와 실제 Pixhawk가 서로 다른 mission logic 코드를 쓰면 안 된다. 설정값만 바꾸면 transport와 runtime target이 바뀌어야 한다.
 
-현재 Gazebo SITL + Windows GCS 경로는 정상이다. 남은 핵심은 `line_follow_node`의 제어/상태머신을 실질적인 line-follow mission으로 만드는 것이다.
+## 0. 현재 진행 상태
 
-구현 목표:
+완료:
 
-```text
-GUIDED 진입
-  -> arm
-  -> 2m takeoff
-  -> 착륙 전까지 2m altitude hold 의도 유지
-  -> line center가 camera center에 오도록 lateral/yaw 제어
-  -> line angle이 desired angle에 수렴하도록 yaw 제어
-  -> ArUco marker 인식
-  -> marker 중심 좌표 위에서 3초 hover
-  -> marker 위치에서 land
-  -> COMPLETE
-```
+- `SerialMavlinkTransport` 구현.
+- `mavlink_probe` no-arm bench tool 구현.
+- `mavlink_motor_test` 저출력 모터 테스트 도구 구현.
+- `line_follow_node --target pixhawk1 --mavlink-smoke` 안전 smoke 경로 구현.
+- 실제 serial target에서 명시 safety flag 없이 자동 arm/takeoff mission을 거부하도록 guard 추가.
+- `config/runtime.pixhawk1.toml`을 Pixhawk USB stable by-id path로 변경.
+- `config/pixhawk1_usb.params`, `config/pixhawk1_usb.expected.toml` 추가.
+- local Linux build/CTest 통과.
+- commit `030a476` push 완료.
+- Pi에서 `git pull`, build, CTest `13/13` 통과.
+- Pi에서 `mavlink_probe --strict-local-estimate` exit status `0`.
+- Pixhawk parameter `EK3_SRC1_POSXY=0`, `EK3_SRC1_VELZ=0` 적용 완료.
 
-실기체 target은 A안이다.
+남은 immediate 작업:
 
-```text
-A: EKF local estimate + ARM/GUIDED + LOCAL_POSITION_NED + BODY_NED velocity/setpoint
-B: ALT_HOLD + RC_CHANNELS_OVERRIDE fallback 설계만 준비
-```
+- 사용자가 물리적으로 기체 주변을 정리한 상태에서 `mavlink_motor_test`로 모터별 회전 확인.
+- RC receiver 입력이 왜 `RC_CHANNELS count=0`인지 확인.
+- power module/battery monitor 설정 확인. 현재 `BATT_MONITOR=0`이라 battery telemetry가 없다.
+- `ARMING_CHECK=0`을 최종 비행 전에 더 안전한 값으로 재설정할지 결정.
+- props-off arm/disarm/mode command bench.
 
-## 1. 반드시 지킬 경계와 금지사항
+## 1. 목표 상태
 
-- `vision_debug_node` detector 코드를 mission executable에 복사하지 않는다.
-- `VisionDebugPipeline` 내부에 MAVLink/control 코드를 넣지 않는다.
-- GCS가 mission 판단을 하게 만들지 않는다.
-- GCS가 line/marker/intersection detection을 다시 수행하게 만들지 않는다.
-- debug video를 mission-critical 경로로 넣지 않는다.
-- full snake/revisit/command UI를 이번 line-follow MVP의 선행 조건으로 만들지 않는다.
-- MTF-01/EKF/GUIDED gate 없이 실기체 자동비행 준비 완료로 간주하지 않는다.
-- unrelated refactor, 대규모 UI 전환, protocol 대개편을 섞지 않는다.
-- 이번 계획을 구현할 때도 기존 `vision_debug_node --target sitl --vision gazebo --video` 경로가 깨지면 안 된다.
-
-## 2. 현재 코드에서 시작할 위치
-
-주요 구현 파일 후보:
-
-- `uav-onboard/tools/line_follow_node.cpp`
-- `uav-onboard/src/mission/LineFollowMission.*`
-- `uav-onboard/src/control/GuidedVelocityController.*`
-- `uav-onboard/src/control/ControlSetpoint.hpp`
-- `uav-onboard/src/autopilot/AutopilotMavlinkAdapter.*`
-- `uav-onboard/src/autopilot/AutopilotState.hpp`
-- `uav-onboard/src/safety/SafetyMonitor.*`
-- `uav-onboard/config/mission.toml`
-- `uav-onboard/config/runtime.sitl.toml`
-- `uav-onboard/config/autopilot.toml`
-- `uav-onboard/config/safety.toml`
-- `uav-onboard/tests/`
-
-필요하면 추가할 수 있는 파일:
-
-- `uav-onboard/src/mission/MissionStateMachine.*`
-- `uav-onboard/src/control/LineFollowController.*`
-- `uav-onboard/src/control/ControlBackend.hpp`
-- `uav-onboard/src/control/GuidedVelocityBackend.*`
-- `uav-onboard/src/control/RcOverrideBackend.*`
-- `uav-onboard/src/autopilot/SerialMavlinkTransport.*`
-
-단, 첫 구현에서는 지나치게 큰 프레임워크를 만들지 말고, 현재 `line_follow_node`에서 안전하게 사용할 수 있는 작은 class부터 분리한다.
-
-## 3. Config 변경 계획
-
-### 3.1 고도 기본값
-
-`uav-onboard/config/mission.toml`:
-
-```toml
-[takeoff]
-target_altitude_m = 2.0
-altitude_reached_ratio = 0.9
-
-[altitude_hold]
-target_altitude_m = 2.0
-kp = 0.4
-max_vz_mps = 0.35
-deadband_m = 0.08
-```
-
-`target_altitude_m`은 takeoff와 line-follow 동안 공통으로 2m를 뜻하게 한다. ArduPilot NED 기준 `vz_down_mps`는 아래 방향이 positive이므로, 실제 제어식에서 sign을 반드시 확인한다.
-
-### 3.2 Line-follow controller 설정
-
-`uav-onboard/config/mission.toml` 또는 별도 `[line_controller]`:
-
-```toml
-[line_follow]
-forward_mps = 0.25
-duration_s = 60.0
-desired_angle_deg = 0.0
-marker_hover_s = 3.0
-
-[line_controller]
-offset_kp = 0.35
-angle_yaw_kp = 1.0
-offset_yaw_kp = 0.25
-max_lateral_mps = 0.35
-max_yaw_rate_rad_s = 0.6
-max_forward_mps = 0.35
-min_confidence = 0.35
-offset_deadband_norm = 0.03
-angle_deadband_deg = 3.0
-```
-
-처음 SITL에서는 conservative하게 시작한다. 실제 line 추종이 확인되기 전에는 forward 속도를 낮게 둔다.
-
-### 3.3 Marker hover/land 설정
-
-```toml
-[marker_hover]
-hold_s = 3.0
-center_tolerance_px = 80.0
-center_kp = 0.25
-max_lateral_mps = 0.25
-```
-
-ArUco marker가 인식되면 즉시 land하지 말고, marker 중심이 camera center에 오도록 3초 동안 hover/centering을 시도한 뒤 land한다.
-
-## 4. 상태머신 설계 계획
-
-현재 `LineFollowMission`은 작고 빠르게 만든 staging 상태머신이다. 다음 구현에서는 유지보수성을 위해 state와 action을 분리한다.
-
-목표 상태:
+최종 목표:
 
 ```text
-IDLE
-WAIT_AUTOPILOT
-SET_GUIDED
-ARM
-TAKEOFF
-LINE_FOLLOW
-MARKER_APPROACH
-MARKER_HOVER
-LAND
-COMPLETE
-ABORT
+같은 mission/control 코드
+  + runtime 설정 target=sitl     -> UDP MAVLink transport + Gazebo vision
+  + runtime 설정 target=pixhawk1 -> Serial MAVLink transport + rpicam vision
 ```
 
-첫 구현에서 `WAIT_AUTOPILOT`, `SET_GUIDED`, `ARM`은 `line_follow_node` orchestration에 남겨도 된다. 다만 mission class의 public API는 새 상태 추가가 쉬운 형태로 둔다.
+허용되는 차이:
 
-권장 구조:
+- transport 종류: UDP vs serial
+- frame source: Gazebo camera vs rpicam
+- runtime config: endpoint, baudrate/device, safety timeout, tuning 값
+- test command: no-arm probe, props-off command bench, full mission run
+
+허용되지 않는 차이:
+
+- 실기체 전용 mission state machine 별도 구현
+- SITL과 실기체에서 다른 line-follow 판단 코드 사용
+- GCS가 mission 판단을 대신 수행
+- `vision_debug_node` detector 코드를 mission executable에 복사
+
+## 2. 현재 확인된 사실
+
+요약:
+
+- Pixhawk USB MAVLink는 Pi에서 `/dev/ttyACM0` 및 stable by-id path로 통신 가능하다.
+- Stable path는 `/dev/serial/by-id/usb-ArduPilot_fmuv2_260034001451373037353835-if00`이다.
+- `/dev/serial0`은 현재 `ttyS0` Linux console/getty에 묶여 있으므로 USB Pixhawk 테스트 기본값으로 쓰면 안 된다.
+- Pixhawk firmware는 ArduCopter `V4.6.3`, frame은 `QUAD/X`, 현재 mode는 `STABILIZE`, disarmed다.
+- Parameter list는 읽힌다.
+- `FLOW_TYPE=5`, `RNGFND1_TYPE=10`, `EK3_ENABLE=1` 등 MTF-01 관련 설정 후보는 존재한다.
+- 2026-05-15 bench 이후 `LOCAL_POSITION_NED`, `DISTANCE_SENSOR`, `RANGEFINDER`, `OPTICAL_FLOW`, `EKF_STATUS_REPORT`가 확인됐다.
+- `RC_CHANNELS count=0`, `BATT_MONITOR=0`, `ARMING_CHECK=0` 상태도 확인됐다.
+- `line_follow_node`는 serial target을 지원하되, real serial에서는 `--mavlink-smoke`, `--no-arm`, `--dry-run`, `--allow-arm-takeoff` 중 하나 없이는 실행을 거부한다.
+
+첫 구현 작업인 **no-arm MAVLink probe + serial transport**는 완료됐다. 다음 작업은 RC/battery/failsafe 확인, 물리적으로 관찰하는 motor test, 그리고 props-off command bench다.
+
+## 3. 절대 금지사항
+
+실기체 안전:
+
+- 현재 `line_follow_node`를 실제 Pixhawk에 바로 연결해 실행하지 않는다.
+- no-arm/dry-run/probe 경로가 생기기 전에는 실제 Pixhawk에 `setGuidedMode`, `arm`, `takeoff`, `land`, `sendBodyVelocity`, `RC_CHANNELS_OVERRIDE`를 보내지 않는다.
+- props 장착 상태 테스트는 이 계획 범위 밖이다.
+- `ARMING_CHECK=0`인 현재 상태를 안전한 상태로 간주하지 않는다.
+- `RC_CHANNELS count=0` 상태에서 RC takeover가 가능하다고 가정하지 않는다.
+- `LOCAL_POSITION_NED`와 range/flow가 확인되지 않은 상태에서 GUIDED velocity line-follow를 시도하지 않는다.
+
+코드/운영:
+
+- Raspberry Pi에서 직접 코드 수정하지 않는다.
+- Pi에서 임시로 고친 파일을 테스트 후 방치하지 않는다.
+- 로컬 변경 없이 Pi에서만 빌드 결과를 바꾸지 않는다.
+- `/dev/serial0`을 현재 USB Pixhawk 기본 endpoint로 설정하지 않는다.
+- SITL용 mission logic과 Pixhawk용 mission logic을 분리하지 않는다.
+- full snake/revisit/GCS command UI를 현재 blocker 해결 작업에 섞지 않는다.
+
+## 4. 작업 흐름 규칙
+
+코드 작업 workflow:
 
 ```text
-MissionInput
-  now
-  autopilot_state snapshot
-  vision_result snapshot
-  safety_decision
-  operator_command
-
-MissionOutput
-  state
-  desired_control_mode
-  control_intent
-  should_takeoff
-  should_land
-  landing_reason
+local PC repo에서 수정
+  -> local build/test
+  -> git status 확인
+  -> commit
+  -> push
+  -> SSH into Pi
+  -> cd /home/astroquad/astroquad/uav-onboard
+  -> git pull
+  -> cmake/build/test
+  -> Pixhawk bench probe
 ```
 
-상태 전환 규칙:
-
-- `IDLE -> TAKEOFF`: onboard local start 또는 CLI start.
-- `TAKEOFF -> LINE_FOLLOW`: altitude >= 2.0m * reached_ratio.
-- `LINE_FOLLOW -> MARKER_APPROACH`: ArUco marker detected.
-- `MARKER_APPROACH -> MARKER_HOVER`: marker center가 tolerance 안에 들어오거나, marker approach timeout이 지나면 hover로 넘어간다.
-- `MARKER_HOVER -> LAND`: centered hover 누적 시간이 3초가 되면 land.
-- `LINE_FOLLOW -> LAND`: line lost timeout, mission timeout, operator land.
-- `LAND -> COMPLETE`: disarmed 확인.
-- `any -> ABORT`: heartbeat loss, severe failsafe, RC takeover, EKF/GUIDED 불가.
-
-나중에 full snake mission을 붙일 때 `LINE_FOLLOW` 뒤에 `GRID_EXPLORE`, `NODE_DECISION`, `TURN`, `MARKER_RECORD`, `REVISIT`을 추가할 수 있어야 한다. 이를 위해 `switch(state)` 안에 큰 제어 코드를 직접 넣지 말고, state transition과 control intent 생성을 분리한다.
-
-## 5. ROS-like 설계 철학 적용 계획
-
-ROS를 직접 쓰지 않지만 node graph처럼 typed message를 흘린다.
-
-권장 runtime graph:
+Pixhawk parameter 작업 workflow:
 
 ```text
-FrameSource
-  -> VisionProcessor
-  -> MissionStateMachine
-  -> GuidanceController
-  -> ControlBackend
-  -> AutopilotMavlinkAdapter
-
-Observers:
-  SafetyMonitor
-  VisionDebugPublisher
-  TelemetryPublisher
-  LogPublisher
+local repo에 parameter 파일 작성/수정
+  -> commit/push
+  -> Pi에서 git pull
+  -> Pi에서 no-arm parameter diff 확인
+  -> 필요할 때만 Pi에서 Pixhawk에 parameter 적용
+  -> 적용 후 다시 parameter dump
+  -> dump 결과를 local repo에 반영하거나 별도 기록 파일로 저장
 ```
 
-구현 원칙:
+권장 SSH:
 
-- 각 단계는 input snapshot을 받고 output struct를 반환한다.
-- `VisionProcessor`는 MAVLink를 모른다.
-- `MissionStateMachine`은 pixel image/JPEG를 모른다. marker center, line offset, line angle 같은 typed vision result만 본다.
-- `GuidanceController`는 mission state와 vision error를 velocity/yaw/altitude setpoint로 바꾼다.
-- `ControlBackend`는 setpoint를 A안 GUIDED velocity 또는 B안 RC override로 변환한다.
-- `AutopilotMavlinkAdapter`는 MAVLink packet 송수신만 한다.
-- GCS publisher는 observer이며 mission/control 루프를 막으면 안 된다.
+```bash
+ssh astroquad@astroquad.local
+```
 
-## 6. Line-follow 제어 구현 계획
+Pi repo path:
 
-현재 vision은 다음 값을 제공한다.
+```bash
+/home/astroquad/astroquad/uav-onboard
+```
+
+## 5. Phase 0: 기준 동기화 - 완료
+
+목표: local repo와 Pi repo 기준을 맞추고, 이후 테스트가 어떤 commit에서 수행됐는지 추적 가능하게 한다.
+
+작업:
+
+- local `uav-onboard`와 remote Pi `uav-onboard`의 branch/HEAD 차이를 확인한다.
+- Pi의 현재 HEAD는 조사 시점에 `b337d02`, local은 `23214a4`였다. 다음 작업 전 반드시 다시 확인한다.
+- local 변경사항이 있으면 내용을 이해하고 보존한다.
+- Pi repo에 local-only 변경이 있으면 바로 덮어쓰지 말고 diff를 확인한다.
+- 이후 구현 기준 commit을 하나로 정한다.
+
+성공 기준:
+
+- local과 Pi가 같은 branch를 보고 있다.
+- 어떤 commit을 Pi에 배포해 테스트할지 명확하다.
+- `git status --short`가 local/Pi 모두 의도한 상태다.
+
+## 6. Phase 1: no-arm MAVLink probe 추가 - 완료
+
+목표: 실제 Pixhawk와 통신하되 절대 arm/takeoff/mode 변경을 하지 않는 독립 실행 파일을 만든다.
+
+권장 실행 파일:
 
 ```text
-line_center_x
-image_center_x
-line_angle
-confidence
+uav-onboard/tools/mavlink_probe.cpp
 ```
 
-제어 error:
+권장 CLI:
+
+```bash
+./build/mavlink_probe --config config --target pixhawk1
+./build/mavlink_probe --autopilot serial:///dev/ttyACM0:115200
+./build/mavlink_probe --autopilot serial:///dev/serial/by-id/usb-ArduPilot_fmuv2_260034001451373037353835-if00:115200
+./build/mavlink_probe --strict-local-estimate
+./build/mavlink_probe --dump-params
+```
+
+필수 동작:
+
+- serial endpoint open
+- companion/GCS heartbeat 송신
+- Pixhawk heartbeat 수신
+- mode/armed/sysid/component 출력
+- message interval request:
+  - `SYS_STATUS`
+  - `LOCAL_POSITION_NED`
+  - `GLOBAL_POSITION_INT`
+  - `DISTANCE_SENSOR`
+  - `RANGEFINDER`
+  - `OPTICAL_FLOW`
+  - `OPTICAL_FLOW_RAD`
+  - `EKF_STATUS_REPORT`
+  - `RC_CHANNELS`
+- 주요 parameter read/dump
+- missing gate를 명확한 exit code로 반환
+
+절대 금지:
+
+- `setGuidedMode`
+- `setLandMode`
+- `arm`
+- `disarm`
+- `takeoff`
+- `sendBodyVelocity`
+- `RC_CHANNELS_OVERRIDE`
+- `COMMAND_LONG` 중 actuator/flight mode에 영향을 주는 명령
+
+성공 기준:
+
+- Pixhawk heartbeat를 30초 안에 수신한다.
+- `mode=STABILIZE`, `armed=false` 같은 상태를 정확히 출력한다.
+- parameter list 또는 selected parameter가 읽힌다.
+- missing `LOCAL_POSITION_NED`, range, flow, RC 상태를 실패/경고로 명확히 표시한다.
+- 이 도구를 여러 번 실행해도 Pixhawk mode/armed 상태가 바뀌지 않는다.
+
+## 7. Phase 2: SerialMavlinkTransport 구현 - 완료
+
+목표: 기존 `MavlinkTransport` interface를 유지하면서 serial/USB MAVLink endpoint를 직접 지원한다.
+
+권장 파일:
 
 ```text
-offset_error = line_center_x - image_center_x
-angle_error  = line_angle - desired_angle
+uav-onboard/src/autopilot/SerialMavlinkTransport.hpp
+uav-onboard/src/autopilot/SerialMavlinkTransport.cpp
 ```
-
-권장 내부 표현:
-
-```text
-offset_error_norm = offset_error / (image_width * 0.5)
-angle_error_rad = deg_to_rad(line_angle_deg - desired_angle_deg)
-```
-
-주의할 점:
-
-- 현재 `toLineControlInput()`은 `center_offset_px / half_width`를 `center_error_m` 이름의 필드에 넣는다. 구현 시 필드명을 `center_error_norm` 등으로 바로잡거나, 최소한 comment/config 이름을 normalized 기준으로 맞춘다.
-- camera image X positive 방향과 `MAV_FRAME_BODY_NED`의 `vy_right_mps` positive 방향이 일치하는지 SITL에서 검증한다.
-- `line_angle_deg` sign과 ArduPilot yaw-rate sign이 일치하는지 SITL에서 검증한다.
-
-초기 controller 식:
-
-```text
-vx_forward_mps = forward_mps
-vy_right_mps   = clamp(offset_kp * offset_error_norm, -max_lateral_mps, max_lateral_mps)
-yaw_rate_rad_s = clamp(angle_yaw_kp * angle_error_rad + offset_yaw_kp * offset_error_norm,
-                       -max_yaw_rate_rad_s,
-                       max_yaw_rate_rad_s)
-vz_down_mps    = altitude_hold_controller(current_altitude_m, target_altitude_m)
-```
-
-Sign 검증 후 필요하면 `vy_right_mps` 또는 `yaw_rate_rad_s`의 sign을 config로 뒤집을 수 있게 한다.
-
-추천 config:
-
-```toml
-[line_controller]
-invert_lateral = false
-invert_yaw = false
-```
-
-Line lost 처리:
-
-- 짧은 line lost: `vx = 0`, `vy = 0`, `yaw_rate = 0`, altitude hold만 유지.
-- `line_lost_ms` 초과: mission output이 `LAND`.
-- confidence가 낮으면 제어 gain을 줄이거나 hold 처리한다.
-
-## 7. 2m altitude hold 구현 계획
-
-요구사항은 “이륙 시 2m까지 올라가고 착륙 전까지 항상 2m 고도를 유지하려고 한다”이다.
-
-구현 방향:
-
-- takeoff command는 `MAV_CMD_NAV_TAKEOFF` altitude 2.0m.
-- takeoff 완료 판단은 `AutopilotMavlinkAdapter::bestAltitudeM()` 기준 `>= 2.0 * altitude_reached_ratio`.
-- line-follow 동안 `SET_POSITION_TARGET_LOCAL_NED` body velocity에 `vz_down_mps`를 포함한다.
-- altitude source 우선순위는 현재 코드처럼 distance sensor, local position, relative altitude 순서를 유지하되, 실기체에서는 MTF-01 range 안정성을 우선 확인한다.
-
-Altitude hold P 제어:
-
-```text
-altitude_error_m = target_altitude_m - current_altitude_m
-vz_down_mps = -clamp(kp * altitude_error_m, -max_vz_mps, max_vz_mps)
-if abs(altitude_error_m) < deadband_m:
-    vz_down_mps = 0
-```
-
-NED sign 설명:
-
-- current altitude가 target보다 낮으면 `altitude_error_m > 0`, 더 올라가야 하므로 `vz_down_mps`는 negative.
-- current altitude가 target보다 높으면 `altitude_error_m < 0`, 내려가야 하므로 `vz_down_mps`는 positive.
-
-검증:
-
-- SITL에서 2m 도달 전 `LINE_FOLLOW`로 넘어가지 않는지 확인한다.
-- line-follow 중 `vz_down_mps`가 altitude error에 맞게 작아지고, 2m 근처에서 0으로 수렴하는지 log로 확인한다.
-
-## 8. ArUco marker hover 후 landing 계획
 
 요구사항:
 
-- Gazebo line 끝에 ArUco marker가 있다.
-- ArUco marker가 인식되면 marker 중심 좌표 기준으로 3초간 hover.
-- 3초 후 그 자리에서 바로 착륙.
+- POSIX `termios` raw mode
+- `/dev/ttyACM0`, `/dev/ttyUSB0`, `/dev/serial/by-id/...`, 추후 `/dev/ttyAMA0` 지원
+- configurable baudrate
+- USB CDC는 baudrate가 nominal이어도 config를 유지
+- `recvMessage(mavlink_message_t&, timeout_ms)`에서 `select` timeout 처리
+- byte stream MAVLink parser 처리
+- partial read/write 처리
+- `EINTR`, `EAGAIN`, short write 대응
+- close/restore RAII
+- permission denied, no such device, busy device, timeout 에러 메시지 명확화
+- UDP transport와 같은 `MavlinkTransport` interface 사용
 
-구현 방향:
+테스트:
 
-1. `VisionResult.markers`가 비어 있지 않으면 marker detected.
-2. 첫 marker 또는 ID 1 marker를 target marker로 선택한다. 지금 Gazebo fixture는 ID 1 기준이므로 가능하면 ID 1을 우선한다.
-3. marker center error를 계산한다.
+- serial parsing unit test는 pseudo terminal 또는 작은 parser test로 가능하면 추가한다.
+- 기존 UDP transport test를 깨지 않는다.
+- `mavlink_probe`가 `SerialMavlinkTransport`를 통해 `/dev/ttyACM0` heartbeat를 읽는다.
 
-```text
-marker_offset_x = marker.center_px.x - image_center_x
-marker_offset_y = marker.center_px.y - image_center_y
-```
+성공 기준:
 
-4. `MARKER_APPROACH` 또는 `MARKER_HOVER`에서는 line-follow forward command를 멈추고 marker center가 camera center로 오도록 body velocity를 낸다.
-5. marker center가 tolerance 안에 들어온 시간만 누적해 3초 hover를 판단한다.
-6. marker가 일시적으로 사라지면 짧게 hold하고, marker lost timeout이 길어지면 safety land 또는 line-follow 복귀 중 하나를 선택한다. 이번 MVP는 safety land가 더 안전하다.
-7. 3초가 지나면 `LAND` 상태로 전환하고 `setLandMode()` 또는 `MAV_CMD_NAV_LAND`를 사용한다.
+- SITL 기존 `UdpMavlinkTransport` test 통과.
+- Pi에서 serial transport로 Pixhawk heartbeat 수신.
+- serial transport 실패 시 actionable error가 나온다.
 
-초기 marker centering 식:
+## 8. Phase 3: Pixhawk parameter config 파일 관리 - 1차 완료
 
-```text
-vx_forward_mps = clamp(marker_y_kp * marker_offset_y_norm, -max_marker_mps, max_marker_mps)
-vy_right_mps   = clamp(marker_x_kp * marker_offset_x_norm, -max_marker_mps, max_marker_mps)
-yaw_rate_rad_s = 0
-vz_down_mps    = altitude hold until LAND starts
-```
+목표: Pixhawk 설정 변경을 사람이 기억에 의존하지 않고 repo에서 추적한다.
 
-marker image Y sign은 반드시 SITL에서 확인한다. 하향 카메라에서 image down이 body forward인지 backward인지는 camera mounting/orientation에 따라 다를 수 있으므로 `invert_marker_x`, `invert_marker_y` config를 둘 수 있다.
-
-## 9. MAVLink/ControlBackend 계획
-
-### 9.1 A안 구현 목표
-
-A안은 primary다.
+권장 파일:
 
 ```text
-EKF local estimate
-ARM
-GUIDED
-LOCAL_POSITION_NED or range altitude
-MAV_FRAME_BODY_NED velocity setpoint
-SET_POSITION_TARGET_LOCAL_NED
+uav-onboard/config/pixhawk1_usb.params
+uav-onboard/config/pixhawk1_usb.expected.toml
+uav-onboard/config/pixhawk1_usb.observed.example.toml
 ```
 
-필요 조건:
+역할:
 
-- heartbeat 수신
-- GUIDED mode set/confirm
-- arm confirm
-- takeoff command
-- altitude estimate valid
-- line-follow 중 주기적으로 body velocity setpoint 송신
-- land mode set/confirm
+- `pixhawk1_usb.params`: ArduPilot parameter apply용 canonical 파일.
+- `pixhawk1_usb.expected.toml`: probe가 읽어야 할 핵심 기대값과 gate 기준.
+- `pixhawk1_usb.observed.example.toml`: 조사 시점 관찰값 예시 또는 template.
 
-`AutopilotMavlinkAdapter` 점검:
+초기 expected에 포함할 항목:
 
-- 현재 `sendBodyVelocity()`는 `MAV_FRAME_BODY_NED`와 velocity+yaw_rate setpoint를 보낸다.
-- type mask는 position/accel/yaw ignore, velocity/yaw_rate 사용 형태로 유지한다.
-- `vz_down_mps`를 altitude hold에서 적극 사용하도록 controller output을 연결한다.
-- `LOCAL_POSITION_NED`, `DISTANCE_SENSOR`, `GLOBAL_POSITION_INT` 수신 상태를 log/telemetry에 드러낸다.
+```toml
+[identity]
+sysid = 1
+frame_class = 1
+frame_type = 1
+firmware_family = "ArduCopter"
 
-### 9.2 B안 fallback 설계
+[mavlink]
+transport_device = "/dev/serial/by-id/usb-ArduPilot_fmuv2_260034001451373037353835-if00"
+baudrate = 115200
 
-B안은 이번에 실비행 primary로 만들지 않는다. 다만 구조상 추가 가능하게 설계한다.
+[ekf]
+ahrs_ekf_type = 3
+ek3_enable = 1
+ek3_flow_use = 1
+ek3_src1_posxy = 0
+ek3_src1_velxy = 5
+ek3_src1_posz = 1
+ek3_src1_velz = 0
+ek3_src1_yaw = 1
 
-```text
-ALT_HOLD + RC_CHANNELS_OVERRIDE
+[rangefinder]
+rngfnd1_type = 10
+rngfnd1_orient = 25
+rngfnd1_min_cm = 1
+rngfnd1_max_cm = 800
+
+[flow]
+flow_type = 5
+
+[safety]
+arming_check_expected_nonzero = true
+battery_monitor_expected_nonzero = true
+rc_channels_required = true
 ```
 
-Fallback 발동 후보:
+주의:
 
-- GUIDED mode 진입 실패
-- EKF local estimate unavailable
-- local position/range invalid
-- MTF-01 optical flow/range failure
-- repeated setpoint rejection 또는 failsafe
+- 현재 관찰값은 `ARMING_CHECK=0`, `BATT_MONITOR=0`, `RC_CHANNELS count=0`이다.
+- 이 값들을 그대로 "좋은 설정"으로 고정하지 않는다.
+- `expected` 파일에는 목표/gate 기준을 쓰고, `observed` dump에는 현재 사실을 쓴다.
+- 실제 parameter apply는 no-arm probe와 diff 출력이 안정된 뒤 진행한다.
 
-B안 구현 시 경계:
+성공 기준:
 
-- mission state machine은 A/B backend를 몰라야 한다.
-- 공통 `ControlSetpoint`를 만든 뒤 backend만 `GuidedVelocityBackend` 또는 `RcOverrideBackend`로 바꾼다.
-- RC override는 실기체 위험도가 높으므로 props-off bench, low-throttle inhibit, RC takeover 우선순위 확인 후에만 활성화한다.
+- repo에 Pixhawk 설정 목표와 관찰 dump 형식이 생긴다.
+- probe가 expected file과 현재 Pixhawk parameter를 비교할 수 있다.
+- 변경한 Pixhawk parameter는 commit history로 추적 가능하다.
 
-이번 계획에서 구현할 최소 항목:
+## 9. Phase 4: runtime config 통합 - 1차 완료
 
-- `ControlBackend` interface 설계.
-- A안 backend는 기존 MAVLink body velocity path로 구현.
-- B안은 config/documentation과 placeholder class 또는 명확한 TODO까지만 허용. 실제 RC override 전송은 별도 안전 검토 후.
+목표: 설정값만 바꾸면 SITL과 Pixhawk가 같은 mission/control code path를 사용하게 한다.
 
-## 10. Telemetry/Logging 계획
+수정 방향:
 
-GCS overlay는 이미 잘 된다. 이번 작업에서 디버깅을 위해 control/mission 상태를 log에 남겨야 한다.
+- `runtime.sitl.toml`:
+  - transport `udp`
+  - vision `gazebo`
+  - SITL-specific topic/timeout/tuning
+- `runtime.pixhawk1.toml`:
+  - transport `serial`
+  - vision `rpicam`
+  - serial device는 current wiring 기준 stable by-id path
+  - no-arm smoke mode가 기본이거나 별도 probe tool 사용
 
-권장 telemetry/log fields:
+권장 Pixhawk runtime 기본 serial:
 
-```json
-"mission": {
-  "state": "LINE_FOLLOW",
-  "target_altitude_m": 2.0,
-  "landing_reason": ""
-},
-"control": {
-  "offset_error_norm": 0.12,
-  "angle_error_deg": -4.5,
-  "vx_forward_mps": 0.25,
-  "vy_right_mps": 0.04,
-  "vz_down_mps": -0.02,
-  "yaw_rate_rad_s": -0.08
-},
-"autopilot": {
-  "mode": "GUIDED",
-  "armed": true,
-  "altitude_m": 1.98,
-  "range_m": 1.98,
-  "local_position_valid": true
-}
+```toml
+[serial]
+device = "/dev/serial/by-id/usb-ArduPilot_fmuv2_260034001451373037353835-if00"
+baudrate = 115200
 ```
 
-Protocol 변경이 부담되면 우선 stdout log로 남긴다. GCS parser가 unknown field를 무시하는 구조이면 additive JSON fields를 추가할 수 있지만, 양쪽 `docs/PROTOCOL.md` 갱신을 같이 한다.
+주의:
 
-## 11. Test 계획
+- `/dev/serial0`은 현재 USB Pixhawk 테스트 기본값으로 쓰지 않는다.
+- 나중에 TELEM UART로 옮기려면 별도 `runtime.pixhawk1_uart.toml`을 만들고 console/getty disable 절차를 문서화한다.
 
-### 11.1 Unit/focused tests
+성공 기준:
 
-추가 권장 테스트:
+- `--target sitl`은 기존 SITL smoke를 유지한다.
+- `--target pixhawk1`은 serial endpoint를 선택한다.
+- mission/control 코드 중 endpoint 종류를 직접 분기하는 부분이 최소화된다.
+- transport 선택은 factory/config 레벨에서 끝난다.
 
-- `GuidedVelocityController` 또는 새 `LineFollowController`
-  - positive offset일 때 expected `vy_right_mps` sign 확인.
-  - positive angle error일 때 expected yaw sign 확인.
-  - deadband 안에서는 lateral/yaw가 0 또는 작게 나오는지 확인.
-  - output clamp 확인.
-  - line lost 입력에서 stop/hold setpoint 확인.
-- altitude hold
-  - current 1.5m, target 2.0m이면 `vz_down_mps < 0`.
-  - current 2.5m, target 2.0m이면 `vz_down_mps > 0`.
-  - current 2.02m, target 2.0m이면 deadband로 0.
-- mission state machine
-  - takeoff altitude 도달 전에는 `LINE_FOLLOW` 진입 금지.
-  - ArUco detected -> marker hover -> 3초 후 land.
-  - line lost timeout -> land.
-  - heartbeat lost -> abort.
+## 10. Phase 5: Pi 배포와 no-arm bench 테스트 - 완료
 
-### 11.2 SITL smoke
+목표: 로컬에서 구현한 serial/probe를 Pi에 배포해 props-off 상태에서 통신 gate를 확인한다.
 
-기존 순서:
-
-```powershell
-cd astroquad\uav-gcs
-.\build\uav_gcs_vision_debug.exe --config config
-```
+절차:
 
 ```bash
-bash ~/fly_test.sh
+# local PC
+git status --short
+cmake --build build
+ctest --test-dir build --output-on-failure
+git add ...
+git commit -m "Add no-arm MAVLink serial probe"
+git push
+
+# Raspberry Pi
+ssh astroquad@astroquad.local
+cd /home/astroquad/astroquad/uav-onboard
+git pull
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+./build/mavlink_probe --config config --target pixhawk1
 ```
+
+성공 기준:
+
+- Pi build succeeds.
+- tests pass or known unrelated failures are documented.
+- `mavlink_probe` opens Pixhawk USB serial.
+- heartbeat/mode/armed/sysid/component are printed.
+- no flight-affecting command is sent.
+- Pixhawk remains disarmed and in the same operator-selected mode.
+
+## 11. Phase 6: MTF-01/EKF local estimate gate - no-arm bench 통과
+
+목표: GUIDED velocity를 쓰기 전에 MTF-01 range/flow와 EKF local estimate를 실제로 확인한다.
+
+Probe가 확인해야 하는 것:
+
+- `LOCAL_POSITION_NED` appears.
+- local `x/y/z`와 `vx/vy/vz`가 finite 값이다.
+- range telemetry appears:
+  - `DISTANCE_SENSOR` 또는 ArduPilot-specific `RANGEFINDER`
+- optical flow telemetry appears:
+  - `OPTICAL_FLOW` 또는 `OPTICAL_FLOW_RAD`
+- 바닥 높이 변화에 range가 반응한다.
+- 기체를 손으로 천천히 움직이면 flow/local velocity가 반응한다.
+- EKF flags가 local estimate gate를 만족한다.
+- RC input이 `RC_CHANNELS`로 보인다.
+
+실패 시 해야 할 일:
+
+- 코드 mission 확장으로 넘어가지 않는다.
+- Pixhawk parameter expected/observed를 비교한다.
+- MTF-01가 연결된 Pixhawk port/protocol/baud 설정을 확인한다.
+- 필요한 parameter 변경은 repo의 params file에 먼저 반영한다.
+- Pi에서 parameter apply 후 다시 dump/probe한다.
+
+성공 기준:
+
+- no-arm probe에서 local estimate/range/flow/RC가 모두 확인된다.
+- 결과가 `development-log/RESEARCH.md` 또는 별도 bench log에 갱신된다.
+- 다음 props-off command bench로 넘어갈 수 있다.
+
+## 12. Phase 7: line_follow_node 안전 옵션 추가 - 1차 완료
+
+목표: 실제 Pixhawk target에서도 같은 executable을 쓰되, 실기체 bench 단계에서 arm/takeoff를 막을 수 있게 한다.
+
+권장 CLI:
 
 ```bash
-WINDOWS_GCS_IP="$(ip route | awk '/default/ {print $3; exit}')"
-
-cd ~/astroquad/uav-onboard
-./build/line_follow_node \
-  --config config \
-  --target sitl \
-  --vision gazebo \
-  --video \
-  --gcs-ip "$WINDOWS_GCS_IP"
+./build/line_follow_node --config config --target pixhawk1 --vision rpicam --no-arm
+./build/line_follow_node --config config --target pixhawk1 --vision rpicam --dry-run
+./build/line_follow_node --config config --target pixhawk1 --vision rpicam --mavlink-smoke
 ```
 
-SITL 성공 기준:
+권장 의미:
 
-- `[mission] TAKEOFF target=2.0m`
-- altitude 2m 근처 도달 후 `LINE_FOLLOW`.
-- line offset이 줄어드는 방향으로 `vy/yaw_rate`가 출력된다.
-- 드론이 라인을 벗어나지 않고 라인 끝까지 접근한다.
-- ArUco ID 1 인식.
-- marker center 기준 hover 3초.
-- 그 자리에서 `LAND`.
-- disarmed 후 `COMPLETE`.
+- `--mavlink-smoke`: heartbeat/streams/state only, mission start 없음.
+- `--dry-run`: vision/control 계산은 하되 Pixhawk에 flight-affecting command 송신 없음.
+- `--no-arm`: mode/request stream은 허용할 수 있으나 arm/takeoff 금지. 정확한 허용 범위는 코드에서 명시적으로 분리한다.
 
-### 11.3 현실 세계 점검
+주의:
 
-구현 완료 후 실기체 적용 가능성 점검 항목:
+- `--no-arm`이 있어도 mode change가 안전한지 별도로 판단한다.
+- 첫 버전은 mode change도 하지 않는 `--mavlink-smoke`를 우선 구현한다.
+- 실제 command path는 명시적 플래그 없이는 열리지 않게 한다.
 
-- Pixhawk1에서 MTF-01 optical flow/range 수신 확인.
-- ArduPilot EKF가 GPS 없이 GUIDED/local position velocity 제어를 받아들일 상태인지 확인.
-- `LOCAL_POSITION_NED` 또는 equivalent local estimate가 안정적으로 갱신되는지 확인.
-- range altitude가 2m 근처에서 튀지 않는지 확인.
-- props off 상태에서 heartbeat, mode change, arm inhibit, takeoff command reject/accept path 확인.
-- RC takeover가 언제나 onboard command보다 우선하는지 확인.
-- 실제 line width, camera FOV, altitude 2m에서 line detection confidence가 충분한지 확인.
-- SITL gain을 그대로 실기체에 쓰지 말고, forward/lateral/yaw gain을 50% 이하로 낮춰 첫 hover/line test를 시작한다.
+성공 기준:
 
-## 12. 구현 순서 체크리스트
+- Pixhawk target으로 실행해도 기본 또는 smoke 모드에서 arm/takeoff가 발생하지 않는다.
+- SITL full mission smoke는 기존처럼 가능하다.
+- command-producing branch가 로그에 명확히 표시된다.
 
-1. [ ] 현재 `RESEARCH.md`, `MVP_PLAN.md`, `PROJECT_SPEC.md` 재확인.
-2. [ ] `mission.toml`/`runtime.sitl.toml`에서 2m altitude와 line/marker controller 설정 확장.
-3. [ ] `ControlSetpoint`가 `vx`, `vy`, `vz`, `yaw_rate`를 명확히 표현하는지 확인하고 이름/주석 정리.
-4. [ ] `GuidedVelocityController`를 line center/angle 기반 controller로 정리하거나 새 `LineFollowController`로 분리.
-5. [ ] altitude hold P controller 추가.
-6. [ ] offset/angle sign 검증을 위한 unit tests 추가.
-7. [ ] mission state machine을 `TAKEOFF`, `LINE_FOLLOW`, `MARKER_APPROACH`, `MARKER_HOVER`, `LAND`, `COMPLETE`, `ABORT` 중심으로 정리.
-8. [ ] ArUco marker centering + 3초 hover + land transition 구현.
-9. [ ] `line_follow_node` orchestration이 mission output과 controller output을 연결하도록 정리.
-10. [ ] control setpoint와 mission/autopilot state를 stdout 또는 telemetry에 노출.
-11. [ ] A안 GUIDED body velocity path 회귀 확인.
-12. [ ] B안 RC override fallback은 interface/설계 수준으로만 남기고 실제 활성화는 별도 safety gate로 미룬다.
-13. [ ] `ctest --test-dir build --output-on-failure` 실행.
-14. [ ] Windows GCS + WSL Gazebo SITL smoke 실행.
-15. [ ] 구현 후 현실 적용 가능성 점검 결과를 `RESEARCH.md` 또는 `TROUBLESHOOTING.md`에 기록.
+## 13. Phase 8: props-off command bench - 다음 단계
 
-## 13. 작업 완료 기준
+전제:
 
-코드 구현 작업이 완료되었다고 판단하려면 다음을 만족해야 한다.
+- Phase 1-7 완료.
+- no-arm probe에서 local estimate/range/flow/RC 확인.
+- operator가 props off 상태를 직접 확인.
+- GCS 또는 Mission Planner로 상태 관찰 가능.
 
-- takeoff target이 2m이고, `LINE_FOLLOW` 중 altitude hold setpoint가 계속 2m를 유지하려 한다.
-- line controller가 `offset_error = line_center_x - image_center_x`, `angle_error = line_angle - desired_angle`를 기준으로 명확히 동작한다.
-- 제어 output sign이 unit test와 SITL log로 검증된다.
-- ArUco marker 인식 시 marker center 기준 3초 hover 후 land한다.
-- 상태머신은 새 상태를 추가하기 쉬운 입력/출력 구조를 가진다.
-- `vision_debug_node`와 GCS overlay 기존 동작이 유지된다.
-- 실기체 A안 적용 가능성을 점검했고, B안 fallback은 구조상 추가 가능하게 남아 있다.
+작업 순서:
+
+1. Stream request/state read만 반복.
+2. Land command를 disarmed/ground 상태에서 어떻게 처리하는지 확인.
+3. Mode switch command를 짧게 확인하되, operator mode switch로 즉시 되돌릴 수 있게 준비.
+4. Arm command는 마지막에 별도 명시 승인을 받고 수행.
+5. Arm 성공 시 즉시 disarm path 확인.
+6. takeoff는 이 phase에서 하지 않는다.
+
+성공 기준:
+
+- mode/armed 상태 변화가 정확히 telemetry에 반영된다.
+- arm/disarm path가 props-off에서 확인된다.
+- RC takeover/mode switch 절차가 확인된다.
+- 실패 시 Pixhawk가 안전 상태로 돌아온다.
+
+## 14. Phase 9: 첫 실기체 line-follow 준비
+
+전제:
+
+- props-off command bench 완료.
+- MTF-01 local estimate gate 완료.
+- RC takeover 확인.
+- battery monitor/failsafe 또는 대체 운용 절차 확인.
+- IMX519 camera/focus/FOV/line threshold 현장 확인.
+- prop 장착 전/후 체크리스트 작성.
+
+첫 실기체 목표:
+
+```text
+auto takeoff
+  -> 즉시 land
+  -> 짧은 2-5m 직선 line follow
+  -> line end/lost/marker/timeout에서 land
+```
+
+금지:
+
+- snake
+- marker revisit
+- 교차점 회전
+- 장거리 autonomous mission
+
+## 15. 문서 갱신 규칙
+
+작업 중 갱신할 파일:
+
+- `development-log/RESEARCH.md`: 조사 결과, 실제 관찰값, 문제 원인.
+- `development-log/PLAN.md`: 현재 실행 계획과 checklist.
+- `development-log/TROUBLESHOOTING.md`: 반복 문제와 해결 이력.
+- `uav-onboard/config/pixhawk1_usb.*`: Pixhawk 설정 목표/관찰/적용값.
+
+기록해야 하는 값:
+
+- 실행 commit hash
+- Pi hostname/IP
+- serial device path
+- Pixhawk firmware version
+- mode/armed state
+- parameter diff
+- observed telemetry messages
+- missing telemetry messages
+- pass/fail와 다음 action
+
+## 16. 다음 에이전트 첫 작업
+
+다음 에이전트가 실제 구현을 시작한다면 이 순서로 진행한다.
+
+1. `RESEARCH.md`와 이 `PLAN.md`를 읽는다.
+2. local/Pi repo revision 차이를 확인한다.
+3. `mavlink_probe` 설계를 코드에 반영한다.
+4. `SerialMavlinkTransport`를 구현한다.
+5. `pixhawk1_usb.expected.toml`과 `pixhawk1_usb.params` 초안을 추가한다.
+6. local build/test를 통과시킨다.
+7. commit/push 한다.
+8. Pi에서 `git pull` 후 build/test 한다.
+9. props-off `mavlink_probe`만 실행한다.
+10. 결과를 `RESEARCH.md`와 필요 시 `TROUBLESHOOTING.md`에 갱신한다.
+
+첫 구현 PR/commit의 완료 조건:
+
+- 코드가 serial transport를 지원한다.
+- no-arm probe가 실제 Pixhawk heartbeat를 읽는다.
+- Pixhawk에 arm/takeoff/mode-change/velocity command를 보내지 않는다.
+- SITL UDP path가 깨지지 않는다.
+- runtime config만으로 SITL/Pixhawk transport 선택 방향이 정리된다.

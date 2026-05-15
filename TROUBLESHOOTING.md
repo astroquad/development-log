@@ -1829,3 +1829,168 @@ uav-onboard/sim/gazebo/models/iris_with_downward_camera/model.sdf
 - 실기체 IMX519 시야에 맞게 camera focus/lens/FOV와 line width를 다시 튜닝한다.
 
 결론: vision/GCS 쪽은 Raspberry Pi 4에서 이어서 쓸 준비가 되어 있지만, 실제 Pixhawk 제어는 native serial transport 구현 또는 외부 UDP bridge 절차 확정 없이는 “옵션만 변경해서 바로 자동비행” 단계가 아니다.
+
+## 41. Pixhawk USB serial bench bring-up과 MTF-01 local estimate 확인
+
+### 문제 상황
+
+실제 Pixhawk1은 Raspberry Pi 4의 USB-A 포트와 Pixhawk USB 포트로 연결되어 있었다. 프로펠러는 제거되어 있었지만, 모터 전원은 인가된 상태였다.
+
+초기 조사에서는 Python MAVLink probe로 heartbeat와 parameter list는 읽혔지만, 다음 메시지가 확인되지 않아 GUIDED velocity 기반 line-follow gate를 통과하지 못한 상태로 보였다.
+
+```text
+LOCAL_POSITION_NED
+DISTANCE_SENSOR
+OPTICAL_FLOW
+OPTICAL_FLOW_RAD
+```
+
+또한 `line_follow_node`는 serial target을 인식하더라도 serial transport가 미구현이라 종료했고, serial이 열리면 기존 mission path가 GUIDED/arm/takeoff로 바로 이어질 위험이 있었다.
+
+### 원인
+
+직접적인 코드 원인은 native serial MAVLink transport와 no-arm probe 경로가 없었던 것이다.
+
+설정 면에서는 Pixhawk EKF source가 no-GPS optical-flow MVP에 맞지 않았다.
+
+관찰된 차이:
+
+```text
+EK3_SRC1_POSXY=3
+EK3_SRC1_VELZ=3
+```
+
+no-GPS optical-flow bench target으로는 다음 값이 필요했다.
+
+```text
+EK3_SRC1_POSXY=0
+EK3_SRC1_VELZ=0
+```
+
+### 해결
+
+적용 commit:
+
+```text
+030a476 Add Pixhawk serial MAVLink bench tools
+```
+
+구현 내용:
+
+- `SerialMavlinkTransport` 추가.
+- `mavlink_probe` no-arm bench tool 추가.
+- `mavlink_motor_test` 저출력 motor test tool 추가.
+- `line_follow_node`에 real serial safety guard 추가.
+- `line_follow_node --mavlink-smoke` 추가.
+- `runtime.pixhawk1.toml`을 stable USB by-id path로 변경.
+- `config/pixhawk1_usb.params`, `config/pixhawk1_usb.expected.toml` 추가.
+
+Pi 배포/검증:
+
+```bash
+cd /home/astroquad/astroquad/uav-onboard
+git pull --ff-only
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+결과:
+
+```text
+13/13 tests passed
+```
+
+Pixhawk parameter 적용:
+
+```bash
+./build/mavlink_probe --config config --target pixhawk1 --duration-ms 12000 \
+  --param-file config/pixhawk1_usb.params \
+  --apply-params --i-understand-this-writes-pixhawk-params
+```
+
+적용된 값:
+
+```text
+EK3_SRC1_POSXY: 3 -> 0
+EK3_SRC1_VELZ: 3 -> 0
+```
+
+### 검증
+
+No-arm probe:
+
+```bash
+./build/mavlink_probe --config config --target pixhawk1 --duration-ms 12000
+```
+
+대표 결과:
+
+```text
+heartbeat: system=1 component=1 mode=STABILIZE(0) armed=false
+local_position_ned: x≈-1.97 y≈-2.79 z≈101.7 vx≈0 vy≈0 vz≈0.005
+range: distance_sensor_m≈1.54 rangefinder_m≈1.54
+optical_flow: quality≈139 ground_distance_m≈1.54
+rc: channels=0 rssi=255
+ekf: flags=0x16f
+```
+
+Strict local estimate gate:
+
+```bash
+./build/mavlink_probe --config config --target pixhawk1 \
+  --duration-ms 12000 --strict-local-estimate
+```
+
+결과:
+
+```text
+exit status 0
+```
+
+`line_follow_node` serial smoke:
+
+```bash
+./build/line_follow_node --config config --target pixhawk1 \
+  --mavlink-smoke --smoke-duration-ms 5000 --no-telemetry
+```
+
+결과:
+
+```text
+[mavlink] safety smoke mode: no mode/arm/takeoff/velocity commands
+[mavlink] heartbeat ok system=1 component=1 mode=STABILIZE armed=false
+[mavlink-smoke] ... local_xy=(...) vel_ned=(...) range=...
+```
+
+### 남은 이슈
+
+- `RC_CHANNELS count=0`: RC receiver input/takeover는 아직 MAVLink에서 확인되지 않았다.
+- `BATT_MONITOR=0`: battery voltage/current telemetry가 없다.
+- `ARMING_CHECK=0`: bench에서는 편하지만 flight-ready safety 상태가 아니다.
+- `mavlink_motor_test`는 구현됐지만 실제 모터 회전은 물리 안전 확인이 필요하므로 자동 실행하지 않았다.
+
+### 다음 확인
+
+모터 회전 테스트는 사용자가 기체 주변을 정리하고 손/케이블을 치운 뒤 직접 실행한다.
+
+```bash
+cd /home/astroquad/astroquad/uav-onboard
+./build/mavlink_motor_test --config config --target pixhawk1 \
+  --motor 1 --percent 5 --seconds 1 --props-removed
+```
+
+예상:
+
+- Pixhawk heartbeat가 출력된다.
+- motor 1이 약 1초 동안 낮은 출력으로 돈다.
+- `COMMAND_ACK result=0`이면 ArduPilot이 motor test command를 accepted한 것이다.
+
+모터가 돌지 않으면 확인할 것:
+
+- Pixhawk safety switch 상태.
+- ESC signal/power wiring.
+- MAIN OUT motor order.
+- ESC calibration 여부.
+- ArduPilot `MOT_PWM_TYPE`, `MOT_PWM_MIN/MAX`, frame class/type.
+- IOMCU/safety 관련 statustext.
