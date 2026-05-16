@@ -2,170 +2,212 @@
 
 Last updated: 2026-05-16 KST
 
-Scope: facts needed for the first real-aircraft line-follow MVP:
+Scope: `line_follow_node`를 RC 채널 값 검증 없이 진행한다고 가정했을 때의
+구현 현황과 실제 비행 안정성 판단.
 
-```text
-auto takeoff -> short straight line follow -> ArUco marker detected
-  -> 3 second marker hover -> land
-```
+이번 판단에서 제외하는 항목:
 
-Out of scope for this step: full snake/grid exploration, marker revisit, GCS
-command UI, RC override backend, battery monitor parameter automation, and
-Pixhawk parameter write automation.
+- full snake/grid exploration
+- marker revisit
+- GCS command UI
+- RC bring-up 자체
+- Pixhawk parameter 자동 write
+- battery/failsafe parameter 자동 설정
 
-## Implemented In This Step
+## 결론
 
-- `line_follow_node` now accepts
-  `--line-mode auto|light_on_dark|dark_on_light`.
-- `line_follow_node` prints selected line mode and RC safety policy at startup.
-- `AutopilotMavlinkAdapter` decodes MAVLink `RC_CHANNELS` into
-  `AutopilotState`.
-- `SafetyMonitor` handles:
-  - missing RC input when RC is required
-  - stale RC input
-  - operator takeover when mode changes away from `GUIDED`
-- SITL/runtime default assumes RC is present so Gazebo line-follow can still
-  run without a real receiver.
-- Pixhawk1 runtime requires fresh RC before command-producing mission flight.
-- Real serial mission still requires explicit `--allow-arm-takeoff`; with that
-  flag, RC gate failure still exits before `GUIDED`, arm, takeoff, or velocity
-  commands.
-- Unit coverage was added for RC MAVLink decode and safety-monitor decisions.
+`line_follow_node`의 자동 이륙, 짧은 직선 라인 추종, ArUco marker 접근,
+3초 hover, 착륙까지의 MVP 실행 경로는 코드상 구현되어 있다.
 
-## Relevant Files
+RC 값을 무시하고 진행하는 우회 경로도 이미 있다. 실기체 Pixhawk1 실행 시
+`--unsafe-assume-rc-present`를 붙이면 `runtime.pixhawk1.toml`의
+`rc_required=true`가 런타임에서 `false`로 바뀌고, `waitRcReady()`가
+MAVLink `RC_CHANNELS`를 기다리지 않는다.
 
-- `uav-onboard/tools/line_follow_node.cpp`
-- `uav-onboard/src/autopilot/AutopilotState.hpp`
-- `uav-onboard/src/autopilot/AutopilotMavlinkAdapter.cpp`
-- `uav-onboard/src/safety/SafetyMonitor.*`
-- `uav-onboard/config/safety.toml`
-- `uav-onboard/config/runtime.sitl.toml`
-- `uav-onboard/config/runtime.pixhawk1.toml`
-- `uav-onboard/tests/test_autopilot_poll_drain.cpp`
-- `uav-onboard/tests/test_safety_monitor.cpp`
-- `uav-onboard/tools/mavlink_probe.cpp`
-- `uav-onboard/tools/vision_debug_node.cpp`
+다만 이 상태는 "비행 가능 코드 경로가 있다"는 의미이지, "실기체 비행
+안정성이 확보됐다"는 의미는 아니다. RC 우회는 조종기 기반 kill/mode
+takeover 확인을 소프트웨어 안전 조건에서 제거하므로 실제 첫 비행 안정성은
+낮게 봐야 한다.
 
-## Current Execution Policy
+## RC 무시 실행 조건
 
-SITL/Gazebo:
+실기체 자동 arm/takeoff 경로는 기본적으로 막혀 있다. Pixhawk1 serial target에서
+명령을 실제로 보내려면 여전히 `--allow-arm-takeoff`가 필요하다.
 
-- RC is assumed present by config.
-- Existing line-follow smoke can run without ELRS hardware.
-- Use `--line-mode` per run instead of editing `vision.toml`.
-
-Pixhawk1 real serial:
-
-- Serial path:
-  `/dev/serial/by-id/usb-ArduPilot_fmuv2_260034001451373037353835-if00`
-- Command-producing mission path is blocked unless `--allow-arm-takeoff` is
-  passed.
-- Even with `--allow-arm-takeoff`, fresh `RC_CHANNELS.chancount > 0` is
-  required before mode/arm/takeoff.
-- During mission, RC loss requests LAND if still in `GUIDED`.
-- If the operator switches out of `GUIDED`, companion velocity commands stop
-  and the mission exits as operator takeover.
-
-## RC / ELRS Bench Facts
-
-- MAVLink `RC_CHANNELS.chancount == 0` means no RC channels are available.
-  Source: https://mavlink.io/en/messages/common.html#RC_CHANNELS
-- ArduPilot documents monitoring pilot RC input via `RC_CHANNELS`.
-  Source: https://ardupilot.org/dev/docs/mavlink-rcinput.html
-- Current receiver: BETAFPV Nano 2400 RX / ExpressLRS 2.4GHz Nano RX.
-- Intended Pixhawk1 TELEM2/ELRS parameters:
-
-```text
-SERIAL2_PROTOCOL = 23
-BRD_SER2_RTSCTS = 0
-RC_PROTOCOLS = 512
-RC_OPTIONS = 8480
-RSSI_TYPE = 3
-```
-
-- ArduPilot CRSF/ELRS docs say CRSF uses full-duplex UART,
-  `SERIALx_PROTOCOL=23`, and `RSSI_TYPE=3`.
-  Source: https://ardupilot.org/copter/docs/common-tbs-rc.html
-- After a MAVLink-triggered autopilot reboot, CRSF/ELRS may need receiver power
-  cycling while the transmitter is already on.
-
-Physical checks still needed:
-
-- Transmitter is on and bound.
-- Receiver LED indicates linked state.
-- Receiver output mode is CRSF.
-- Pixhawk/receiver is power-cycled with transmitter already on.
-- Receiver TX -> Pixhawk TELEM2 RX.
-- Receiver RX -> Pixhawk TELEM2 TX if telemetry/backchannel is used.
-- TELEM2 plug orientation, 5V, and GND are correct.
-
-## Remaining Real-Flight Blockers
-
-Do not run real `--allow-arm-takeoff` flight until all gates below pass:
-
-- `mavlink_probe --target pixhawk1 --strict-rc` passes.
-- Battery telemetry/failsafe risk is addressed or explicitly accepted.
-  Previous observation had `BATT_MONITOR=0`.
-- Flight-controller pre-arm risk is addressed or explicitly accepted.
-  Previous observation had `ARMING_CHECK=0`.
-- Props-off motor order/direction is verified.
-- Props-off arm/disarm/LAND command path is verified.
-- Operator can immediately switch mode/kill/land from the transmitter.
-- GCS video/telemetry and line overlay are stable.
-
-## Command Gates
-
-Build/test:
+RC 값을 무시하고 실제 mission 경로로 들어가는 명령 형태:
 
 ```bash
-cd uav-onboard
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
-cmake --build build
-ctest --test-dir build --output-on-failure
+./build/line_follow_node --config config --target pixhawk1 \
+  --vision rpicam --line-mode light_on_dark --video \
+  --allow-arm-takeoff --unsafe-assume-rc-present
 ```
 
-SITL line-follow regression:
+어두운 라인을 따라가야 하면 `--line-mode dark_on_light`를 사용한다.
 
-```bash
-./build/line_follow_node --config config --target sitl \
-  --vision gazebo --line-mode light_on_dark --video
+이 옵션을 붙였을 때 바뀌는 것:
+
+- RC preflight gate를 통과 처리한다.
+- mission 중 RC missing/stale에 의한 LAND fallback을 비활성화한다.
+- MAVLink adapter의 RC decode 코드는 남아 있지만 safety 판단에는 쓰지 않는다.
+
+바뀌지 않는 것:
+
+- Pixhawk heartbeat는 필요하다.
+- real serial target에서는 optical-flow/range/EKF/local-position 기반 local
+  hold estimate gate가 필요하다.
+- mode가 `GUIDED`에서 벗어나면 operator takeover로 보고 companion velocity
+  command를 중단한다.
+- 자동 mission에는 `--allow-arm-takeoff`가 필요하다.
+- line lost, mission timeout, marker timeout, heartbeat lost safety는 남아 있다.
+
+## 구현된 범위
+
+`line_follow_node`
+
+- `--target sitl|pixhawk1`, `--vision fake|gazebo|rpicam`,
+  `--line-mode auto|light_on_dark|dark_on_light`를 지원한다.
+- Pixhawk1 serial target은 `runtime.pixhawk1.toml`의 serial device와 baudrate를
+  사용한다.
+- real serial target은 `--allow-arm-takeoff` 없이는 자동 arm/takeoff mission을
+  거부한다.
+- `--mavlink-smoke`, `--no-arm`, `--dry-run`은 mode/arm/takeoff/velocity 명령을
+  보내지 않는 확인 경로다.
+- `--unsafe-assume-rc-present`는 RC gate만 우회한다.
+
+Vision
+
+- `VisionProcessor`를 공유해 `vision_debug_node`와 `line_follow_node`가 같은
+  detector 경로를 쓴다.
+- frame source는 `fake`, `gazebo`, `rpicam`으로 분리되어 있다.
+- line center offset, line angle, confidence가 controller 입력으로 들어간다.
+- GCS telemetry/video 송신은 `line_follow_node --video`에서 가능하다.
+- 비행 중에는 `vision_debug_node`와 `line_follow_node`를 동시에 GCS video sender로
+  실행하지 않는 전제가 유지된다.
+
+Mission state
+
+구현된 상태 흐름:
+
+```text
+IDLE -> TAKEOFF -> LINE_FOLLOW -> MARKER_APPROACH
+  -> MARKER_HOVER -> LAND -> COMPLETE
+any state -> ABORT
 ```
 
-Pixhawk no-arm gates:
+주요 전환 조건:
+
+- 목표 고도 도달 후 `LINE_FOLLOW`.
+- line detected와 confidence가 충분하면 전진 추종.
+- marker detected면 `MARKER_APPROACH`.
+- marker center가 tolerance 안에 들어오면 `MARKER_HOVER`.
+- marker hover 3초 후 LAND.
+- line lost timeout, marker timeout, mission timeout, safety land면 LAND.
+- heartbeat lost 또는 GUIDED 이탈이면 ABORT.
+
+Control
+
+- 기본 전진 속도는 `0.25 m/s`.
+- line offset은 body-frame lateral velocity로, line angle과 offset은 yaw-rate로
+  P 제어된다.
+- lateral velocity clamp는 `0.35 m/s`, yaw-rate clamp는 `0.6 rad/s`.
+- confidence가 낮거나 line이 없으면 전진 명령을 0으로 두고 altitude/local hold
+  쪽으로 전환한다.
+- altitude hold는 사용 가능한 altitude/range 값을 기준으로 `vz_down`을 제한한다.
+- real serial target은 takeoff 전 local XY hold anchor를 잡고, takeoff settle과
+  landing descent에서도 local hold를 사용하려 한다.
+
+Safety
+
+- heartbeat 미수신/timeout은 ABORT.
+- `GUIDED` mode 이탈은 operator takeover로 보고 LAND도 velocity도 추가로 보내지
+  않고 종료한다.
+- line lost timeout과 mission timeout은 LAND.
+- RC 우회 옵션이 없으면 Pixhawk1 profile은 fresh `RC_CHANNELS`가 필요하다.
+- RC 우회 옵션이 있으면 RC missing/stale safety는 작동하지 않는다.
+- battery low, GCS link lost, Pixhawk parameter sanity는 현재 mission loop에서
+  강제 safety gate로 구현되어 있지 않다.
+
+## 안정성 판단
+
+SITL/코드 수준 안정성:
+
+- mission state machine, guided velocity controller, safety monitor, MAVLink RC
+  decode에 unit coverage가 있다.
+- Gazebo/SITL line-follow smoke 통과 기록이 문서에 남아 있다.
+- 이번 문서 정리 과정에서는 build/test/SITL을 새로 실행하지 않았다.
+
+실기체 안정성:
+
+- RC를 무시하고 진행할 경우 첫 실비행 안정성은 아직 검증되지 않았다.
+- `line_follow_node`는 속도와 yaw-rate를 보수적으로 clamp하지만, 실제 기체 tune,
+  motor order/direction, prop direction, optical-flow drift, camera exposure,
+  line false-positive에는 별도 실기체 검증이 필요하다.
+- local hold estimate gate가 남아 있으므로 optical flow/range/EKF가 불안정하면
+  이륙 전 중단된다. 이 gate는 유지해야 한다.
+- 착륙은 local XY anchor가 있으면 guided descent를 시도하고, 불가능하면 LAND mode
+  fallback을 사용한다. 실제 지면 근접/안정 판단은 range와 local velocity에 의존한다.
+- RC 우회 시 조종기 입력이 보이지 않아도 mission은 진행하므로, 조종기 기반 즉시
+  개입을 안전 근거로 삼을 수 없다. mode 변경을 다른 경로로 넣으면 ABORT는 되지만,
+  이것은 RC takeover 검증을 대체하지 못한다.
+
+현재 판단:
+
+```text
+SITL/벤치 코드 경로: 구현됨
+실기체 no-arm 확인: 필요
+props-off motor/command 확인: 필요
+manual hover/tune 확인: 필요
+RC 우회 실비행 안정성: 미검증, 낮음
+```
+
+## RC 우회로 진행하기 전 최소 gate
+
+RC gate는 생략하더라도 아래 gate는 생략하지 않는다.
 
 ```bash
 ./build/mavlink_probe --config config --target pixhawk1 \
   --duration-ms 12000 --strict-local-estimate
 
-./build/mavlink_probe --config config --target pixhawk1 \
-  --duration-ms 30000 --strict-rc
-
 ./build/line_follow_node --config config --target pixhawk1 \
   --mavlink-smoke --smoke-duration-ms 5000 --no-telemetry
 ```
 
-Vision-only line color check:
+Vision-only line 확인:
 
 ```bash
 ./build/vision_debug_node --config config \
   --line-only --line-mode light_on_dark --video
-
-./build/vision_debug_node --config config \
-  --line-only --line-mode dark_on_light --video
 ```
 
-First real mission command, only after every gate passes:
+Props-off motor 확인:
 
 ```bash
-./build/line_follow_node --config config --target pixhawk1 \
-  --vision rpicam --line-mode light_on_dark --video --allow-arm-takeoff
+./build/mavlink_motor_test --config config --target pixhawk1 \
+  --motor 1 --percent 5 --seconds 1 --props-removed
 ```
 
-## Operational Notes
+Motor 2, 3, 4도 같은 방식으로 확인한다.
 
-- Do not run `vision_debug_node` and `line_follow_node` simultaneously as GCS
-  video/telemetry senders during flight.
-- During mission flight, `line_follow_node` owns camera, vision, telemetry,
-  video, MAVLink control, and safety handling.
-- `vision_debug_node` remains for vision-only smoke/tuning.
-- GCS overlay uses onboard metadata only; GCS should not rerun detection.
+실제 자동 mission은 위 확인, battery/failsafe 판단, manual hover, GCS video/telemetry
+확인이 끝난 뒤에만 시도한다.
+
+## 남은 리스크
+
+- RC 우회는 의도적으로 RC safety layer를 제거한다.
+- battery monitor/failsafe와 arming check 상태는 실제 Pixhawk에서 다시 확인해야 한다.
+- line detector는 조명, 바닥 재질, 라인 색에 민감하므로 `--line-mode`와 threshold
+  tuning이 필요할 수 있다.
+- marker approach는 marker가 보일 때는 marker centering을 하고, marker가 사라져도
+  line이 보이면 line-follow fallback으로 계속 움직일 수 있다.
+- local estimate가 흔들리면 takeoff hold, low-confidence hold, guided landing이
+  모두 흔들릴 수 있다.
+- GCS video는 관찰 보조일 뿐 mission-critical safety가 아니다.
+
+## 다음 작업
+
+1. Raspberry Pi/Pixhawk에서 `--strict-local-estimate`와 `--mavlink-smoke` 재확인.
+2. `vision_debug_node --line-only --video`로 실제 라인 색상과 overlay 안정성 확인.
+3. props-off motor order/direction과 LAND/disarm command path 확인.
+4. manual hover로 optical-flow/range 기반 hold 안정성 확인.
+5. RC 우회를 계속 쓸지, 최소한 mode/kill을 보장할 별도 operator interrupt를 둘지
+   결정.
