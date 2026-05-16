@@ -2228,3 +2228,94 @@ Bench bring-up과 초기 테스트를 위해 ArduPilot arming check가 꺼져 �
 ### 상태
 
 미해결. 당장 실험 속도는 빠르지만 실비행 안전 관점에서는 좋지 않다. 이번 MVP 비행 이후에는 최소한 필요한 arming check를 다시 켜고, 어떤 check를 의도적으로 끄는지 별도 목록으로 관리해야 한다.
+
+
+## 50. Gazebo SITL 라인 추종 중 좌우 헤드쉐이크 진동
+
+최종 업데이트: 2026-05-17
+
+### 문제 상황
+
+Gazebo SITL 라인 추종 테스트에서 드론이 라인 위에 정렬된 상태에서도 1–2초 주기로 좌우 진동("헤드쉐이크")이 발생했다. 전진 속도가 높을수록 진동이 커졌고, 라인 검출 각도가 목표값 근처에서 약간 흔들릴 때 특히 두드러졌다.
+
+### 원인 분석
+
+세 가지 독립적인 원인이 복합적으로 작용했다.
+
+**1. `angle_yaw_kp` 과대 (기존 기본값: 1.0)**
+
+라인 각도 오차에 대한 비례 게인이 yaw_rate 명령으로 직접 연결된다. ±5°(≈0.087 rad) 수준의 미세한 각도 흔들림이 ±0.087 rad/s 수준의 yaw 명령을 만들어 냈다. 제어 루프 20 Hz에서 기체가 돌면 카메라 각도가 바뀌고, 컨트롤러가 반대 방향으로 보정하면서 전형적인 P게인 헌팅이 발생했다.
+
+**2. `offset_yaw_kp` 교차 결합 (기존 기본값: 0.25)**
+
+드론이 옆으로 밀릴 때 이 게인이 횡방향 오차에 비례하는 추가 yaw 성분을 더했다. 의도는 "라인 쪽으로 기수를 돌린다"였지만 실제 동작은 두 번째 피드백 경로를 형성했다: 횡방향 오차 → 추가 yaw → 카메라 각도 변화 → 반대 방향 각도 오차 → 반대 yaw 명령 → 진동. `offset_kp`가 `vy`로 횡방향 드리프트를 이미 보정하는 상황에서 이 결합 항은 잉여이며 루프를 조건부 불안정하게 만들었다.
+
+**3. 출력 스무딩 없음**
+
+EMA alpha 기본값이 1.0(스무딩 없음)이었다. 비전 15 fps에서 두 프레임 연속으로 각도 잡음이 나타나면 다음 틱에서 full-magnitude yaw 명령 반전이 그대로 비행 컨트롤러에 전달됐다.
+
+### 해결 방법
+
+모든 변경은 하위 호환성을 유지한다. 기존 Gazebo 동작은 기본값 베이스라인으로 보존되고, 새 기능은 TOML config 옵트인으로만 활성화된다.
+
+**게인 감소 (`config/mission.toml`, `config/runtime.sitl.toml`)**
+
+```toml
+[line_controller]
+angle_yaw_kp       = 0.5    # 기존 1.0 → 절반으로 축소, 헌팅 진폭 감소
+offset_yaw_kp      = 0.0    # 기존 0.25 → 교차 결합 비활성화 (vy만 사용)
+max_yaw_rate_rad_s = 0.35   # 기존 0.6 → 최악의 경우 명령 상한 축소
+```
+
+**EMA 출력 스무딩** (`GuidedVelocityController` — 새 상태 필드 추가)
+
+```toml
+output_ema_alpha = 0.4   # 0 = 고정, 1.0 = 스무딩 없음(레거시 기본값)
+```
+
+최종 `vy`와 `yaw_rate` 명령에 저역 통과 필터를 적용한다. alpha=0.4, 20 Hz 기준으로 2 Hz 이상의 고주파 반전이 약 80% 감쇠된다. 컨트롤러 C++ 기본값은 1.0으로 유지되어 TOML 옵트인 없이는 동작이 바뀌지 않는다.
+
+**레이트 리미팅** (기본값 비활성, 실제 비행용)
+
+```toml
+max_lateral_rate_mps        = 0.025   # 50 ms 스텝당 vy 변화 상한 → ~0.5 m/s²
+max_yaw_rate_change_rad_s   = 0.025   # 스텝당 yaw_rate 변화 상한
+```
+
+EMA 필터와 독립적으로 기체 프레임 가속도를 제한한다. 기본값 0.0(비활성)으로 SITL에 영향 없음.
+
+**실비행 보수적 프로파일** (`config/runtime.pixhawk1.toml`)
+
+추가로 게인을 낮추고, 레이트 리미팅을 활성화하고, 전진 속도를 줄인 전용 블록을 별도 파일로 관리한다.
+
+### 코드 변경 요약
+
+| 파일 | 변경 내용 |
+|---|---|
+| `src/control/GuidedVelocityController.hpp` | config 구조체에 `output_ema_alpha`, `max_lateral_rate_mps`, `max_yaw_rate_change_rad_s`, `forward_confidence_scale` 추가; `updateLine`/`update`/`stop`을 non-`const`로 변경; `resetSmoothing()`, `smoothOutput()` 추가 |
+| `src/control/GuidedVelocityController.cpp` | `smoothOutput()` 구현 (EMA + 레이트 리미팅); 라인 소실 시 스무더 상태를 0으로 감쇠; 컨피던스 스케일 전진 속도 |
+| `tools/line_follow_node.cpp` | `[line_controller]` 4개 새 키 TOML 파싱 추가 (기존에는 묵묵히 무시됨); 기동 시 게인 배너 출력; `--profile-vision` 플래그 추가; 시뮬/실기 추정기 경로 주석 추가 |
+| `config/mission.toml` | `[line_controller]` 기본값 업데이트, 모든 튜닝 필드 인라인 주석 추가 |
+| `config/runtime.sitl.toml` | 시뮬 전용 오버라이드 (`angle_yaw_kp=0.5`, `offset_yaw_kp=0.0`, `output_ema_alpha=0.4`) |
+| `config/runtime.pixhawk1.toml` | 보수적 실비행 전용 블록 추가 |
+| `src/vision/LineMaskBuilder.cpp` | 지연 `ensure_hsv()` 클로저로 프레임당 중복 `cvtColor` 호출 최대 2회 제거 |
+| `tests/test_guided_velocity_controller.cpp` | 5개 명명 서브테스트 추가 (레거시 수학, EMA 감쇠, 레이트 리미팅, 컨피던스 스케일링, 소실 시 스무더 감쇠) |
+
+### 발견된 버그: TOML 키가 실제로는 읽히지 않았음
+
+이전 WIP diff에서 config 구조체에 필드를 추가하고 TOML 파일에 값을 썼지만, `loadRuntimeConfig()`와 `applyRuntimeOverlay()` 양쪽에 `.value_or()` 호출을 추가하는 것을 빠뜨렸다. `output_ema_alpha`, `max_lateral_rate_mps`, `max_yaw_rate_change_rad_s`, `forward_confidence_scale` 네 키가 런타임에 묵묵히 무시되어 TOML에 뭘 써도 C++ 기본값이 유지됐다. 두 로더 위치에 파싱 블록을 추가해서 수정했다.
+
+### 검증 결과
+
+- `cmake --build build-codex --target onboard_core` — 경고 0개, 클린 빌드
+- `cmake --build build-codex --target test_guided_velocity_controller` — 클린 빌드
+- `./build-codex/tests/test_guided_velocity_controller` — 5개 서브테스트 모두 통과 (exit 0)
+- `LineMaskBuilder.cpp` OpenCV 헤더 포함 컴파일 — 오류 없음
+
+### 미해결 / 알려진 리스크
+
+**`LineStabilizer` 180° 각도 플립**: 스태빌라이저가 프레임 간 라인 각도를 EMA 보간한다. 라인 검출이 ~90°에서 ~270°(축 대칭 앨리어스)로 점프하면 보간이 0°를 지나면서 대규모 순간 각도 오차가 생기고, 짧은 yaw 스파이크가 발생한다. 주요 진동 원인은 아니지만 실비행 적극 튜닝 전에 수정할 것. 완화책: 블렌딩 전 각도 차이를 [−90°, +90°] 범위로 클램프.
+
+**MTF-01 광학 흐름 품질**: 컨트롤러의 `min_confidence` 게이팅은 비행 컨트롤러의 광학 흐름 품질 플래그와 별개다. 실기에서는 `OPTICAL_FLOW_RAD.quality`가 운용 환경에서 안정적으로 ≥ 50을 유지하는지 `forward_mps`를 높이기 전에 벤치에서 검증할 것.
+
+**부호 규약**: MAVLink `SET_POSITION_TARGET_LOCAL_NED` 기체 프레임 부호가 펌웨어 버전에 따라 다를 수 있다. 첫 야외 테스트 전 벤치에서 `invert_lateral`과 `invert_yaw` 플래그를 검증할 것.
