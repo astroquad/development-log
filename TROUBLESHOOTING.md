@@ -1,6 +1,6 @@
 # Astroquad 트러블슈팅 및 개발 판단 로그
 
-최종 업데이트: 2026-05-15
+최종 업데이트: 2026-05-16
 
 범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석, 해결 방법, 설계 판단을 보고서용 개발로그로 정리한다. 현재 기본 장치는 Raspberry Pi 4 + IMX519-78이며, Raspberry Pi Zero 2 W 관련 내용은 이전 bring-up 단계의 이력으로 남긴다.
 
@@ -1994,3 +1994,237 @@ cd /home/astroquad/astroquad/uav-onboard
 - ESC calibration 여부.
 - ArduPilot `MOT_PWM_TYPE`, `MOT_PWM_MIN/MAX`, frame class/type.
 - IOMCU/safety 관련 statustext.
+
+## 42. TELEM2 MAVLink 구성에서 `RC_CHANNELS`가 보이지 않음
+
+### 문제 상황
+
+Pixhawk1 TELEM2에는 조종기/안테나 계통이 연결되어 있고 Mission Planner와 조종기 조작으로 모터 반응은 확인되었다. 하지만 companion computer에서 MAVLink로 확인한 RC 상태는 계속 비어 있었다.
+
+```text
+rc: channels=0 rssi=0
+```
+
+`line_follow_node`의 RC gate도 같은 이유로 통과하지 못했다.
+
+### 원인 판단
+
+TELEM2는 현재 MAVLink 용도로 쓰는 설정이 맞고, 조종기 입력은 일반적인 Pixhawk `RCIN` 입력이 아니라 Mission Planner/RC 시스템을 통한 MAVLink override 또는 별도 경로로 들어오는 것으로 보인다. 이 경우 Pixhawk가 companion link로 `RC_CHANNELS`를 안정적으로 내보내지 않을 수 있다.
+
+### 임시 해결
+
+실비행 직전 테스트를 위해 `line_follow_node`에 다음 강제 옵션을 추가했다.
+
+```bash
+--unsafe-assume-rc-present
+```
+
+이 옵션은 MAVLink RC gate만 우회한다. 실제 serial arm/takeoff는 여전히 `--allow-arm-takeoff`가 있어야 실행된다.
+
+### 상태
+
+미해결. 조종기 수동 개입 자체는 가능해 보였지만, companion software가 `RC_CHANNELS`로 조종기 존재를 검증하는 문제는 남아 있다. 추후 RC receiver 연결 방식, ArduPilot RC input/override 설정, `RC_CHANNELS`/`RC_CHANNELS_OVERRIDE` 경로를 별도로 정리해야 한다.
+
+## 43. 배터리 telemetry가 잡히지 않음
+
+### 문제 상황
+
+초기 Pixhawk probe에서 배터리 voltage/current가 정상적으로 나오지 않았고, strict battery check를 통과하지 못했다.
+
+### 원인
+
+Pixhawk parameter에서 battery monitor가 꺼져 있었다.
+
+```text
+BATT_MONITOR=0
+```
+
+### 해결
+
+Pixhawk1 analog power module 기준으로 battery monitor parameter를 적용하고 reboot했다.
+
+```text
+BATT_MONITOR=4
+BATT_VOLT_PIN=2
+BATT_CURR_PIN=3
+BATT_VOLT_MULT=10.1
+BATT_AMP_PERVLT=17
+BATT_AMP_OFFSET=0
+```
+
+### 결과
+
+`mavlink_probe --strict-battery`가 통과했고, bench 상태에서 다음처럼 전압/전류/잔량이 확인되었다.
+
+```text
+battery: voltage_v=11.42 current_a=0.04 remaining_pct=99
+```
+
+### 상태
+
+해결됨. 단, 실제 배터리 잔량 퍼센트와 전류 정확도는 power module 실측 캘리브레이션으로 추후 보정할 수 있다.
+
+## 44. `line_follow_node`에서 라인 색상 모드를 직접 지정하지 못함
+
+### 문제 상황
+
+`vision_debug_node`는 `--line-mode light_on_dark|dark_on_light|auto`를 지원했지만, 실비행에 사용할 `line_follow_node`는 같은 옵션이 없었다. 콘크리트 바닥/테이프 조건에서는 라인 색상 모드 전환이 즉시 필요했다.
+
+### 해결
+
+`line_follow_node`에 `--line-mode <mode>` 옵션을 추가하고, runtime log에 적용된 mode가 출력되도록 했다.
+
+예:
+
+```bash
+./build/line_follow_node --config config --target pixhawk1 \
+  --vision rpicam --line-mode dark_on_light
+```
+
+### 상태
+
+해결됨.
+
+## 45. IMX519 초점이 흐릿함
+
+### 문제 상황
+
+첫 실비행 후 GCS 영상과 vision debug 화면에서 카메라 초점이 흐릿해 라인/마커 인식 신뢰도가 낮아질 수 있었다.
+
+### 확인
+
+Pi에서 IMX519 focus sweep을 수행했고 Laplacian sharpness 기준으로 `focus_absolute=4095`가 가장 선명했다.
+
+대표 결과:
+
+```text
+4095: sharpness 6.96
+3600: sharpness 6.08
+3200: sharpness 3.45
+1984: sharpness 1.29
+```
+
+### 해결
+
+`config/vision.toml`의 focus 값을 `4095`로 조정했다. 또한 focus motor 설정 직후 바로 `rpicam-vid`를 실행하면 camera timeout이 발생할 수 있어, `RpicamMjpegSource`에서 focus 설정 후 500ms 대기하도록 수정했다.
+
+### 상태
+
+해결됨. Pi에서 `vision_debug_node --vision-smoke-count`와 전체 test가 통과했다.
+
+## 46. 검정 절연 테이프 라인이 햇빛 반사 때문에 잘 잡히지 않음
+
+### 문제 상황
+
+실외 회색 콘크리트 바닥에 검정 절연 테이프를 붙여 테스트했지만, 테이프 표면이 매끄러워 햇빛을 강하게 반사했다. 결과적으로 회색 바닥과 검정 테이프가 둘 다 밝게 보이며 라인 트레이싱이 제대로 시작되지 않았다.
+
+### 원인 판단
+
+소프트웨어 threshold 문제만이 아니라 라인 재질/조명 조건 문제다. 반사광이 들어오면 `dark_on_light` 조건에서도 검정 테이프가 밝은 영역으로 인식될 수 있다.
+
+### 조치
+
+코드 쪽에서는 라인 confidence가 낮거나 라인을 잃었을 때 전진 명령을 끊고 XY hold로 들어가도록 보강했다. 물리 환경 쪽에서는 무광 재질, 더 넓은 폭, 바닥과 확실히 대비되는 색상으로 라인을 다시 준비해야 한다.
+
+### 상태
+
+부분 해결. 소프트웨어 fallback은 보강됐지만, 실제 라인 재질/색상 문제는 미해결이며 다음 실비행 전 물리 라인을 바꿔 검증해야 한다.
+
+## 47. 라인 미검출 후 착륙이 사선으로 진행됨
+
+### 문제 상황
+
+실비행에서 기체는 목표 고도 약 2m까지 이륙했지만 라인을 잡지 못했고, 약 3초 후 landing으로 넘어갔다. 이때 제자리 착륙이 아니라 한쪽 방향으로 사선 이동하며 내려왔다.
+
+### 원인
+
+기존 구현은 라인 추종 중에는 body velocity setpoint를 보냈지만, 이륙 후 라인이 없거나 착륙 중인 상태에서는 "속도 0"에 가깝게만 명령했다. 이는 Loiter 같은 위치 hold가 아니며, optical-flow local estimate가 일시적으로 흔들리는 상황에서는 XY 위치를 적극적으로 붙잡지 못한다.
+
+비행 로그에서도 다음 흐름이 보였다.
+
+```text
+EKF3 IMU1 stopped aiding
+EKF3 IMU1 started relative aiding
+EKF3 IMU1 fusing optical flow
+```
+
+### 해결
+
+`line_follow_node`에 LOCAL_NED XY hold anchor를 추가했다.
+
+- 실기체 serial target에서는 arm/takeoff 전에 local position, range, optical-flow quality, EKF relative aiding이 1.5초 이상 안정적이어야 한다.
+- 이륙 중에도 takeoff 위치의 XY anchor를 유지한다.
+- 목표 고도 도달 후 기본 2초간 XY hold settle을 수행한다.
+- 라인이 감지되지 않거나 confidence가 낮으면 현재 위치를 anchor로 잡고 body velocity 대신 LOCAL_NED XY hold setpoint를 보낸다.
+- 마커 hover도 XY hold로 수행한다.
+- 착륙도 우선 GUIDED descent + XY hold로 내려가며, 실패하면 LAND mode로 fallback한다.
+
+### 상태
+
+구현 완료, 로컬 빌드/테스트 통과. 실제 Pi pull/build 및 실비행 재검증은 아직 필요하다.
+
+## 48. 착륙 후 모터가 자동으로 멈추지 않음
+
+### 문제 상황
+
+첫 실비행에서 기체가 착륙했지만 모터가 계속 돌았고, Mission Planner에서 수동 disarm을 수행해야 했다.
+
+### 원인
+
+기존 landing flow는 `LAND` mode 진입 후 disarm 완료를 충분히 보장하지 않았다. Rangefinder 기준으로 지면에 닿았다고 판단할 수 있는 상태에서도 별도 disarm retry가 약했다.
+
+### 해결
+
+착륙 후 다음 로직을 추가했다.
+
+- rangefinder가 0.30m 이하이고 local velocity가 충분히 작으면 near-ground stable 상태로 판단한다.
+- 해당 상태가 2초 이상 유지되면 `MAV_CMD_COMPONENT_ARM_DISARM`으로 disarm을 명시적으로 요청한다.
+- 최종 near-ground 상태에서 추가 disarm attempt를 수행한다.
+- 최신 구현에서는 GUIDED descent 중 near-ground stable 상태가 되면 descent 속도를 0으로 보내고 disarm한다.
+
+### 상태
+
+구현 완료, 로컬 테스트 통과. 실기체에서 착륙 후 자동 disarm까지 재검증 필요.
+
+## 49. `line_follow_node` GCS 영상이 이륙 후 멈추거나 끊김
+
+### 문제 상황
+
+`line_follow_node --video` 실행 시 처음 1-2초 정도는 GCS 영상이 나오다가 이륙 후 화면이 멈춘 것처럼 보였다. `vision_debug_node --fps 12`에서는 onboard 송신 로그는 계속 나오지만 GCS 쪽 frame이 뚝뚝 끊겼다.
+
+### 원인 판단
+
+복합 이슈다.
+
+- 기존 `line_follow_node`는 takeoff/control 전후 video 송신 생명주기가 짧아 landing 구간에서 화면이 끊길 수 있었다.
+- GCS video는 UDP MJPEG chunk 기반이라 Wi-Fi 품질, broadcast/unicast, FPS, JPEG 크기에 민감하다.
+- 실비행 중 control loop와 vision publish가 같은 프로세스에서 돌기 때문에 FPS를 과하게 잡으면 frame skip/drop이 생길 수 있다.
+
+### 해결/개선
+
+- `line_follow_node`에 `--fps <n>` 옵션을 추가해 GCS debug video FPS를 직접 낮출 수 있게 했다.
+- startup video streaming을 추가해 heartbeat/arm/takeoff 중에도 영상 송신을 시작한다.
+- landing 중에도 disarm 또는 timeout까지 video drain을 계속 수행한다.
+- mission/landing log에 `video_sent`, `video_drop`, `video_skip`, `video_fail` counters를 출력한다.
+
+### 상태
+
+부분 해결. `--fps 12` 기준 송신 경로는 동작하지만, 실제 GCS stutter는 네트워크/FPS/JPEG 품질 영향을 계속 받는다. 다음 실비행에서는 `--fps 8` 또는 `--fps 10`, 가능하면 GCS IP unicast 지정으로 재검증한다.
+
+## 50. `ARMING_CHECK=0` 상태
+
+### 문제 상황
+
+Mission Planner 로그에 다음 warning이 남았다.
+
+```text
+Warning: Arming Checks Disabled
+```
+
+### 원인
+
+Bench bring-up과 초기 테스트를 위해 ArduPilot arming check가 꺼져 있다.
+
+### 상태
+
+미해결. 당장 실험 속도는 빠르지만 실비행 안전 관점에서는 좋지 않다. 이번 MVP 비행 이후에는 최소한 필요한 arming check를 다시 켜고, 어떤 check를 의도적으로 끄는지 별도 목록으로 관리해야 한다.
