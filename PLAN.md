@@ -1,463 +1,374 @@
-# Astroquad 구현 계획서
+# Plan: grid mission `(0,0)` origin centering fix
 
-최종 업데이트: 2026-05-16 KST
+작성일: 2026-05-20 KST
 
-기준 문서: `development-log/RESEARCH.md`
+## 0. 현재 문제 요약
 
-구현 상태: 승인된 계획 기준 구현 완료. 아래 계획 본문은 추적용으로 유지하며,
-실제 변경 결과는 이 섹션을 기준으로 본다.
+실행 조건:
 
-완료 결과:
-
-- `line_follow_node`에 `--line-mode auto|light_on_dark|dark_on_light` 옵션을 추가했다.
-- MAVLink `RC_CHANNELS`를 `AutopilotState`에 반영하도록 adapter를 확장했다.
-- SITL은 RC assumed-present, Pixhawk1 serial은 RC required profile로 분리했다.
-- Pixhawk1 command-producing mission은 `--allow-arm-takeoff`가 있어도 fresh RC가
-  확인되지 않으면 `GUIDED`, arm, takeoff, velocity command 전에 종료한다.
-- 비행 중 RC loss는 LAND fallback, `GUIDED` 이탈은 operator takeover로 처리한다.
-- `SafetyMonitor` unit test와 RC decode test를 추가/보강했다.
-- WSL 로컬 검증에서 build와 `ctest` 14/14가 통과했다.
-
-남은 실기체 gate:
-
-- 라즈베리파이/Pixhawk 연결 후 `--strict-local-estimate`, `--strict-rc`,
-  `--mavlink-smoke` no-arm gate를 다시 통과해야 한다.
-- props-off motor order/direction, arm/disarm/LAND command path 확인이 필요하다.
-- battery/failsafe와 `ARMING_CHECK` 위험은 실제 비행 전 별도로 판단해야 한다.
-
-목표: 이번 구현 단계가 끝나면 사용자가 바로 현실에서 짧은 라인 트레이싱
-테스트를 준비할 수 있어야 한다. 현실 비행 목표는 다음 MVP로 한정한다.
-
-```text
-자동 이륙
-  -> 짧은 직선 라인 추종
-  -> ArUco marker 발견
-  -> 3초 hover
-  -> 자동 착륙
+```bash
+./build/grid_mission_node --config config --target sitl --vision gazebo \
+  --world grid --line-mode dark_on_light --marker-count 4 \
+  --video --gcs-ip 172.22.128.1
 ```
 
-이 문서는 원래 구현 계획서였고, 현재는 승인 후 실행된 작업의 추적 문서다.
-아래 단계별 계획은 구현 의도와 검증 순서를 보존하기 위해 유지한다.
+관찰:
 
-## 1. 이번 단계의 완료 기준
+- `ARM_TAKEOFF -> MARKER_LOCK_YAW -> ENTRY_FORWARD`까지는 의도대로 진행된다.
+- vertiport ArUco ID 23은 인식되고, yaw는 약 `1.55 rad`까지 돌아간다.
+- `ENTRY_FORWARD` 중 첫 grid L 교차점을 보지만, 카메라 중심이 교차점 중심에 정렬되지 않은 상태에서 `(0,0)`으로 확정된다.
+- 이후 `SNAKE_FORWARD`에서 다음 노드를 찾지 못하고 `EMERGENCY_LAND`로 들어간다.
 
-이번 단계는 단순히 코드가 빌드되는 것이 아니라, 현실 비행 직전까지 필요한
-MVP 안전장치와 운용 명령이 완성된 상태를 목표로 한다.
+핵심 로그:
 
-완료 조건:
+```text
+t=7.004   st=ENTRY_FORWARD yaw=1.54 idec=cruise
+t=8.088   st=ENTRY_FORWARD idec=turn_ready type=L cy=0.54
+t=8.595   st=ENTRY_FORWARD idec=turn_ready type=L cy=0.56
+t=9.769   st=ENTRY_FORWARD idec=turn_confirm type=L cy=0.73
+t=10.341  st=SNAKE_FORWARD coord=(0,0) hd=north nodes=1 idec=turn_confirm type=L cy=0.72
+...
+t=13.771  st=SNAKE_FORWARD line=0
+...
+t=20.139  st=EMERGENCY_LAND
+```
 
-- `line_follow_node`가 `--line-mode auto|light_on_dark|dark_on_light`를 받는다.
-- SITL에서는 RC 연결을 가정하여 기존 Gazebo line-follow smoke가 계속 비행한다.
-- 실제 Pixhawk serial target에서는 RC 입력이 MAVLink `RC_CHANNELS`로 확인되기
-  전까지 `GUIDED`, `arm`, `takeoff`, velocity command를 보내지 않는다.
-- 실제 Pixhawk serial target에서 비행 중 RC 입력이 사라지면 companion control을
-  중단하고 deterministic fallback으로 들어간다.
-- 실제 Pixhawk serial target에서 비행 중 mode가 `GUIDED`가 아니게 되면
-  operator takeover로 보고 velocity command를 멈춘다.
-- 새 안전 로직은 unit test로 검증한다.
-- 구현 완료 후 작업자는 사용자가 그대로 따라 할 수 있는 "명령어 실행 순서
-  체크리스트"를 최종 답변에 반드시 제공한다.
+`cy=0.72`인 상태에서 이미 `(0,0)`으로 넘어갔다는 점이 중요하다. 현재 `stop_center_target_cy = 0.55` 기준으로 보면 첫 origin latch가 교차점 중심 정렬 뒤가 아니라, 교차점이 화면 하단으로 지나간 뒤에 발생하고 있다.
 
-이번 단계에서 하지 않는 것:
+## 1. 원인 분석
 
-- full snake/grid exploration
-- marker revisit
-- GCS command UI
-- RC override backend 구현
-- battery monitor parameter 자동 변경
-- Pixhawk parameter write 자동화 추가
+직접 원인:
 
-## 2. 현재 전제
+- `GridMission::handleEntryForward()`가 첫 교차점을 `intersection_seen && min_progress_ok`만으로 origin으로 확정한다.
+- 이 조건에는 교차점 중심이 카메라 중심 또는 목표 Y 위치에 왔는지 확인하는 gate가 없다.
+- origin을 확정하는 순간 `last_node_local_x/y`와 `hop_start_local_x/y`도 현재 LOCAL_NED 위치로 잡힌다.
+- 따라서 실제 `(0,0)` 교차점 중심이 아니라, 교차점이 카메라에 보이기 시작했거나 화면 아래로 지난 위치가 다음 hop의 기준점이 된다.
 
-현재 라즈베리파이는 연결되어 있지 않다. 그러므로 구현자는 로컬 repo에서
-코드와 설정을 수정하고, 로컬 build/test와 가능한 SITL 검증까지만 수행한다.
+코드상 직접 위치:
 
-실기체 관련 현재 사실:
+```text
+uav-onboard/src/mission/GridMission.cpp
+  handleEntryForward()
+    if (intersection_seen && min_progress_ok) {
+      tracker_->forceOrigin(GridCoord{0, 0}, GridHeading::North);
+      last_node_local_x_ = *in.local_x_m;
+      last_node_local_y_ = *in.local_y_m;
+      armHopStart(in);
+      transition(GridState::SnakeForward, ...);
+    }
+```
 
-- Pixhawk USB serial stable path:
-  `/dev/serial/by-id/usb-ArduPilot_fmuv2_260034001451373037353835-if00`
-- `runtime.pixhawk1.toml`은 serial target과 `rpicam` vision profile을 사용한다.
-- `mavlink_probe --target pixhawk1 --strict-local-estimate`는 이전 bench에서 통과했다.
-- 현재 기록상 RC는 아직 보이지 않는다: `rc: channels=0 rssi=255`.
-- 현재 기록상 battery telemetry는 없다: `BATT_MONITOR=0`.
-- 현재 기록상 `ARMING_CHECK=0`이다.
+보조 원인:
 
-실제 비행 전 hard gate:
+- `ENTRY_FORWARD`에는 감속/정렬 상태가 없다. 첫 L이 화면에 들어와도 계속 `ForwardBlind`로 전진한다.
+- `StopAndCenter`는 `SnakeStopAtCenter`에서만 사용되고, 첫 origin lock에는 쓰이지 않는다.
+- 현재 `StopAndCenter`도 Y 방향 decel만 있고 X 방향 lateral centering은 없다.
+- `entry_forward_speed_mps = 0.30`이 config에 있지만 실제 `ForwardBlind` 속도에는 연결되어 있지 않다. 현재 `ForwardBlind`는 `GridControlMapperConfig::forward_speed_blind_mps` 기본값 경로를 탄다.
+- `IntersectionDecisionEngine`은 `ARM_TAKEOFF`/`MARKER_LOCK_YAW` 동안에도 계속 업데이트되어 vertiport texture에서 `+`, `T` 같은 candidate를 만든다. tracker commit은 막혀 있지만 decision window/record lockout에는 잔상이 남을 수 있다.
+- `SNAKE_FORWARD`는 mid-cell align window에서만 line follow를 열기 때문에, origin 시작점이 틀어지면 line을 잃고 다음 node를 못 잡기 쉽다.
 
-- `mavlink_probe --target pixhawk1 --strict-rc`가 통과해야 한다.
-- props-off motor order/direction 확인이 끝나야 한다.
-- props-off arm/disarm/land command path 확인이 끝나야 한다.
-- battery/failsafe 위험을 사용자가 명시적으로 수용하거나 별도 설정해야 한다.
+직접적인 failsafe는 `hop_max_distance_m` 초과로 추정된다.
 
-## 3. 작업 원칙
+- `entry_forward_timeout`은 이미 지나 `SNAKE_FORWARD`에 들어갔으므로 아님.
+- altitude ceiling도 아님. 로그상 `agl ~= 2.0m`이고 ceiling check는 rangefinder를 우선 사용한다.
+- heartbeat/mission timeout/max intersections도 정황상 아님.
+- `SNAKE_FORWARD`에서 다음 교차점을 못 잡은 채 잘못된 hop 기준점으로 계속 진행하다 `hop_distance_exceeded`에 해당하는 경로로 `EmergencyLand`에 들어간 것으로 보는 것이 가장 자연스럽다.
 
-- `vision_debug_node`와 `line_follow_node`의 detector 코드를 분리하지 않는다.
-  이미 공유 중인 `VisionProcessor`를 계속 사용한다.
-- SITL과 실제 Pixhawk용 mission logic을 분리하지 않는다. 차이는 runtime config와
-  safety config로 표현한다.
-- 실제 serial target에서 command-producing path는 보수적으로 막는다.
-- 기본값은 개발 편의보다 현실 안전을 우선한다. 단, SITL smoke는 기존처럼 바로
-  돌 수 있어야 한다.
-- 라즈베리파이에 연결되지 않은 상태에서 실제 Pixhawk 명령을 실행하려 하지 않는다.
-- 코드 구현 후 README나 RESEARCH 업데이트가 필요하면, 실행 명령과 safety gate
-  변경점만 짧게 갱신한다.
+## 2. 수정 목표
 
-## 4. 구현 Phase 1: RC 상태를 AutopilotState에 추가
+목표:
 
-대상 파일:
+```text
+MarkerLockYaw
+  -> EntryForward
+  -> EntryCenterOrigin
+  -> SnakeForward
+```
 
-- `uav-onboard/src/autopilot/AutopilotState.hpp`
-- `uav-onboard/src/autopilot/AutopilotMavlinkAdapter.cpp`
-- `uav-onboard/tests/test_autopilot_poll_drain.cpp`
+핵심 원칙:
 
-구현 내용:
+- 첫 grid intersection을 "보았다"와 "그 위에 정렬했다"를 분리한다.
+- `(0,0)` origin publish, tracker forceOrigin, `last_node_local_x/y`, `hop_start_local_x/y`는 정렬 완료 후에만 수행한다.
+- 첫 origin 정렬 중에는 yaw를 `yaw_align_target_rad_`로 계속 고정한다.
+- 교차점 center X/Y가 tolerance 안에 들어오고, 속도가 충분히 낮은 상태가 몇 frame 유지된 뒤에만 `SnakeForward`로 넘긴다.
+- failsafe 값을 늘려 문제를 숨기지 않는다.
 
-- `AutopilotState`에 RC 관측 필드를 추가한다.
-  - `std::optional<int> rc_channel_count`
-  - `std::optional<int> rc_rssi`
-  - 필요하면 `std::array<std::uint16_t, 18> rc_channels_pwm`
-  - `std::chrono::steady_clock::time_point last_rc_channels_time`
-- `AutopilotMavlinkAdapter::processMessage()`에서
-  `MAVLINK_MSG_ID_RC_CHANNELS`를 decode한다.
-- `mavlink_probe.cpp`의 기존 decode 방식을 참고한다.
-- `requestDefaultStreams()`의 `RC_CHANNELS` request는 유지한다.
+## 3. 구현 계획
 
-테스트:
+### 3.1 GridMission state 추가
 
-- `test_autopilot_poll_drain.cpp`의 fake transport 메시지 목록에
-  `RC_CHANNELS` MAVLink message를 추가한다.
-- `adapter.poll()` 이후 다음을 assert한다.
-  - `rc_channel_count.has_value()`
-  - `rc_channel_count > 0`
-  - `rc_rssi.has_value()`
-  - `last_rc_channels_time`이 설정됨
+`GridState`에 새 상태를 추가한다.
 
-완료 기준:
+```cpp
+EntryCenterOrigin
+```
 
-- 기존 heartbeat/local-position test가 깨지지 않는다.
-- RC message가 들어오면 adapter state에 반영된다.
-- RC message가 없으면 state는 empty 상태를 유지한다.
+상태 의미:
 
-## 5. 구현 Phase 2: SafetyConfig에 RC gate 설정 추가
+- `EntryForward`에서 첫 grid intersection candidate를 발견하면 바로 origin latch하지 않고 이 상태로 전환한다.
+- 이 상태는 교차점 중심을 카메라 중심/목표점에 맞추는 전용 상태다.
+- 정렬 완료 후에만 `(0,0)`을 publish하고 `SnakeForward`로 진입한다.
 
-대상 파일:
+권장 흐름:
 
-- `uav-onboard/src/safety/SafetyMonitor.hpp`
-- `uav-onboard/src/safety/SafetyMonitor.cpp`
-- `uav-onboard/config/safety.toml`
-- `uav-onboard/config/runtime.sitl.toml`
-- `uav-onboard/config/runtime.pixhawk1.toml`
-- 필요 시 `uav-onboard/tools/line_follow_node.cpp`의 config loading 부분
+```text
+EntryForward
+  - yaw-frozen ForwardBlind
+  - vertiport false positive guard
+  - first L/T/+ candidate 발견
+  -> EntryCenterOrigin
 
-구현 내용:
+EntryCenterOrigin
+  - yaw-frozen intersection centering
+  - center_x_norm, center_y_norm tolerance 확인
+  - velocity low/stable frames 확인
+  - origin latch
+  - decision engine reset/cooldown
+  -> SnakeForward
+```
 
-- `SafetyConfig`에 다음 필드를 추가한다.
-  - `bool rc_required`
-  - `bool assume_rc_present`
-  - `int rc_lost_ms`
-- base 또는 SITL 기본값은 SITL smoke가 깨지지 않게 둔다.
-  - `assume_rc_present = true`
-  - `rc_required = false`
-- Pixhawk runtime overlay는 현실 비행 safety를 우선한다.
-  - `assume_rc_present = false`
-  - `rc_required = true`
-  - `rc_lost_ms`는 1000-2000ms 범위에서 보수적으로 선택한다.
-- `line_follow_node`의 `loadRuntimeConfig()`가 runtime overlay의 RC safety 값을
-  읽도록 한다.
+### 3.2 EntryForward acceptance 조건 변경
 
-테스트:
+현재 조건:
 
-- `SafetyMonitor` unit test가 아직 별도 파일로 없다면
-  `tests/test_safety_monitor.cpp`를 추가한다.
-- CMake에 `test_safety_monitor`를 등록한다.
-- 테스트 케이스:
-  - `assume_rc_present=true`이면 RC 입력 없이도 mission safety가 통과한다.
-  - `rc_required=true`이고 RC 입력이 없으면 start gate가 실패한다.
-  - mission 중 RC timestamp가 `rc_lost_ms`보다 오래되면 Land 또는 Abort decision을 낸다.
+```cpp
+intersection_seen && min_progress_ok
+```
 
-완료 기준:
+수정 후:
 
-- safety config가 base/SITL/Pixhawk profile별로 다르게 적용된다.
-- unit test로 SITL-friendly path와 Pixhawk-strict path가 모두 검증된다.
+- `EntryForward`는 origin latch를 하지 않는다.
+- `EntryForward`는 충분히 그럴듯한 첫 교차점을 보면 `EntryCenterOrigin`으로만 전환한다.
+- false positive 방지를 위해 다음 gate를 같이 둔다.
 
-## 6. 구현 Phase 3: 실제 serial preflight RC gate 추가
+권장 gate:
 
-대상 파일:
+- `accepted_type`이 `L`, `T`, `Cross` 중 하나.
+- `center_y_norm`이 너무 아래로 지나가지 않은 상태. 예: `center_y_norm < entry_center_late_y`.
+- 최소 전진거리 gate는 기존 `hop_intersection_min_distance_m = 1.0`을 그대로 쓰기보다 entry 전용으로 분리한다.
+  - 예: `entry_intersection_min_distance_m = 0.4~0.7`
+  - 이유: 현재 로그에서 `cy=0.54~0.56`로 가장 좋은 순간이 t=8.1~8.6인데, 기존 1.0m gate 때문에 이 시점을 놓친 것으로 보인다.
+- vertiport marker ID 23이 여전히 보여도 첫 grid line이 보일 수 있으므로 `mks=23 present` 자체를 hard reject로 쓰지는 않는다.
+- 대신 `IntersectionDecisionEngine` reset과 distance/center gate로 vertiport texture 잔상을 제거한다.
 
-- `uav-onboard/tools/line_follow_node.cpp`
-- 필요 시 `uav-onboard/src/safety/SafetyMonitor.*`
+### 3.3 EntryCenterOrigin control 구현
+
+현재 `StopAndCenter`는 Y 방향만 처리한다.
+
+```cpp
+if (center_y_norm < stop_center_target_cy) {
+    vx_forward = small positive taper;
+}
+```
+
+첫 origin에는 X/Y 2D centering이 필요하다.
+
+추가할 데이터:
+
+- `GridMissionOutput::intersection_center_x_norm`
+- `GridControlMapperInput::intersection_center_x_norm`
+- 가능하면 log에도 `cx`, `cy`, `hop` 출력
+
+정규화:
+
+```text
+center_x_norm = (center_px.x - width * 0.5) / (width * 0.5)
+center_y_norm = center_px.y / height
+```
+
+권장 제어:
+
+- `vx_forward_mps = kp_y * (entry_center_target_y - center_y_norm)`
+- `vy_right_mps = kp_x * center_x_norm` 또는 marker hover와 같은 sign convention 재사용
+- `yaw_rate_rad_s = computeYawRate(current_yaw, yaw_align_target)`
+- `vz_down_mps = altitude hold`
+- 속도는 작은 값으로 clamp한다. 예: `entry_center_max_v_mps = 0.10~0.15`
+- `center_y_norm`이 target보다 커졌을 때는 아주 작은 reverse도 허용한다. 예: max reverse `0.05~0.08m/s`
+
+주의:
+
+- sign은 Gazebo GCS overlay로 확인한다. marker hover가 이미 vertiport 중심 잡기에 성공하므로 가능하면 그 sign convention과 맞춘다.
+- 첫 구현에서는 `EntryCenterOrigin` 전용 intent를 새로 두는 것이 가장 안전하다. 기존 `StopAndCenter`를 snake boundary에도 쓰고 있기 때문에 동작을 무리하게 바꾸면 boundary turn이 같이 흔들릴 수 있다.
+
+권장 새 intent:
+
+```cpp
+GridControlIntent::IntersectionCenter
+```
+
+### 3.4 Origin latch 조건
+
+`EntryCenterOrigin`에서만 아래 작업을 수행한다.
+
+- `tracker_->forceOrigin(GridCoord{0, 0}, GridHeading::North)`
+- `intersections_recorded_ = 1`
+- `last_node_local_x/y = current local position`
+- synthetic `origin_publish_event`
+- `armHopStart(in)`
+- `transition(GridState::SnakeForward, ...)`
+
+정렬 완료 조건:
+
+- `abs(center_x_norm) <= entry_center_x_tol_norm`
+- `abs(center_y_norm - entry_center_target_y) <= entry_center_y_tol_norm`
+- `local_velocity_xy_mps <= snake_stop_velocity_threshold_mps` 또는 entry 전용 threshold
+- 위 조건이 `entry_center_stable_frames` 이상 연속
+
+초기 권장값:
+
+```toml
+entry_intersection_min_distance_m = 0.5
+entry_center_target_y = 0.55
+entry_center_x_tol_norm = 0.08
+entry_center_y_tol_norm = 0.06
+entry_center_stable_frames = 3
+entry_center_timeout_s = 5.0
+entry_center_max_v_mps = 0.12
+entry_center_max_reverse_mps = 0.06
+```
+
+### 3.5 Decision window reset
+
+다음 전환점에서 `IntersectionDecisionEngine`을 reset 또는 cooldown한다.
+
+- `MarkerLockYaw -> EntryForward`
+- `EntryForward -> EntryCenterOrigin`
+- `EntryCenterOrigin -> SnakeForward`
+
+목적:
+
+- vertiport texture에서 생긴 `+`, `T`, `L` 잔상을 첫 grid origin 판단에 섞지 않는다.
+- `(0,0)`으로 확정한 직후 같은 교차점 잔상이 곧바로 boundary watchdog이나 다음 node로 재사용되지 않게 한다.
 
 구현 위치:
 
-- `waitHeartbeat()`와 `requestDefaultStreams()` 이후
-- `setGuidedMode()`, `arm()`, `takeoff()` 이전
+- `GridMission`은 이미 `IntersectionDecisionEngine* decision_engine_`을 optional로 들고 있다.
+- state transition 직전에 `decision_engine_->reset()` 또는 `startCooldown()`을 호출한다.
+- `EntryCenterOrigin -> SnakeForward`에서는 `reset()` 후 `armHopStart(in)`를 수행하는 쪽이 더 명확하다.
 
-구현 내용:
+### 3.6 Entry speed config 연결
 
-- `line_follow_node`에 preflight gate 함수를 만든다.
-  예: `waitRcReady(AutopilotMavlinkAdapter&, SafetyConfig, timeout)`
-- real serial target이고 `rc_required=true`이면 fresh `RC_CHANNELS`를 기다린다.
-- fresh 조건:
-  - `rc_channel_count.has_value()`
-  - `rc_channel_count > 0`
-  - `last_rc_channels_time`이 현재 시각 기준 `rc_lost_ms`보다 오래되지 않음
-- timeout 안에 RC가 준비되지 않으면:
-  - 명확한 에러 로그 출력
-  - nonzero exit
-  - `setGuidedMode`, `arm`, `takeoff`, `sendBodyVelocity` 호출 금지
-- SITL 또는 `assume_rc_present=true`인 profile은 기존처럼 통과한다.
+현재 `entry_forward_speed_mps`가 실제 setpoint에 연결되어 있지 않다.
 
-테스트:
+수정 옵션:
 
-- 가능하면 pure helper 함수로 분리해 unit test를 작성한다.
-- 최소한 adapter RC decode test와 safety monitor test로 gate 판단을 검증한다.
-- 실제 Pixhawk가 없는 상태에서는 real serial 실행 테스트를 하지 않는다.
+1. `GridMissionOutput`에 `forward_speed_override_mps`를 추가한다.
+2. `GridControlMapperInput`에도 같은 optional 값을 전달한다.
+3. `ForwardBlind`에서 override가 있으면 그 값을 사용한다.
 
-완료 기준:
+최소 수정:
 
-- `--target sitl`은 RC 없이 기존 동작을 유지한다.
-- `--target pixhawk1 --allow-arm-takeoff`는 RC가 없으면 flight command 전에 중단한다.
-- 중단 로그는 사용자가 왜 이륙하지 않았는지 바로 이해할 수 있어야 한다.
+- `grid_mission_node.cpp`에서 `cfg.mapper.forward_speed_blind_mps = cfg.mission.entry_forward_speed_mps`로 연결할 수 있다.
+- 단, 이 방법은 `SnakeForward`의 blind 속도까지 같이 바꾸므로 entry와 snake 속도를 분리하려면 override 방식이 낫다.
 
-## 7. 구현 Phase 4: 비행 중 RC loss와 operator takeover 처리
+권장:
 
-대상 파일:
+- entry 전용 속도와 snake blind 속도를 분리한다.
+- 이번 문제는 첫 origin 진입에서 발생하므로 `EntryForward`만 느리게 시작할 수 있어야 한다.
 
-- `uav-onboard/tools/line_follow_node.cpp`
-- `uav-onboard/src/safety/SafetyMonitor.*`
-- 필요 시 `uav-onboard/src/autopilot/AutopilotState.hpp`
+### 3.7 로그 보강
 
-구현 내용:
+현재 로그만으로는 정확히 어떤 failsafe가 발생했는지와 hop distance가 얼마인지 바로 보이지 않는다.
 
-- mission loop의 `SafetyInput`에 RC 상태와 mode 상태를 전달한다.
-- `SafetyMonitor`가 다음 상황을 판단하도록 확장한다.
-  - RC required인데 RC가 stale이면 fallback
-  - `assume_rc_present=false`인데 RC channel count가 0이면 fallback
-  - mission 중 mode가 `GUIDED`가 아니면 operator takeover
-- fallback 정책:
-  - vehicle mode가 아직 `GUIDED`이면 `Land` action
-  - mode가 이미 `GUIDED`가 아니면 companion velocity command를 중단하고
-    mission을 `ABORT` 또는 operator takeover reason으로 종료
-- 어떤 경우에도 RC loss/operator takeover 이후 forward line-follow velocity를
-  계속 보내지 않는다.
-
-테스트:
-
-- `test_safety_monitor`에 다음 케이스를 추가한다.
-  - fresh RC가 있으면 `SafetyAction::None`
-  - stale RC이면 `SafetyAction::Land` 또는 지정한 fallback action
-  - mode가 `GUIDED`가 아니면 operator takeover action/reason
-- `line_follow_node` loop에서 safety action 처리 후 velocity command가 추가로
-  나가지 않는 구조인지 코드 리뷰한다.
-
-완료 기준:
-
-- RC loss와 operator mode takeover가 line lost와 별도 reason으로 로그에 남는다.
-- fallback 이후 companion이 manual/operator control과 싸우지 않는다.
-
-## 8. 구현 Phase 5: line_follow_node line-mode CLI 추가
-
-대상 파일:
-
-- `uav-onboard/tools/line_follow_node.cpp`
-
-구현 내용:
-
-- `Options`에 `std::string line_mode_override`를 추가한다.
-- usage에 다음 옵션을 추가한다.
+추가 권장 필드:
 
 ```text
---line-mode <auto|light_on_dark|dark_on_light>
+intent=<...>
+safety=<...>
+hop=<m>
+cx=<normalized>
+cy=<normalized>
+phase=<approach_phase>
+vx/vy/yawrate=<command>
 ```
 
-- parser에서 옵션을 읽는다.
-- `loadRuntimeConfig()`에서 base config와 runtime overlay 적용 후 CLI override를
-  마지막에 적용한다.
-- 허용 값은 `auto`, `light_on_dark`, `dark_on_light`로 제한한다.
-- startup log에 선택된 line mode를 출력한다.
+특히 `SNAKE_FORWARD`에서 `hop_distance_m`가 `hop_max_distance_m=3.5`에 도달하는 순간을 확인해야 한다.
 
-참고:
+`out.last_safety_event`는 이미 출력 경로가 있으나, 이번 로그에는 safety reason이 보이지 않았다. `transition(EmergencyLand)` 직후 같은 frame에서 reason이 남는지 확인하고, 필요하면 `last_safety_event_`에도 `hop_distance_exceeded`를 저장한다.
 
-- `vision_debug_node.cpp`의 `--line-mode` 구현을 그대로 참고한다.
-- detector path는 `VisionProcessor`를 계속 사용한다.
+## 4. 테스트 계획
 
-테스트:
+### 4.1 Unit test
 
-- 최소 빌드 테스트로 parser compile을 확인한다.
-- 가능하면 `--vision-smoke-count`와 함께 line mode가 startup/vision smoke 로그에
-  반영되는지 수동 실행한다.
+새 focused test를 추가한다.
 
-완료 기준:
+권장 파일:
 
-- SITL 실행 명령에 `--line-mode light_on_dark`를 붙일 수 있다.
-- 실제 Pi 실행 명령에 `--line-mode light_on_dark` 또는 `dark_on_light`를 붙일 수 있다.
-- 공유 config 파일을 매번 수정하지 않고 현장 라인 색을 선택할 수 있다.
+```text
+uav-onboard/tests/test_grid_mission_entry_origin.cpp
+```
 
-## 9. 구현 Phase 6: 문서와 실행 명령 정리
+테스트 케이스:
 
-대상 파일:
+1. `MarkerLockYaw`에서 marker centered + yaw stable이면 `EntryForward`로 간다.
+2. `EntryForward`에서 L intersection을 봐도 바로 `SnakeForward`로 가지 않고 `EntryCenterOrigin`으로 간다.
+3. `EntryCenterOrigin`에서 center error가 tolerance 밖이면 origin을 publish하지 않는다.
+4. center X/Y가 tolerance 안이고 velocity가 낮은 frame이 누적되면 origin event를 publish하고 `SnakeForward`로 간다.
+5. origin latch 후 `hop_start_local_x/y`가 정렬 완료 위치 기준으로 잡힌다.
+6. mixed/stale decision window가 origin latch에 영향을 주지 않도록 reset/cooldown 호출 효과를 검증한다.
 
-- `development-log/RESEARCH.md`
-- `development-log/PLAN.md`
-- `uav-onboard/README.md`
+### 4.2 Build
 
-작업 내용:
-
-- 구현 완료 후 `RESEARCH.md`에 실제로 구현된 safety gate와 남은 blocker만 갱신한다.
-- `README.md`의 real-hardware command 예시에 `--line-mode`와 RC gate 주의사항을
-  추가한다.
-- `PLAN.md`에는 완료 상태나 다음 단계만 짧게 반영한다.
-- 최종 답변에는 반드시 명령어 실행 순서 체크리스트를 제공하라고 기록한다.
-
-문서에 반드시 남길 내용:
-
-- SITL은 RC assumed-present profile이다.
-- Pixhawk serial은 RC required profile이다.
-- `--allow-arm-takeoff`를 붙여도 RC gate가 실패하면 이륙하지 않는다.
-- `vision_debug_node`와 `line_follow_node`는 동시에 GCS video/telemetry sender로
-  실행하지 않는다.
-
-## 10. 로컬 검증 계획
-
-라즈베리파이가 연결되어 있지 않은 현재 상태에서 가능한 검증:
-
-```powershell
-cd c:\Users\mseoky\Documents\astro\astroquad\uav-onboard
-cmake --build build
+```bash
+cmake --build build --target grid_mission_node
+cmake --build build --target test_grid_mission_entry_origin
 ctest --test-dir build --output-on-failure
 ```
 
-WSL/Gazebo/SITL 환경이 준비되어 있으면 추가 검증:
+### 4.3 SITL 재현 검증
+
+기존과 같은 명령으로 재실행한다.
 
 ```bash
-cd ~/astroquad/uav-onboard
-./build/line_follow_node --config config --target sitl \
-  --vision gazebo --line-mode light_on_dark --video
+./build/grid_mission_node --config config --target sitl --vision gazebo \
+  --world grid --line-mode dark_on_light --marker-count 4 \
+  --video --gcs-ip 172.22.128.1
 ```
 
-SITL 기대 결과:
+성공 로그 기준:
 
-- RC receiver 없이도 실행된다.
-- startup log에 line mode와 RC assumed-present 설정이 드러난다.
-- 기존처럼 marker approach, 3초 hover, land, complete에 도달한다.
-
-## 11. 라즈베리파이 연결 후 체크리스트
-
-구현 작업자가 최종 답변에 사용자용 명령어 실행 순서 체크리스트를 반드시 제공해야
-한다. 체크리스트는 아래 순서를 기반으로 작성한다.
-
-### 11.1 배포와 빌드
-
-```bash
-ssh astroquad@astroquad.local
-cd /home/astroquad/astroquad/uav-onboard
-git pull
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
-cmake --build build
-ctest --test-dir build --output-on-failure
+```text
+MARKER_LOCK_YAW
+ENTRY_FORWARD
+ENTRY_CENTER_ORIGIN
+SNAKE_FORWARD coord=(0,0) nodes=1
+SNAKE_RECORD_NODE coord=(0,-1) or next expected node
 ```
 
-### 11.2 Pixhawk no-arm gate
+검증 포인트:
 
-```bash
-./build/mavlink_probe --config config --target pixhawk1 \
-  --duration-ms 12000 --strict-local-estimate
+- `ENTRY_FORWARD`에서 L을 봐도 바로 `nodes=1`이 되지 않는다.
+- `ENTRY_CENTER_ORIGIN` 동안 `cx`, `cy`가 target으로 수렴한다.
+- `(0,0)` publish 시점의 `cy`가 `0.55 ± tolerance` 근처다.
+- `(0,0)` publish 시점의 `cx`가 0 근처다.
+- `SNAKE_FORWARD` 진입 직후 line이 유지된다.
+- `hop_distance_exceeded` 없이 다음 교차점이 기록된다.
 
-./build/mavlink_probe --config config --target pixhawk1 \
-  --duration-ms 30000 --strict-rc
+## 5. 피해야 할 임시 처방
 
-./build/line_follow_node --config config --target pixhawk1 \
-  --mavlink-smoke --smoke-duration-ms 5000 --no-telemetry
-```
+하지 말 것:
 
-통과 기준:
+- `hop_max_distance_m`만 크게 늘려서 emergency를 늦추기.
+- `hop_intersection_min_distance_m`만 낮춰서 더 빨리 origin을 찍기.
+- `EntryForward`에서 raw `intersection.valid`를 더 쉽게 받아들이기.
+- GCS overlay 기준으로 사람이 보기엔 맞아 보인다는 이유로 tracker origin만 보정하기.
+- `SnakeForward` line-follow window를 무작정 전체 cell로 넓히기.
 
-- local estimate/range/flow gate 통과
-- strict RC gate 통과
-- smoke mode에서 mode/arm/takeoff/velocity command가 나가지 않음
+이 문제는 failsafe threshold 문제가 아니라 origin latch 시점 문제다. `(0,0)` 기준점이 틀리면 이후 snake traversal 전체가 누적 오차를 안고 시작한다.
 
-### 11.3 카메라와 라인 색 확인
+## 6. 우선순위
 
-GCS를 켠 뒤 vision-only로 라인 색을 확인한다.
+1. `EntryCenterOrigin` 상태 추가.
+2. origin latch를 `EntryCenterOrigin` 완료 시점으로 이동.
+3. intersection center X/Y를 mission output과 mapper input에 연결.
+4. `IntersectionCenter` intent 또는 entry 전용 centering control 추가.
+5. decision window reset/cooldown 추가.
+6. `entry_forward_speed_mps` 실제 연결.
+7. 로그 보강.
+8. unit test와 SITL 재검증.
 
-```bash
-./build/vision_debug_node --config config \
-  --line-only --line-mode light_on_dark --video
-```
+## 7. 예상 결과
 
-현장 라인이 어두운 라인이면:
+수정 후에는 첫 L 교차점이 화면에 들어온 순간이 아니라, 카메라 중심축이 교차점 중심에 맞은 뒤 `(0,0)`이 확정되어야 한다.
 
-```bash
-./build/vision_debug_node --config config \
-  --line-only --line-mode dark_on_light --video
-```
-
-통과 기준:
-
-- GCS overlay에서 line center가 안정적으로 보인다.
-- ArUco marker 테스트도 필요하면 별도 vision-only로 확인한다.
-- 이 단계에서 `line_follow_node`는 동시에 실행하지 않는다.
-
-### 11.4 props-off command bench
-
-이 단계는 props removed 상태에서만 한다.
-
-```bash
-./build/mavlink_motor_test --config config --target pixhawk1 \
-  --motor 1 --percent 5 --seconds 1 --props-removed
-```
-
-이후 motor 2, 3, 4를 같은 방식으로 확인한다.
-
-추가로 arm/disarm/land command path 확인이 필요하면 구현 완료 후 제공되는 별도
-명령을 사용한다. `--allow-arm-takeoff` full mission은 아직 실행하지 않는다.
-
-### 11.5 첫 실제 line-follow 실행
-
-모든 no-arm/props-off gate가 통과한 뒤에만 진행한다.
-
-밝은 라인:
-
-```bash
-./build/line_follow_node --config config --target pixhawk1 \
-  --vision rpicam --line-mode light_on_dark --video --allow-arm-takeoff
-```
-
-어두운 라인:
-
-```bash
-./build/line_follow_node --config config --target pixhawk1 \
-  --vision rpicam --line-mode dark_on_light --video --allow-arm-takeoff
-```
-
-실행 전 조건:
-
-- transmitter on/bound
-- `mavlink_probe --strict-rc` 통과
-- GCS video/telemetry 확인
-- 배터리와 failsafe 위험 확인
-- operator가 mode switch/kill/land 절차를 즉시 수행할 수 있음
-- 주변 안전 확보
-
-## 12. 실패 시 중단 기준
-
-다음 중 하나라도 발생하면 실제 flight command 단계로 넘어가지 않는다.
-
-- strict RC 실패
-- local estimate/range/flow gate 실패
-- GCS 영상 또는 line overlay가 불안정
-- Pixhawk mode/armed 상태가 예상과 다름
-- `line_follow_node --mavlink-smoke`가 command를 보낸 흔적이 있음
-- motor order/direction이 확실하지 않음
-- operator takeover 절차가 확인되지 않음
-
-## 13. 최종 답변 요구사항
-
-이 계획서를 실행하는 구현 작업자는 완료 후 최종 답변에 아래를 반드시 포함한다.
-
-- 변경한 파일 요약
-- 추가/수정한 safety gate 요약
-- 실행한 테스트와 결과
-- 실행하지 못한 테스트와 이유
-- 라즈베리파이 연결 후 사용자가 그대로 따라 할 명령어 실행 순서 체크리스트
-- 실제 `--allow-arm-takeoff` 실행 전 남은 hard blocker 여부
+그러면 `last_node_local_x/y`와 `hop_start_local_x/y`가 실제 첫 grid node 중심 기준으로 잡히고, `SnakeForward`의 3m hop 거리와 `hop_align_start_m`/`hop_align_end_m` window가 실제 grid cell geometry와 다시 맞게 된다. 그 결과 현재처럼 첫 node 직후 line을 잃고 `hop_distance_exceeded`로 착륙하는 현상이 사라지는 것이 기대된다.

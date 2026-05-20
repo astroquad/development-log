@@ -74,7 +74,7 @@ Debug/staging 실행 파일:
 
 Gazebo/SITL staging:
 
-- WSL에서 `bash ~/fly_test.sh`로 Astroquad Gazebo vision world와 ArduCopter SITL을 실행한다.
+- WSL에서 `bash ~/astroquad/uav-onboard/scripts/line_tracing_test.sh`로 Astroquad line-tracing test world와 ArduCopter SITL을 실행한다. 추가 Gazebo world는 `scripts/<world>_test.sh` 형태로 분리해 관리한다.
 - main world는 Iris 하향 camera, 어두운 ground, 폭 10cm 흰색 직선 line, 출발점 기준 3m 전방 50cm x 50cm ArUco ID 1 marker를 포함한다.
 - `vision_debug_node --target sitl --vision gazebo --video`는 Gazebo 하향 camera frame을 GCS로 보내고 기존 line/marker/intersection overlay telemetry를 유지한다.
 - `line_follow_node --target sitl --vision gazebo --video`는 같은 vision/GCS path와 MAVLink UDP SITL control path를 함께 검증하는 staging executable이다. 비행 중에는 camera, vision, telemetry, video 송신을 이 프로세스 하나가 담당한다.
