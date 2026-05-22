@@ -1,8 +1,83 @@
 # Astroquad 트러블슈팅 및 개발 판단 로그
 
-최종 업데이트: 2026-05-16
+최종 업데이트: 2026-05-21
 
 범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석, 해결 방법, 설계 판단을 보고서용 개발로그로 정리한다. 현재 기본 장치는 Raspberry Pi 4 + IMX519-78이며, Raspberry Pi Zero 2 W 관련 내용은 이전 bring-up 단계의 이력으로 남긴다.
+
+## 0. 현재 기준선: `grid_mission_node`와 grid arena snake mission
+
+### 현재 실행 기준
+
+최근 grid mission 개발의 기준 명령은 다음이다.
+
+```bash
+bash ~/astroquad/uav-onboard/scripts/grid_arena_test.sh
+
+./build/grid_mission_node --config config --target sitl --vision gazebo \
+  --world grid --line-mode dark_on_light --marker-count 4 \
+  --video --gcs-ip <windows-gcs-ip>
+```
+
+`--world grid`는 `config/runtime.sitl.grid.toml`을 사용해
+`grid_arena_test_world` Gazebo camera topic을 선택한다. 수동 topic override는
+custom fixture 또는 임시 world 테스트 때만 필요하다.
+
+### 현재 state machine
+
+`grid_mission_node`는 `VisionProcessor`, `IntersectionDecisionEngine`,
+`GridCoordinateTracker`, `GridMission`, `SnakePlanner`, `GridControlMapper`,
+`AutopilotMavlinkAdapter`, `VisionDebugPublisher`를 묶는 SITL staging
+composition root다.
+
+현재 grid mission 흐름:
+
+```text
+ARM_TAKEOFF
+  -> MARKER_LOCK_YAW
+  -> ENTRY_FORWARD
+  -> ENTRY_CENTER_ORIGIN
+  -> SNAKE_LAUNCH_ALIGN
+  -> SNAKE_FORWARD
+  -> SNAKE_RECORD_NODE
+  -> SNAKE_STOP_AT_CENTER
+  -> SNAKE_TURN_90
+  -> SNAKE_ADVANCE_ONE_CELL
+  -> SNAKE_TURN_90_AGAIN
+  -> SNAKE_COMPLETE
+  -> LAND
+```
+
+새 grid arena에는 vertiport에서 grid까지 이어지는 line이 없으므로
+`ENTRY_FORWARD`는 yaw-frozen blind forward다. 첫 L/T/+ 교차점은 보는 즉시
+origin으로 확정하지 않고, `ENTRY_CENTER_ORIGIN`에서 X/Y 중심과 저속 gate를
+통과한 뒤 local `(0,0)`으로 publish한다.
+
+### 현재 알고리즘 판단
+
+- Gazebo ground-truth pose를 mission 입력으로 쓰지 않는다.
+- LOCAL_NED는 짧은 hop 거리와 hover source로만 사용한다.
+- `GridCoordinateTracker::update()`는 peek-only이며, mission gate 통과 후
+  `commitAdvance()`만 실제 좌표를 전진시킨다.
+- `grid_mission_node`는 GCS UDP loss에 대비해 최신 committed `grid_node`를
+  매 frame 다시 보낸다. GCS는 node id/coordinate로 dedup한다.
+- Cell 사이 이동은 yaw locked `ForwardBlind`가 기본이고, line following은
+  `hop_align_start_m..hop_align_end_m`의 짧은 mid-cell alignment window에서만
+  열린다.
+- Boundary에서는 `SnakePlanner`가 첫 turn direction을 latch하고 이후
+  left/right를 strict alternation한다. 기대 branch가 없으면 backtrack하지
+  않고 snake complete로 본다.
+- Marker commit은 sliding `MarkerWindow`가 같은 non-vertiport ID를 충분히
+  관찰했을 때만 수행한다. window 안에 서로 다른 ID가 섞이면 flush한다.
+
+### 현재 남은 범위
+
+- `grid_mission_node --target pixhawk1` real arm/takeoff는 열려 있지 않다.
+  현재는 `--no-arm` smoke만 허용한다.
+- Marker ID 역순 재방문, 출발점 복귀, official coordinate conversion은 아직
+  미구현이다.
+- GCS protocol에는 richer mission object가 준비되어 있지만,
+  `VisionDebugPublisher` path는 아직 grid mission state를 구조화해서 채우지
+  않는다. 현재 상세 state 확인은 `grid_mission_node` console log가 기준이다.
 
 ## 1. GCS가 온보드 telemetry를 수신하지 못함
 
@@ -1784,11 +1859,14 @@ uav-onboard/sim/gazebo/models/iris_with_downward_camera/model.sdf
 - line/marker 물리 크기는 바꾸지 않는다. 실기체 camera에 맞출 때는 camera FOV만 조정한다.
 - Gazebo model SDF 변경 후에는 Gazebo/SITL을 재시작한다. C++ rebuild는 FOV-only 변경에는 필요 없다.
 
-## 40. Raspberry Pi 4 + Pixhawk1에서 현재 `line_follow_node`를 옵션만 바꿔 바로 쓸 수 있는지
+## 40. Raspberry Pi 4 + Pixhawk1에서 `line_follow_node`를 바로 쓸 수 있는지
 
 ### 현재 판단
 
-부분적으로만 가능하다.
+이 항목은 초기 판단 기록이며, 바로 다음 41번 항목의 serial bring-up 작업으로
+상태가 바뀌었다. 현재 기준으로는 native `SerialMavlinkTransport`가 구현되어
+있고, `line_follow_node --target pixhawk1`는 no-arm smoke와 명시적
+`--allow-arm-takeoff` guard를 가진다.
 
 가능한 것:
 
@@ -1796,28 +1874,21 @@ uav-onboard/sim/gazebo/models/iris_with_downward_camera/model.sdf
 - onboard line/ArUco/intersection vision 처리.
 - GCS telemetry/video 송신.
 - `line_follow_node --target sitl --vision gazebo --video`로 검증된 mission/control 구조.
+- Pixhawk1 USB/serial MAVLink heartbeat/probe/smoke path.
 
-바로 안 되는 것:
+여전히 바로 하면 안 되는 것:
 
-- `--target pixhawk1 --vision rpicam`만으로 Pixhawk1에 직접 제어 명령을 보내는 native serial MAVLink transport는 아직 구현되지 않았다.
-- 현재 code path에서 serial endpoint를 선택하면 “serial transport intentionally not implemented”로 종료한다.
+- 실제 arm/takeoff는 `--allow-arm-takeoff` 없이는 열리지 않는다.
+- RC takeover, battery, local estimate, motor order, prop direction, manual hover
+  gate를 통과하지 않은 상태에서 자동비행을 시작하지 않는다.
+- `grid_mission_node --target pixhawk1`는 현재 real arm/takeoff grid mission
+  path가 아니며 `--no-arm` smoke만 기준으로 본다.
 
-코드 수정 없이 실기체 경로를 억지로 열 수 있는 조건:
-
-- 별도 MAVLink router/bridge가 Pixhawk USB/TELEM serial을 UDP endpoint로 변환한다.
-- `line_follow_node`는 그 UDP endpoint를 `--autopilot udp://...`로 사용한다.
-- 이 경우에도 ArduPilot heartbeat, GUIDED, arm, local position, RC takeover, land command가 props-off bench에서 먼저 검증되어야 한다.
-
-예시:
+현재 smoke 예시:
 
 ```bash
-./build/line_follow_node \
-  --config config \
-  --target pixhawk1 \
-  --vision rpicam \
-  --video \
-  --gcs-ip <gcs-ip> \
-  --autopilot udp://0.0.0.0:14550
+./build/line_follow_node --config config --target pixhawk1 \
+  --mavlink-smoke --smoke-duration-ms 5000 --no-telemetry
 ```
 
 ### 실기체 전 필수 gate
@@ -1828,7 +1899,9 @@ uav-onboard/sim/gazebo/models/iris_with_downward_camera/model.sdf
 - GCS video는 broadcast보다 unicast `--gcs-ip <laptop-ip>`를 우선 사용한다.
 - 실기체 IMX519 시야에 맞게 camera focus/lens/FOV와 line width를 다시 튜닝한다.
 
-결론: vision/GCS 쪽은 Raspberry Pi 4에서 이어서 쓸 준비가 되어 있지만, 실제 Pixhawk 제어는 native serial transport 구현 또는 외부 UDP bridge 절차 확정 없이는 “옵션만 변경해서 바로 자동비행” 단계가 아니다.
+결론: vision/GCS와 native Pixhawk serial smoke는 이어서 쓸 수 있다. 다만
+실제 자동비행은 여전히 explicit arm/takeoff flag와 모든 실기체 gate를
+통과한 뒤에만 진행한다.
 
 ## 41. Pixhawk USB serial bench bring-up과 MTF-01 local estimate 확인
 
