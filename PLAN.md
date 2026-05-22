@@ -1,54 +1,67 @@
-# Plan: Marker Manhattan Revisit
+# Plan: Full Mission Return-To-Vertiport
 
 Date: 2026-05-22 KST
 
 ## Goal
 
-Extend existing `uav-onboard/tools/grid_mission_node.cpp`. Do not create a new runtime program.
+Extend the existing `grid_mission_node` flow. Do not create a new runtime
+program.
 
-Flow:
+Target mission:
 
 ```text
-Grid snake search
--> synthesize/drain remaining grid nodes
--> freeze grid map
--> revisit found ArUco markers by Manhattan route
+snake grid search
+-> synthetic grid completion/drain
+-> marker revisit, always enabled
+-> return to grid origin (0,0)
+-> face south on the grid
+-> leave grid toward vertiport with yaw frozen and line tracing disabled
+-> find active vertiport ArUco marker
+-> marker-center hover/align
 -> land
+-> publish mission_complete
+-> exit
 ```
 
-Hard requirements:
+Keep existing movement primitives. This is mostly route composition, state
+sequencing, and telemetry.
 
-- Reuse existing snake/hover/turn/pass-through code as much as possible.
-- Do not delete existing snake/dwell behavior; keep fallback switches.
-- Revisit order is selected at startup: `asc`, `desc`, or `none`.
-- During revisit, do not add new grid nodes/edges to GCS map.
-- During revisit, keep showing live drone coord/heading on the already-built map.
-- At each revisited marker, hover centered for the existing marker-hover duration/logic.
-- GCS marker panel shows revisited markers with strikethrough/fallback visited mark.
-- U-turn policy for first implementation: two verified 90-degree turns, not a new direct 180-degree turn.
+## Requirements
+
+- `--revisit-order` default is `desc` when omitted.
+- `--revisit-order asc` is the only alternate order.
+- Remove public `none` mode from CLI/config/docs. Revisit is now part of the
+  mission, not an optional feature.
+- After all marker revisits, always return to `(0,0)`.
+- Use the same Manhattan route planner/forward/turn/hover mechanics already
+  used for marker revisit.
+- At `(0,0)`, rotate so the drone faces grid south (`v` on GCS map).
+- Align on the `(0,0)` intersection center before exiting the grid.
+- From `(0,0)` to the vertiport, fly yaw-frozen forward with line inputs off.
+- Search for the runtime active vertiport marker id latched during takeoff.
+- If the vertiport marker is not found, use the same timeout budget as
+  `entry_forward_timeout_s`.
+- Once the vertiport marker is visible, use existing marker-centering hover
+  control, then land.
+- Once leaving the grid toward the vertiport, GCS grid map must hide the drone
+  arrow because the drone is no longer on a grid node.
+- After successful landing/disarm, onboard sends a final success telemetry
+  packet and exits.
+- GCS shows `mission complete!` when that final success telemetry is received.
 
 ## Files
 
-Onboard add:
+Onboard modify:
 
 - `uav-onboard/src/mission/MarkerRevisitPlanner.hpp`
 - `uav-onboard/src/mission/MarkerRevisitPlanner.cpp`
-- `uav-onboard/tests/test_marker_revisit_planner.cpp`
-
-Onboard modify:
-
-- `uav-onboard/CMakeLists.txt`
-- `uav-onboard/config/mission.toml`
 - `uav-onboard/src/mission/GridMission.hpp`
 - `uav-onboard/src/mission/GridMission.cpp`
-- `uav-onboard/src/mission/GridCoordinateTracker.hpp`
-- `uav-onboard/src/mission/GridCoordinateTracker.cpp`
-- `uav-onboard/src/mission/MarkerRegistry.hpp`
-- `uav-onboard/src/mission/MarkerRegistry.cpp`
 - `uav-onboard/src/protocol/TelemetryMessage.hpp`
 - `uav-onboard/src/protocol/TelemetryMessage.cpp`
 - `uav-onboard/tools/grid_mission_node.cpp`
-- `uav-onboard/tests/test_grid_mission_entry_origin.cpp` or new `test_grid_mission_revisit.cpp`
+- `uav-onboard/config/mission.toml`
+- `uav-onboard/README.md`
 
 GCS modify:
 
@@ -56,343 +69,271 @@ GCS modify:
 - `uav-gcs/src/protocol/TelemetryMessage.cpp`
 - `uav-gcs/src/telemetry/GridMapTracker.hpp`
 - `uav-gcs/src/telemetry/GridMapTracker.cpp`
-- `uav-gcs/src/telemetry/MarkerTracker.hpp`
-- `uav-gcs/src/telemetry/MarkerTracker.cpp`
-- `uav-gcs/src/app/VisionDebugApp.cpp`
+- `uav-gcs/src/telemetry/VisionLogFormatter.cpp`
+- optionally `uav-gcs/src/telemetry/MarkerTracker.cpp` if the side panel should
+  also show mission completion.
+
+Tests optional but useful:
+
+- `uav-onboard/tests/test_marker_revisit_planner.cpp`
+- `uav-onboard/tests/test_grid_mission_revisit.cpp`
 - `uav-gcs/tests/test_telemetry_line_parse.cpp`
 - `uav-gcs/tests/test_grid_map_tracker.cpp`
-- optionally add `uav-gcs/tests/test_marker_tracker.cpp`
 
-## Reuse
+## CLI And Config
 
-Reuse from `GridMission`:
-
-- `ForwardBlind` for straight motion: yaw lock + lateral line-centering
-- `MarkerHover` path: `populateMarkerInputs`, `beginMarkerHover`, `markerHoverComplete`
-- pass-through logic idea: commit/pose update without dwell on middle nodes
-- `StopAndCenter` before turn nodes
-- 90-degree yaw turn logic from `SnakeTurn90` / `SnakeTurn90Again`
-- `synthesizeRemainingColumnNodes()` before revisit starts
-
-Do not reuse:
-
-- `SnakePlanner` for revisit route choice. Revisit target order/path is deterministic from marker coords, not boundary discovery.
-
-## Onboard Data Model
-
-Add revisit order:
+Change public order model:
 
 ```cpp
-enum class RevisitOrder { None, Asc, Desc };
+enum class RevisitOrder { Asc, Desc };
 ```
 
-Add planner types:
+Preferred implementation:
+
+- `GridMissionConfig::revisit_order = RevisitOrder::Desc`
+- `parseRevisitOrder()` accepts only `asc` and `desc`
+- `--revisit-order` omitted -> `desc`
+- `--revisit-order none` -> CLI error
+- remove `revisit_order = "none"` from `config/mission.toml`; set `"desc"` or
+  omit the key
+- update README commands and examples
+
+Compatibility note:
+
+- If keeping `RevisitOrder::None` internally reduces code churn, do not expose
+  it in CLI/config/docs and never choose it by default. Remove it later when
+  convenient.
+
+## Planner Reuse
+
+Generalize `MarkerRevisitPlanner` into a reusable Manhattan waypoint planner
+without changing its current behavior.
+
+Minimal path:
+
+- Keep `MarkerRevisitPlanner` name for now.
+- Add a helper that builds a single `RevisitLeg` to an arbitrary `GridCoord`.
+- Use it for:
+  - marker-to-marker revisit legs
+  - final return leg from current coord to `(0,0)`
+
+Rules stay the same:
+
+- choose X-first or Y-first by lower turn cost
+- tie-break by first segment matching current heading
+- tie-break by longer first segment
+- U-turn remains two verified 90-degree turns
+
+## New GridMission States
+
+Add states after `RevisitComplete`:
 
 ```cpp
-struct MarkerRevisitTarget {
-    int id = -1;
-    GridCoord coord;
-};
-
-struct RevisitSegment {
-    GridHeading heading = GridHeading::Unknown;
-    int cells = 0;
-};
-
-struct RevisitLeg {
-    int marker_id = -1;
-    GridCoord target;
-    std::vector<RevisitSegment> segments;
-};
+ReturnHomeInit,
+ReturnHomeForward,
+ReturnHomeStopAtTurn,
+ReturnHomeTurn90,
+ReturnHomeAlignOrigin,
+ReturnHomeFaceSouth,
+ReturnVertiportForward,
+ReturnVertiportMarkerHover,
+MissionComplete,
 ```
 
-Add `MarkerRecord` fields:
+State reuse:
 
-```cpp
-bool revisited = false;
-std::int64_t revisited_ms = 0;
-```
+- `ReturnHomeForward` mirrors `RevisitForward`.
+- `ReturnHomeStopAtTurn` mirrors `RevisitStopAtTurn`.
+- `ReturnHomeTurn90` mirrors `RevisitTurn90`.
+- `ReturnHomeAlignOrigin` reuses `IntersectionCenter`/center gate logic from
+  entry-origin centering.
+- `ReturnHomeFaceSouth` reuses one-or-two-step 90-degree yaw turn logic.
+- `ReturnVertiportForward` reuses `ForwardBlind` intent but explicitly disables
+  line inputs.
+- `ReturnVertiportMarkerHover` reuses `MarkerHover`, `populateMarkerInputs`,
+  `beginMarkerHover`, and full marker hover dwell/centering behavior.
 
-Add `MarkerRegistry` API:
-
-```cpp
-bool markRevisited(int aruco_id, std::int64_t timestamp_ms);
-std::size_t revisitedGridMarkerCount() const;
-```
-
-Add `GridCoordinateTracker` API:
-
-```cpp
-void setCurrentPose(GridCoord coord, GridHeading heading);
-```
-
-`setCurrentPose` must update only `current_coord_` and `current_heading_`; it must not mutate `nodes_`, node IDs, or map edges.
-
-## Planner Rules
-
-Input:
-
-- current coord
-- current heading
-- marker records with valid grid coords
-- order: `asc` or `desc`
-
-Order:
-
-- `asc`: marker id increasing
-- `desc`: marker id decreasing
-- `none`: no revisit; keep existing landing behavior
-
-For each next target:
-
-1. Build candidate path `X axis first, then Y axis`.
-2. Build candidate path `Y axis first, then X axis`.
-3. Drop zero-length segments.
-4. Score each candidate:
-   - same heading: `0`
-   - 90-degree turn: `1`
-   - U-turn: `2`
-5. Choose lower score.
-6. Tie-break by candidate whose first segment matches current heading.
-7. Tie-break by longer first segment.
-
-U-turn representation:
-
-- Do not add direct 180 turn state initially.
-- If heading needs opposite direction, emit two 90-degree turns at the same node before moving.
-
-Planner unit tests:
-
-- asc order
-- desc order
-- same-row route
-- same-column route
-- X-first vs Y-first lower turn cost
-- current-heading tie-break
-- U-turn costs as two 90-degree turns
-- zero-distance target produces immediate marker hover/no movement segment
-
-## GridMission States
-
-Add states:
-
-```cpp
-RevisitInit,
-RevisitForward,
-RevisitStopAtTurn,
-RevisitTurn90,
-RevisitMarkerHover,
-RevisitComplete,
-```
-
-Transition outline:
+## State Flow
 
 ```text
-SnakeComplete
-  if pending_synth_events_ not empty:
-    drain as today
-  else if revisit_order == none or no grid markers:
-    Land as today
-  else:
-    RevisitInit
-
-RevisitInit
-  build RevisitLeg list from MarkerRegistry
-  set grid_map_finalized=true
-  choose first segment/target
-  if already at target: RevisitMarkerHover
-  else if turn needed: RevisitStopAtTurn
-  else: RevisitForward
-
-RevisitForward
-  intent=ForwardBlind
-  target_yaw_rad = heading yaw for active segment
-  on nodeJustRecorded + distance gate:
-    update current pose only
-    if target marker coord reached: RevisitMarkerHover
-    else if segment cells complete and next heading differs: RevisitStopAtTurn
-    else continue ForwardBlind
-
-RevisitStopAtTurn
-  intent=StopAndCenter
-  reuse velocity settle / center gate
-  then RevisitTurn90
-
-RevisitTurn90
-  intent=YawTurn
-  rotate one 90-degree step
-  if U-turn still needs second 90: stay/loop RevisitTurn90
-  else enter RevisitForward or RevisitMarkerHover
-
-RevisitMarkerHover
-  intent=MarkerHover
-  focus target marker id
-  reuse marker hover helper and timeout
-  on complete: MarkerRegistry.markRevisited(id)
-  choose next leg or RevisitComplete
-
 RevisitComplete
-  Land
+  -> ReturnHomeInit
+
+ReturnHomeInit
+  build single Manhattan leg to (0,0)
+  if already at (0,0): ReturnHomeAlignOrigin
+  else if heading mismatch: ReturnHomeStopAtTurn
+  else: ReturnHomeForward
+
+ReturnHomeForward
+  intent=ForwardBlind
+  target_yaw_rad = active route segment yaw
+  commit_tracker_advance=false
+  on nodeJustRecorded + hop distance gate:
+    setCurrentPose(next coord, segment heading)
+    if reached (0,0): ReturnHomeAlignOrigin
+    else continue/turn like revisit
+
+ReturnHomeStopAtTurn
+  intent=StopAndCenter
+  reuse velocity settle + branch settle
+  then ReturnHomeTurn90
+
+ReturnHomeTurn90
+  intent=YawTurn
+  one verified 90-degree step
+  if U-turn needs second 90: stay ReturnHomeTurn90
+  else ReturnHomeForward
+
+ReturnHomeAlignOrigin
+  intent=IntersectionCenter
+  center the (0,0) intersection using existing center gates
+  when centered/stable: ReturnHomeFaceSouth
+
+ReturnHomeFaceSouth
+  intent=YawTurn
+  rotate to GridHeading::South
+  when yaw stable:
+    setCurrentPose((0,0), South)
+    armHopStart()
+    set grid_pose_visible=false for GCS
+    ReturnVertiportForward
+
+ReturnVertiportForward
+  intent=ForwardBlind
+  target_yaw_rad = yaw for GridHeading::South
+  line_detected=false, center_error=0, angle_error=0
+  wait until active vertiport marker id is visible
+  timeout = entry_forward_timeout_s
+  on marker visible: ReturnVertiportMarkerHover
+
+ReturnVertiportMarkerHover
+  intent=MarkerHover
+  focus active_vertiport_marker_id_
+  center over marker using existing marker controller
+  after marker hover dwell / centered gate: Land
+
+Land
+  existing LAND mode
+  when disarmed: MissionComplete
+
+MissionComplete
+  mission_finished=true
+  mission_complete=true
+  landing_success=true
+  next tick/after final telemetry: Done
 ```
 
 Important:
 
-- During all revisit states, `commit_tracker_advance=false`.
-- Revisit node arrivals call `GridCoordinateTracker::setCurrentPose`, not `commitAdvance`.
-- GCS map freeze is a telemetry flag and also protected by no new onboard grid commits.
+- Return-home grid movement must not mutate `nodes_` or GCS map nodes.
+- Use `GridCoordinateTracker::setCurrentPose()` only.
+- GCS map remains frozen after snake completion.
+- During return-home `(0,0)` movement, live arrow is still shown on the frozen
+  grid.
+- During off-grid vertiport forward/marker hover/landing, live arrow is hidden.
 
-## Config And CLI
+## Vertiport Return Details
 
-Add to `config/mission.toml`:
+Marker id:
 
-```toml
-revisit_order = "asc"                 # asc | desc | none
-revisit_passthrough_regular_nodes = true
-revisit_marker_hover_s = 3.0          # optional; default can reuse snake_marker_hover_s
-revisit_turn_center_required = true
+- Use `active_vertiport_marker_id_`.
+- If it is still `-1`, treat as mission fault and emergency land or use config
+  fallback only as a last-resort failsafe. Do not leak fallback ID to normal
+  GCS status as an observed marker.
+
+Forward search:
+
+- Start at centered `(0,0)`, heading south.
+- Disable line centering and intersection/node handling.
+- Use yaw lock only.
+- Move with the same speed family as `EntryForward` or `ForwardBlind`; prefer
+  existing `ForwardBlind` output if it is already stable.
+- Timeout after `config_.entry_forward_timeout_s`.
+
+Marker hover:
+
+- Use existing marker control; this should be the final precision alignment
+  over the vertiport.
+- After successful alignment/dwell, request LAND mode.
+- Keep `mission_complete=false` until disarmed.
+
+## Telemetry Additions
+
+Onboard protocol `MissionTelemetry` add:
+
+```cpp
+bool return_active = false;
+std::string return_phase = "none";       // none|to_origin|face_south|to_vertiport|landing
+bool grid_pose_visible = true;
+bool vertiport_return_active = false;
+bool vertiport_acquired = false;
+bool landing_success = false;
+bool mission_complete = false;
 ```
 
-Add to `grid_mission_node` CLI:
+Populate from `GridMissionOutput` in `grid_mission_node`.
+
+GCS parse the same fields.
+
+GCS behavior:
+
+- `GridMapTracker::observeMission()`:
+  - if `grid_pose_visible=false`, clear/hide mission arrow and ignore drone
+    fractional position
+  - keep frozen nodes and marker glyphs
+- `VisionLogFormatter`:
+  - if `mission_complete=true`, show `mission complete!`
+  - while return is active, show `return=<phase>`
+  - keep `marker_revisit=yes/no` when revisit order is active
+
+Example final log:
 
 ```text
---revisit-order <asc|desc|none>
+=== Mission ===
+state=MISSION_COMPLETE  intent=land
+markers=4/4  snake_complete=yes  marker_revisit=yes  return=landing
+mission complete!
+------------------------------------------------------------
 ```
 
-CLI overrides config.
+## Implementation Notes
 
-## Telemetry
+- Keep all code in existing modules; do not add a new executable.
+- Prefer adding small helpers inside `GridMission` over duplicating large
+  handler bodies:
+  - `buildReturnHomePlan()`
+  - `startCurrentReturnLeg()`
+  - `handleRouteForward(...)`
+  - `handleRouteStopAtTurn(...)`
+  - `handleRouteTurn90(...)`
+  - `setGridPoseVisible(bool)`
+- If generic route helpers become too invasive, copy the revisit handlers first
+  and refactor only after build passes.
+- Preserve existing snake search behavior.
+- Preserve existing marker 3-second hover semantics:
+  - grid marker during snake search: full dwell
+  - marker on turn node: full dwell
+  - marker revisit: full dwell
+  - vertiport final alignment: full dwell unless field testing shows this is
+    too slow
 
-Onboard `MissionMarkerEntry` add:
+## Acceptance Checklist
 
-```cpp
-bool revisited = false;
-double revisited_s = 0.0;
-```
-
-Onboard `MissionTelemetry` add:
-
-```cpp
-bool revisit_active = false;
-bool grid_map_finalized = false;
-std::string revisit_order = "none";
-int revisit_target_id = -1;
-int revisit_remaining = 0;
-```
-
-JSON keys:
-
-```json
-{
-  "mission": {
-    "revisit_active": true,
-    "grid_map_finalized": true,
-    "revisit_order": "asc",
-    "revisit_target_id": 3,
-    "revisit_remaining": 2,
-    "markers_found": [
-      {
-        "id": 1,
-        "grid": [-1, -2],
-        "grid_valid": true,
-        "first_seen_s": 204.7,
-        "revisited": true,
-        "revisited_s": 398.2
-      }
-    ]
-  }
-}
-```
-
-`grid_mission_node` publish policy:
-
-- Before revisit: publish grid nodes as today.
-- During revisit: do not create new committed grid nodes.
-- During revisit: mission grid coord/heading must continue updating.
-- Prefer also suppressing repeated `last_committed_event` during revisit if practical.
-
-## GCS Behavior
-
-`GridMapTracker`:
-
-- Add `grid_map_finalized_`.
-- `observeMission(mission)` sets `grid_map_finalized_ |= mission.grid_map_finalized`.
-- If `grid_map_finalized_`, `observe(grid_node)` ignores new nodes/edges.
-- `observeMission(mission)` still updates live drone coord/heading.
-- Existing map remains visible.
-
-`VisionDebugApp` observe order:
-
-```cpp
-grid_map.observeMission(parsed->mission);
-grid_map.observe(parsed->vision.grid_node);
-grid_map.observeDronePosition(...);
-marker_tracker.observe(parsed->mission);
-```
-
-Reason: freeze flag must be applied before same-packet `grid_node`.
-
-`MarkerTracker`:
-
-- Parse and store `MissionMarkerEntry::revisited`.
-- Render revisited marker with strikethrough if usable.
-- Plain-text fallback: prefix `[x]`.
-
-Suggested rendering:
-
-```text
-id=1  grid=(-1,-2)  t=204.7s
-[x] id=2  grid=(-3,-4)  t=315.2s
-```
-
-If Win32 edit control renders combining strikethrough reliably, apply it to the whole visited line; otherwise keep `[x]`.
-
-## Implementation Order
-
-1. Add `MarkerRevisitPlanner` and planner tests.
-2. Add `MarkerRegistry.revisited` fields/API.
-3. Add `GridCoordinateTracker::setCurrentPose`.
-4. Add telemetry structs/JSON fields on onboard and GCS.
-5. Add CLI/config parsing for `--revisit-order`.
-6. Add `GridMission` revisit states and internal route state.
-7. Wire `SnakeComplete` to `RevisitInit` after synthetic drain.
-8. Implement `RevisitForward` using existing `ForwardBlind` and node distance gate.
-9. Implement `RevisitStopAtTurn` and `RevisitTurn90` by extracting/reusing current turn helpers where sensible.
-10. Implement `RevisitMarkerHover` using current marker hover helpers.
-11. Freeze GCS map on `grid_map_finalized`.
-12. Add marker visited rendering.
-13. Run tests and SITL checks.
-
-## Tests
-
-Onboard:
-
-```bash
-cmake --build build --target test_marker_revisit_planner test_grid_mission_entry_origin grid_mission_node
-ctest --test-dir build -R 'marker_revisit|grid_mission|guided_velocity_controller' --output-on-failure
-```
-
-GCS:
-
-```bash
-cmake --build build --target test_telemetry_line_parse test_grid_map_tracker uav_gcs_vision_debug
-ctest --test-dir build --output-on-failure
-```
-
-Add assertions:
-
-- `--revisit-order none` keeps existing land-after-snake behavior.
-- `asc` and `desc` produce expected marker order.
-- Revisit middle nodes do not emit grid commits.
-- Revisit updates mission current coord/heading.
-- GCS ignores new grid nodes after `grid_map_finalized`.
-- GCS still moves arrow after `grid_map_finalized`.
-- Revisited markers render as visited.
-
-## Open Decisions
-
-- On target marker lost for full hover timeout:
-  - Recommended first behavior: log `revisit_marker_lost`, mark not revisited, continue to next target.
-  - Conservative option: retry once or emergency land.
-- After all markers revisited:
-  - Current plan: land at last marker unless return-home is requested later.
-  - Return-home can be a later planner target using the same route machinery.
+- `grid_mission_node --revisit-order desc` works.
+- `grid_mission_node` with omitted `--revisit-order` behaves as `desc`.
+- `--revisit-order asc` works.
+- `--revisit-order none` is rejected.
+- Snake search still completes and freezes the GCS grid map.
+- Marker revisit still marks GCS markers `[>]` then `[x]`.
+- After all markers are revisited, drone returns to `(0,0)`.
+- Drone faces south at `(0,0)`.
+- Drone exits grid toward vertiport with line inputs disabled.
+- GCS grid arrow disappears once drone leaves grid.
+- Vertiport marker acquisition triggers marker centering.
+- Successful landing publishes `mission_complete=true`.
+- GCS prints `mission complete!`.
+- Onboard exits after final success telemetry.
+- Build passes:
+  - `cmake --build astroquad/uav-onboard/build`
+  - `cmake --build astroquad/uav-gcs/build`
