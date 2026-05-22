@@ -2392,3 +2392,476 @@ EMA 필터와 독립적으로 기체 프레임 가속도를 제한한다. 기본
 **MTF-01 광학 흐름 품질**: 컨트롤러의 `min_confidence` 게이팅은 비행 컨트롤러의 광학 흐름 품질 플래그와 별개다. 실기에서는 `OPTICAL_FLOW_RAD.quality`가 운용 환경에서 안정적으로 ≥ 50을 유지하는지 `forward_mps`를 높이기 전에 벤치에서 검증할 것.
 
 **부호 규약**: MAVLink `SET_POSITION_TARGET_LOCAL_NED` 기체 프레임 부호가 펌웨어 버전에 따라 다를 수 있다. 첫 야외 테스트 전 벤치에서 `invert_lateral`과 `invert_yaw` 플래그를 검증할 것.
+
+---
+
+## 51. `grid_mission_node` Cycle 8 — `alt` 표시 혼란 + LINE_ENTER timeout / yaw drift
+
+**증상**:
+- log의 `alt`가 3.3~3.48 m로 표시되어 알고리즘 결함처럼 보임 (실제 비행 고도는 ground 기준 ~2 m).
+- vertiport→첫 grid 교차점 진입 도중 yaw가 천천히 회전(1.57→1.40)하면서 라인 이탈, LINE_ENTER 5 s timeout → EmergencyLand.
+
+**원인**:
+- `alt` 필드가 LOCAL_NED z(takeoff origin 기준)였고, 컨트롤러는 `distance_sensor.value_or(local_altitude)`로 rangefinder 우선 사용. 단상(0.7 m)에서 이륙했으므로 단상 벗어나면 LOCAL_NED z만 점프해 표시상 ↑.
+- LineDetector contour 전체에 `cv::fitLine`을 적용하므로 T-shape 교차점이 프레임 상단에 들어오는 partial-Unknown 구간 동안 fused 각도가 반환 → LineFollow가 그 각도를 따라가 yaw drift.
+
+**해결**:
+- log 포맷: `agl=2.00 lz=3.48` (rangefinder=AGL, local_z 분리). ceiling 체크도 rangefinder 우선 + LOCAL_NED fallback.
+- `populateLineInputs`에서 `intersection.valid`(Unknown/Straight/L/T/+ 어떤 타입이든)이면 `line_angle_error_rad=0`, `line_center_error_norm=0`로 freeze → yaw가 fused angle을 따라가는 것을 차단.
+- `IntersectionDecision`에 `node_record_y_min/max` (0.40 / 0.65) 게이트 추가 — 교차점이 정확히 카메라 중앙 zone에 들어왔을 때만 NodeRecord 발사.
+- LineEnter timeout 5 s → 10 s, idle counter는 라인이 잡힌 마지막 시점부터 측정.
+
+---
+
+## 52. Tracker가 동일 (0,0) 교차점을 4번 advance해 가짜 노드 생성
+
+**증상**:
+- 드론은 (0,0)에서 약 1.5 m만 전진했는데 GCS 그리드에 `nodes=5 current=(0,-4)` 표시.
+- 로그에 `idec=node_record` 이벤트가 t=20.82/22.41/24.01에 약 1.5 s 간격으로 동일 시그니처(type=T cy=0.40~0.61 bm=0x0D)로 반복 발사됨.
+
+**원인**:
+- `IntersectionDecisionEngine.record_node_once_frames`(18 frames, ~1.5 s)는 frame-level dedup이지 거리 dedup이 아님.
+- `GridCoordinateTracker.update()`는 `decision.event_ready`만 보고 `node_advance_min_frames`(4 frames) 후엔 무조건 `current_coord_` advance. mission 레이어의 distance gate는 `intersections_recorded_`만 막을 뿐 tracker coord는 자유롭게 advance했음.
+
+**해결 — peek/commit 분리**:
+- `tracker.update(...)`는 event 메타데이터만 채워 반환하고 `current_coord_` advance를 보류 (peek).
+- 새 `tracker.commitAdvance(event)`를 mission이 distance gate + lockouts 모두 통과했을 때만 호출.
+- `GridMissionOutput`에 `commit_tracker_advance` 플래그 추가. mission이 "진짜 노드"로 판정 시 true.
+
+**부수 변경 — handleSnakeRecordNode stale node_event**:
+- dwell 시간 후 boundary 판정에 `in.node_event.grid_branch_mask`를 매 tick 다시 읽었으나 lockout 활성 후 valid=false라 mask=0 → 항상 boundary로 오판 → SnakeStopAtCenter → SnakeComplete → LAND.
+- 해결: `handleSnakeForward`에서 SnakeRecordNode 진입 직전 `last_node_grid_branch_mask_`, `last_node_front_open_`을 latch하고 dwell 종료 후 cached 값으로 판정.
+
+---
+
+## 53. 마커가 1-2 frame false-positive로 commit되는 문제
+
+**증상**:
+- (0,0) 근처에서 mks=1 (id=7) 한순간 잡힘 → `MarkerRegistry`에 commit. 실제로는 교차점 십자 패턴의 ArUco 오인식.
+- `markers_expected` 카운트 오류, `marker_hover_active_` 잘못 트리거.
+
+**해결 변천**:
+- Cycle 9: mission 레이어에 `marker_candidate_count_` 추가, 같은 ID가 연속 N 프레임 보일 때만 commit (`marker_observation_min_frames=3`).
+- Cycle 11: 임계값 부족 — 3 frames(150 ms)는 OpenCV ArUco가 교차점 십자/T를 일시 안정 인식하는 시간보다 짧음. 6 frames(300 ms)로 상향 + `min_marker_perimeter_rate` 0.03→0.05로 보수화 (이미지 둘레의 5% 미만 후보 거부).
+- Cycle 16: sliding window로 교체 — 최근 N(8) frames 중 동일 ID가 M(4) 이상 등장하면 commit, 윈도우 내 다른 ID 섞이면 flush.
+
+---
+
+## 54. Boundary 워치독이 너무 일찍 발동해 교차점 중심 도달 전 정지
+
+**증상**:
+- 워치독이 `TurnConfirm` (cy=0.34) 단계에 트리거 → 교차점이 프레임 상단에 막 보이기 시작한 시점에 SnakeStopAtCenter → 드론이 실제 교차점에서 1+m 못 도달한 상태에서 정지.
+
+**원인**:
+- `TurnConfirm`: cy가 `turn_zone_y_min` 아래(접근 중)일 때 발사.
+- `TurnReady`: cy ∈ [turn_zone_y_min, turn_zone_y_max] (중심 위치).
+- 둘 다 받으면 cy=0.34 시점에 정지.
+
+**해결**:
+- 워치독을 `TurnReady` 단계에만 발동하도록 좁힘. SnakeForward는 그 사이 `forward_speed_advance_mps`로 계속 전진 → 자연스럽게 교차점 중심 도달 시점에 워치독 트리거.
+
+---
+
+## 55. SnakeStopAtCenter가 stale grid_branch_mask로 SnakeComplete 오판
+
+**증상**:
+- SnakeStopAtCenter → SnakeTurn90으로 가야 하는데 SnakeComplete로 직행, LAND.
+
+**원인**:
+- `handleSnakeStopAtCenter`가 `sp_in.grid_branch_mask = in.node_event.grid_branch_mask`로 SnakePlanner에 전달. 이 시점엔 peek valid=false → mask=0 → SnakePlanner는 모든 branch 없음 → `Complete` 반환.
+
+**해결**:
+- 워치독에서 latch한 fresh `last_node_grid_branch_mask_`을 SnakePlanner에 전달.
+
+---
+
+## 56. 좌표계 north 방향 결정
+
+**경과**:
+- Cycle 12: `north = +y` (math convention) 채택 — `s`가 화면 아래쪽, `+`가 위로 누적.
+- Cycle 13: 사용자 mental model과 충돌해 `north = -y` (screen convention) 원복. `advance()`, `headingVector()`, `canvasRow()` 모두 일관성 있게 revert.
+- 좌회전(negative x) 케이스는 `canvasCol = (x - min_x) * 4`가 동적 계산이라 영향 없음.
+
+**교훈**: 좌표계 선택은 컴포넌트 간 일관성보다 사용자 시각 모델과의 일치가 우선. revert는 advance/headingVector/canvasRow 세 곳을 동시에 바꿔야 함.
+
+---
+
+## 57. L 코너에서 30-50 cm 일찍 정지
+
+**증상**: 워치독 발동 후 stop ramp-down 시작 위치가 교차점 중심에서 30-50 cm 부족.
+
+**해결 — cy-feedback 감속**:
+- `GridControlMapper`의 `StopAndCenter` intent에 cy 기반 점진 감속 추가:
+  ```cpp
+  if (cy < stop_center_target_cy) {
+      gap = stop_center_target_cy - cy;
+      scale = min(1.0, gap / 0.30);
+      vx = stop_center_max_vx_mps * scale;
+  } else { vx = 0; }
+  ```
+- Cycle 12: target_cy=0.55 — 여전히 부족.
+- Cycle 13: target_cy=0.65 — 카메라 중심선보다 +0.15 아래까지 전진 후 정지. Gazebo Iris 하향 카메라 principal point 오프셋 보정.
+
+---
+
+## 58. 회전 후 U-turn (이전 corridor의 라인 재추종)
+
+**증상**: SnakeTurn90 후 SnakeAdvanceOneCell이 즉시 LineFollow 활성화. 드론이 중심에서 30-50 cm 떨어진 위치에 있어 카메라가 column 1의 OLD 라인을 봄 → "다음 노드 도착" 오인식 → SnakeTurn90Again 또 좌회전 → 결국 180° U-turn.
+
+**해결 — Blind forward window**:
+- SnakeTurn90 / SnakeTurn90Again 완료 시 `snake_post_turn_blind_until_s_ = now + snake_post_turn_blind_s` latch.
+- 그 기간 동안 `intent=ForwardBlind` (yaw freeze, body forward 0.40 m/s) — LineFollow 비활성, distance gate skip, `nodeJustRecorded` 무시.
+- Cycle 12: 2.5 s (1.0 m blind) → 너무 김.
+- Cycle 13: 1.5 s (0.6 m blind) — 새 corridor 진입 + 이전 corridor 라인 잔상 클리어 충분.
+
+---
+
+## 59. SnakeAdvanceOneCell `advance_timeout` EmergencyLand
+
+**증상**: SnakeAdvanceOneCell 진입 후 8 s 내 다음 노드 못 도달 → `advance_timeout` → EmergencyLand.
+
+**원인**:
+- `forward_speed_advance_mps = 0.18` (hardcoded 기본값, mission.toml에서 로드 안 됨).
+- 0.18 m/s × (8 − 2.5) s = 0.99 m → cell 3 m 미달성.
+
+**해결**:
+- mission.toml에서 `forward_speed_advance_mps` 로드 추가 + 0.30 m/s로 상향.
+- `snake_advance_timeout_s` 8 → 15 s.
+- 산수: blind 1.5 s × 0.40 + (15 − 1.5) s × 0.30 = 4.65 m → cell 3 m + 마진.
+
+---
+
+## 60. `populateLineInputs` freeze가 lateral 보정도 차단
+
+**증상**: 회전 후 카메라가 라인을 우측에 두고 진행해도 vy_right_mps가 0. yaw만 정렬되고 lateral 보정 안 됨.
+
+**원인**: Cycle 8에서 추가한 `if (intersection.valid) { line_center_error_norm=0; }`가 SnakeAdvanceOneCell에서도 발동해 lateral 입력 차단.
+
+**해결 변천**:
+- Cycle 13: state-aware freeze — SnakeForward / SnakeRecordNode에서만 freeze, LineEnter / SnakeAdvanceOneCell / GridOriginLock에선 비활성.
+- Cycle 14 (롤백): `best_observed_type ∈ {L,T,Cross}` 기반 cross_potential로 재설계 시도, LineEnter 동안 type=Straight 유지로 yaw drift 차단 못 함 → 전면 롤백.
+- Cycle 15: `accepted_type=Straight` AND raw branches Front+Back angle 차이 ∈ [170°, 190°] 일 때만 보정 허용. T 시작 transient에서 contour merging이 angle을 흔드는 경우 차단.
+
+---
+
+## 61. Column 전환 시 tracker가 commit 안 되어 column 2/3가 column 1을 덮어씀
+
+**증상**:
+- 첫 column 10 노드 이후 GCS 그리드 갱신 안 됨. onboard 로그는 `nodes=11,12,...18` 증가하지만 모두 `coord=(0,*)` — column 2 진입 후 x가 -1로 안 바뀜.
+- column 2 끝에서 잘못된 turn → trace 꼬임 → fallsafe.
+
+**원인**:
+- `handleSnakeAdvanceOneCell`에서 다음 노드 도착 시 `intersections_recorded_++` 후 SnakeTurn90Again으로 전이하지만 `out.commit_tracker_advance`를 켜지 않음 + node_event를 GCS로 latch도 안 함.
+- 결과: tracker의 `current_coord_`는 column 1 끝 좌표 유지. 다음 commit의 peek event = `advance((0,-9), south)` = `(0,-8)` → column 1과 같은 x 덮어쓰기.
+
+**해결**:
+- `handleSnakeAdvanceOneCell`의 노드 도착 분기에 `out.commit_tracker_advance = true;` + `last_node_local_x_/y_` 갱신 추가. SnakeTurn90이 `notifyTurnCompleted(west)`를 이미 호출했으므로 peek event는 정확히 `(-1, -9)` (새 column 진입점).
+
+---
+
+## 62. 마커 hover race — mks=0 frame 한 번으로 hover 해제
+
+**증상**: 마커 commit은 되지만 호버 안 됨. mks=1 frame 사이 mks=0이 한 번이라도 끼면 다음 tick의 `focus_marker_id` 재선택에서 -1 → MarkerHover intent 해제.
+
+**원인**: `handleSnakeRecordNode`가 **매 tick** `focus_marker_id`를 다시 선택. 현재 frame `in.vision->markers`만 보고 candidate count 체크.
+
+**해결 — hover latch**:
+- `marker_hover_active_`가 latch된 후엔 `last_recorded_marker_id_`로 fix → 다음 tick에 마커가 안 보여도 hover 유지.
+- `populateMarkerInputs`가 marker_detected=false로 처리하지만 intent=MarkerHover면 `GuidedVelocityController::updateMarker`가 vy=0 안정 호버 명령 출력.
+
+---
+
+## 63. ArUco 마커가 검정 grid line에 닿아 인식 불가
+
+**증상**: 흰 배경 + 검정 라인 arena로 변경 후 ArUco DICT_4X4_50 마커 외곽 검정 quiet zone과 라인이 시각적으로 이어져 OpenCV가 contour 분리 실패.
+
+**해결**: 마커 plane(0.50×0.50 m) 아래에 더 큰 흰색 plane(0.60×0.60 m)을 z=0.001에 추가. 5 cm 흰색 margin이 라인과 마커 quiet zone을 명확히 구분. PNG는 건드리지 않고 SDF만 수정.
+
+---
+
+## 64. Snake alternation이 깨짐 — `직진→좌좌→직진→좌좌`
+
+**증상**: 정상은 `직진→좌좌→직진→우우→직진→좌좌...`이나 실제로 좌회전만 반복. column 2 끝 boundary에서 우회전 대신 좌회전.
+
+**원인**:
+- `SnakePlanner::planAtBoundary`에서 `snake_dir_ = chosen;`로 chosen-flipped 값을 덮어씀.
+- snake_dir_의 의미는 "snake의 alternation 기준 방향" — boundary에서 primary 방향에 branch가 없어 일시 flip한 chosen 값을 snake_dir_에 저장하면 다음 `notifySecondTurnCompleted()`의 flip이 잘못된 base에서 일어남.
+
+**해결**: `snake_dir_ = chosen;` 라인 제거. snake_dir_은 `notifySecondTurnCompleted`에서만 mutate되도록.
+
+---
+
+## 65. LineFollow / LaunchAlign이 yaw를 누적 drift시킴
+
+**증상**: 셀당 ±0.02-0.04 rad yaw drift 누적, 7-8셀 후 라인 이탈 → fallsafe.
+
+**원인**:
+- `GridControlMapper`의 LineFollow / LaunchAlign case가 `line_controller_->updateLine()` 결과를 그대로 사용.
+- `updateLine()`은 `yaw_rate = angle_yaw_kp · angle_error + offset_yaw_kp · offset_error` — LineDetector angle bias를 그대로 따라감.
+- LaunchAlign 1-2 s × line_controller yaw_rate → 한 사이클 동안 ±0.1-0.2 rad 흔들림. ForwardBlind가 복귀시키기엔 시간 부족.
+
+**해결 변천**:
+- Cycle 17: SnakeLaunchAlign 종료 시 `yaw_align_target_rad_ = wrap(*attitude_yaw)` re-latch 제거 (drift된 yaw가 새 target으로 freeze되는 것 차단). SnakeTurn90 / SnakeAdvanceOneCell 90° target을 `latched_yaw + dir·π/2`로 계산 (live attitude 아님). Turn90Again 완료 시 `yaw_align_target_rad_ = yaw_target_rad_` 갱신.
+- Cycle 18 (핵심): `GridControlMapper`의 LineFollow / LaunchAlign case에서 line_controller가 출력한 `sp.yaw_rate_rad_s`를 `computeYawRate(current, target)`으로 덮어쓰기. vy는 line_controller 그대로, yaw만 mission target lock. **이게 진짜 fix** — Cycle 17만으로는 LineFollow window에서 잔여 drift 누적 지속.
+
+**교훈**: line-following 컨트롤러의 yaw output을 mission 레이어가 신뢰하지 말 것. column heading 같은 mission-level invariant는 mission 자신이 lock해야 함.
+
+---
+
+## 66. Boundary 노드가 GCS에 commit 안 됨
+
+**증상**: 각 열의 마지막 (boundary) 노드 1개씩 GCS 그리드에 누락. 9-cell column에서 8개만 표시.
+
+**원인**:
+- `IntersectionDecision`이 `required_turn=true`인 boundary 교차점에선 state를 `NodeRecord` 거치지 않고 직접 `TurnConfirm/TurnReady`로 routing.
+- `handleSnakeForward`의 정규 arrival 경로(`nodeJustRecorded` 체크)는 false → commit_tracker_advance 미설정.
+- 워치독은 state=TurnReady에서 발사되지만 commit 블록이 없음.
+
+**해결**: 워치독 분기에도 정규 arrival과 동일한 commit 블록 추가. `in.node_event.valid`이면 peek event 사용, 아니면 synthetic GridNodeEvent를 합성 (cy가 turn_zone에는 들어왔지만 node_zone overlap 못 잡은 케이스 fallback).
+
+---
+
+## 67. 회전 직후 mapper의 LineFollow가 lateral bias를 그대로 따라감
+
+**증상**: ForwardBlind intent에서도 LineDetector의 작은 center bias 때문에 N/S 방향에 따라 일관된 좌/우 tilt 발생.
+
+**원인**: ForwardBlind는 yaw freeze + body forward만 명령했지만 lateral은 0 (보정 없음). LineDetector의 grid-frame bias 방향에 따라 라인 중심이 카메라 중심에서 벗어남.
+
+**해결**: ForwardBlind에서도 라인이 잡혔으면 `line_controller_->updateLine()`을 호출해 vy만 사용 (yaw_rate는 무시, mission이 직접 lock). `angle_error_rad=0`을 명시적으로 넘겨 yaw 영향 0. `populateLineInputs`가 이미 교차점 근처에서 line 입력을 null로 만들기 때문에 confident straight line일 때만 작동.
+
+---
+
+## 68. GCS 화살표가 cell 사이에서 표시 정확도 / s 위치 문제
+
+**경과**:
+- Cycle 13: 드론 sub-cell 위치 telemetry 송신 + GCS가 `canvasRow + round(frac_y * 2)` 형태로 화살표를 cell 사이에 표시. 자세한 진행도 표시.
+- Cycle 16: arena 변경(vertiport 진입 라인 제거)으로 `s` 표시 의미 없어짐 + sub-cell arrow 정확도가 LOCAL_NED drift에 민감 → 화살표는 항상 `current_coord_`의 캔버스 좌표에 표시. `s` 표시 제거.
+
+**교훈**: telemetry 표시 정확도는 보내는 신호의 안정성을 넘어설 수 없음. LOCAL_NED 1-cell 진행도는 분당 누적 optical flow drift 안에서 신뢰 가능한 신호.
+
+---
+
+## 69. GCS에 vertiport id=23이 미검출 상태에서 바로 표시됨
+
+**증상**: onboard 프로그램 시작 직후 GCS에 `[vertiport] id=23  vertiport (pending)`가 표시됨. 실제 버티포트 마커를 보기 전인데도 23이 먼저 뜸.
+
+**원인**:
+- onboard의 내부 미션 로직은 latched vertiport id가 없을 때 `config_.vertiport_marker_id`를 fallback으로 사용해야 안전함.
+- 그런데 telemetry용 public getter도 같은 fallback 함수를 타면서, 미검출 상태의 설정값 23이 GCS로 새어 나감.
+
+**해결**:
+- 내부 로직은 `effectiveVertiportMarkerId()` fallback 유지.
+- telemetry getter는 fallback 없이 실제 latched 값만 반환하도록 분리. 아직 본 적 없으면 `-1`.
+- GCS 표시는 `pending` / `verified` 문구를 제거하고, 실제 첫 vertiport detection id만 표시하도록 정리.
+
+---
+
+## 70. GCS Vision Log 3분할 창 크기 조절 + Windows `LoadCursorW` 빌드 실패
+
+**증상**:
+- Vision Log의 grid / marker / mission 로그 3칸 크기가 고정되어 현장 디버깅 시 불편.
+- Windows MinGW 빌드에서 `LoadCursorW(nullptr, IDC_SIZEWE)`가 `LPSTR` → `LPCWSTR` 변환 실패로 컴파일 에러.
+
+**원인**:
+- 기존 Win32 UI가 splitter drag 상태를 갖고 있지 않음.
+- MinGW 환경에서 `IDC_SIZEWE`, `IDC_SIZENS`, `IDC_ARROW` 매크로 타입이 wide API 인자와 맞지 않음.
+
+**해결**:
+- `VisionLogWindow`에 vertical / horizontal splitter drag 상태와 hit test 추가.
+- 마우스 드래그로 좌우 패널 폭과 상하 로그 높이를 조절.
+- cursor 로딩은 integer resource id + `MAKEINTRESOURCEW(...)`를 사용해 `LoadCursorW` 타입 문제 해결.
+
+---
+
+## 71. Snake 완료 시 남은 열 synth가 현재 위치까지 이동시킴
+
+**증상**: 마지막 마커를 예를 들어 `(-4,-7)`에서 발견했는데, grid 완성을 위해 남은 열을 채운 뒤 GCS current가 `(-4,-8)`처럼 열 끝으로 이동해 보임. 실제 드론은 움직이지 않았음.
+
+**원인**:
+- 닫힌 직사각형 grid를 만들기 위한 synthetic node가 실제 tracker advance처럼 처리되어 current pose까지 갱신.
+- grid map completion과 drone current pose가 같은 이벤트 경로를 공유하고 있었음.
+
+**해결**:
+- 남은 열을 채우는 synthetic `GridNodeEvent`에 `updates_current=false`, `origin_local_only=true`를 부여.
+- `SnakeComplete`에서 pending synthetic event를 한 tick씩 drain하되, tracker의 현재 좌표/방향은 마지막 실제 위치로 유지.
+
+**교훈**: map topology 보강 이벤트와 vehicle pose 이벤트는 같은 grid node라도 의미가 다르다.
+
+---
+
+## 72. ForwardBlind 중 yaw는 고정되지만 N/S 방향별 lateral drift 발생
+
+**증상**: yaw는 mission target에 잘 lock되어 있는데, north/south 진행 방향에 따라 라인 중심에서 한쪽으로 비껴가는 경향이 생김.
+
+**원인**:
+- `ForwardBlind`는 vx + yaw lock만 내고 `vy_right_mps=0`.
+- LineDetector의 body-frame center bias가 heading에 따라 grid frame에서 반대 방향 lateral drift로 나타남.
+- 기존의 짧은 LineFollow window만으로는 셀 전체 구간의 lateral 오차를 충분히 누르지 못함.
+
+**해결**:
+- `ForwardBlind`에서도 라인이 검출되면 line controller를 호출하되 `angle_error_rad=0.0`으로 고정.
+- line controller 결과 중 `vy_right_mps`만 사용하고 yaw는 mission-level `target_yaw_rad`로 계속 lock.
+- 교차점 근처는 기존 `populateLineInputs` freeze가 line error를 0으로 만들기 때문에 옆 가지에 끌려갈 위험을 낮춤.
+
+---
+
+## 73. 마커 hover가 마커 중심에서 충분히 맞지 않고 착륙 위치가 밀림
+
+**증상**: 마지막 마커 발견 후 3초 hover 후 착륙하는데, 체감상 마커 중심보다 50 cm 정도 벗어나서 내려앉음.
+
+**원인**:
+- 마커 hover는 이미 3초 타이머로 유지되고 있었지만, hover 중 marker center error를 적극적으로 줄이는 품질이 중요했음.
+- yaw는 mission target으로 유지해야 하고, 마커 방향/회전각을 따라 yaw를 돌리면 실전에서 마커 부착 방향에 의존하게 됨.
+
+**해결**:
+- `MarkerHover`는 ArUco center error x/y로 평행 이동 보정.
+- yaw는 마커 orientation이 아니라 mission target yaw로 고정.
+- `markerHoverComplete()`는 `snake_marker_hover_s` 기준으로 3초 유지. 마지막 발견 마커가 재방문 1순위여도 revisit leg에서 다시 한 번 target marker로 3초 hover.
+
+**교훈**: 마커 hover align은 marker orientation이 아니라 marker center 기준이어야 실전 배치 방향에 독립적이다.
+
+---
+
+## 74. 탐색 속도 상향 후 일반 노드 dwell 때문에 overshoot / align 시간이 늘어남
+
+**증상**:
+- forward 속도를 올리면 전체 시간은 줄지만, 매 일반 노드마다 정지 dwell을 하면서 overshoot가 커지고 다시 교차점 align에 시간이 듦.
+- marker 없는 중간 노드에서 멈추는 시간이 탐색 시간의 큰 비중을 차지.
+
+**원인**:
+- 모든 노드를 같은 방식으로 `SnakeRecordNode` dwell 처리.
+- 일반 통과 노드와 boundary / turn / marker node를 구분하지 않음.
+
+**해결**:
+- 기존 dwell 경로는 유지해 현장 fallback 가능하게 둠.
+- `snake_passthrough_regular_nodes` 분기 추가: marker hint가 없고, turn 후보가 아니고, forward branch가 열린 일반 노드는 정지 없이 통과.
+- marker가 보이거나 boundary / turn node면 기존처럼 정지, branch 판별, marker hover를 수행.
+
+**교훈**: 속도 개선은 forward m/s보다 "정지해야 하는 노드"를 줄이는 효과가 더 크다.
+
+---
+
+## 75. Snake 이후 마커 재방문을 별도 프로그램으로 나눌지 여부
+
+**문제**: line tracing / snake / revisit를 별도 프로그램으로 쪼개면 테스트는 쉬울 수 있지만, 실제 운용 목표는 onboard + GCS 두 프로그램만 사용하는 것.
+
+**결론**:
+- 새 프로그램을 만들지 않고 `grid_mission_node`를 확장.
+- snake가 만든 `MarkerRegistry`와 `GridMapTracker`를 그대로 재사용.
+- `MarkerRevisitPlanner`로 asc/desc target order와 Manhattan leg를 생성.
+- 회전, passthrough, marker hover는 snake 단계의 기존 state / helper를 최대한 재사용.
+
+**GCS 표시**:
+- marker list 시간을 `found=` / `revisited=`로 구분.
+- 현재 재방문 target은 `[>]`, 완료 marker는 `[x]`로 표시.
+- Mission summary에 revisit 성공 여부를 `marker_revisit`로 추가.
+
+---
+
+## 76. Revisit 중 경로 위의 다른 마커 처리
+
+**질문**: 현재 target이 아닌 마커가 재방문 경로 위에 있으면 hover하는가?
+
+**코드 기준 동작**:
+- `RevisitForward`는 교차점 통과와 좌표 advance만 처리.
+- `RevisitMarkerHover`에서만 `revisit_current_marker_id_`를 `focus_id`로 잡고 marker hover / markRevisited를 수행.
+- 따라서 경로 중간에 보이는 다른 ArUco는 telemetry에는 보일 수 있지만 미션 제어상 무시하고 지나감.
+
+**의도**: desc/asc 순서 보장을 위해 target marker에 도착했을 때만 hover/visited 처리.
+
+---
+
+## 77. 재방문 완료 후 버티포트 복귀 / 착륙 단계
+
+**요구**: 전체 미션을 `snake 탐색 -> marker revisit -> (0,0) 복귀 -> vertiport 복귀 -> 착륙 -> 종료`로 확장.
+
+**구현 방향**:
+- revisit planner의 Manhattan leg 생성 로직을 재사용해 현재 위치에서 `(0,0)`까지 복귀.
+- `(0,0)`에서 grid 기준 south를 바라보도록 회전.
+- grid를 벗어나는 순간 GCS grid map의 current arrow는 숨김.
+- 라인 추적은 끄고 yaw freeze + forward blind로 vertiport marker id가 보일 때까지 전진.
+- vertiport marker가 잡히면 marker center hover 후 land.
+
+**Failsafe**:
+- 버티포트 복귀 forward / hover timeout은 진입 단계와 같은 `entry_forward_timeout_s` 계열을 사용.
+- active vertiport id가 없거나 제한 시간 안에 찾지 못하면 emergency land.
+
+---
+
+## 78. 새 edge-case world에서 Gazebo camera frame timeout
+
+**증상**: `grid_arena_edge_case_test.sh`로 새 world를 띄운 뒤 기존 명령 `--world grid`로 실행하면 `[vision] read failed: timed out waiting for Gazebo camera frame` 반복.
+
+**원인**:
+- onboard의 Gazebo camera source는 `--world grid`일 때 기존 `/world/grid_arena_test_world/...` topic을 구독.
+- 새 SDF 내부 world name을 새 이름으로 바꾸면 Gazebo camera topic도 달라져 기존 `--world grid` 경로와 불일치.
+
+**해결**:
+- course file / script 이름은 `grid_arena_edge_case_test_world`로 새로 두되, SDF 내부 `<world name>`은 기존 topic과 맞게 유지.
+- 새 3x3 edge-case arena는 기존 camera / drone 조건을 보존하고 marker 배치만 변경.
+
+**교훈**: Gazebo의 file name과 internal world name은 별개다. runtime topic은 internal world name을 따른다.
+
+---
+
+## 79. `(0,0)` 원점에 있는 ArUco marker가 저장되지 않음
+
+**증상**: edge-case arena에서 id=3 marker를 `(0,0)`에 배치하면 grid 진입과 snake 출발은 정상인데, id=3이 registry에 저장되지 않음.
+
+**원인**:
+- grid entry flow는 `ENTRY_CENTER_ORIGIN -> latchGridOrigin -> SNAKE_LAUNCH_ALIGN`으로 바로 넘어감.
+- 원점은 이미 "시작 노드"로 처리되므로 일반 `SnakeRecordNode` marker registration 경로를 타지 않음.
+
+**해결**:
+- `EntryOriginMarkerHover` 상태 추가.
+- `ENTRY_CENTER_ORIGIN`에서 원점 정렬이 끝난 직후 stable non-vertiport marker가 있으면 `(0,0)` marker로 register.
+- 원점을 다음 노드로 착각하지 않도록 node advance는 하지 않고, marker만 registry에 붙인 뒤 3초 hover 후 `SnakeLaunchAlign`로 진행.
+- hover 전후 `marker_window_`를 clear해 원점 marker가 다음 노드에 stale하게 붙지 않도록 함.
+
+---
+
+## 80. 두 번째 회전 노드 marker hover 중 yaw가 이전 방향으로 돌아감
+
+**증상**: 두 번째 회전 노드에 marker가 있으면 marker hover 중 yaw가 이전 column 방향으로 돌아갔다가, 이후 `SNAKE_TURN_90_AGAIN`에서 다시 180도 가까이 도는 이상 동작.
+
+**원인**:
+- `handleTurnNodeMarkerHover()`가 항상 `yaw_align_target_rad_`를 hover target yaw로 사용.
+- 두 번째 turn-cell marker hover 시점에는 connector heading을 유지해야 하는데, `yaw_align_target_rad_`에는 이전 column heading이 남아있음.
+- `MarkerHover` intent는 yaw도 target으로 제어하므로 hover 중 실제로 기체가 돌아감.
+
+**해결**:
+- marker hover 진입 시점에 `pending_post_hover_yaw_target_rad_`를 latch.
+- 첫 boundary marker hover는 기존 column yaw를 유지.
+- 두 번째 turn-cell marker hover는 second-turn target을 계산하기 전 connector yaw를 latch해 hover 동안 유지.
+- hover 종료 후에만 다음 yaw turn 단계로 진행.
+
+---
+
+## 81. Marker orientation을 align 기준으로 쓰면 실전 배치 방향에 의존
+
+**질문**: 마커 hover / align이 marker 방향 기준이면, 현장에 마커가 아무 방향으로 붙어 있을 때 문제가 되지 않는가?
+
+**확인 결과**:
+- 현재 marker hover 제어는 ArUco orientation을 yaw 기준으로 쓰지 않음.
+- `populateMarkerInputs`는 marker center pixel error x/y만 control input으로 전달.
+- yaw는 mission target yaw로 lock된다.
+- registry에는 orientation을 기록하지만, 이동/hover 제어의 기준은 아님.
+
+**교훈**: orientation은 telemetry/debug metadata로만 두고, 제어는 center + mission yaw 기준으로 유지하는 편이 실전 배치에 강하다.
+
+---
+
+## 82. Revisit order 기본값과 CLI 옵션
+
+**요구**: 앞으로 항상 marker revisit까지 수행하므로 `--revisit-order none`은 제거하고, 옵션 생략 시 desc가 기본이 되게 함.
+
+**해결**:
+- config 기본값을 `RevisitOrder::Desc`로 유지.
+- CLI는 `--revisit-order asc|desc`만 받도록 정리.
+- README에 기본 desc 실행 예시와 asc 예시를 추가.
+
+**운용 메모**:
+- 기본 실행은 `--revisit-order` 생략 가능.
+- 오름차순 테스트 때만 `--revisit-order asc`를 명시.
+
+---
