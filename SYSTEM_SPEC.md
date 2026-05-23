@@ -1,6 +1,6 @@
 # Astroquad System Spec
 
-최종 업데이트: 2026-05-21
+최종 업데이트: 2026-05-23
 
 이 문서는 `uav-onboard`와 `uav-gcs`를 모두 포함하는 전체 시스템 기준
 문서다. Repo별 세부 책임과 실행 방법은 각 repo의 `PROJECT_SPEC.md`와
@@ -28,9 +28,11 @@ C++ 기반 시스템이다.
 
 - Vision/GCS path는 재사용 가능한 라이브러리로 분리되어 있다.
 - `line_follow_node`는 SITL 및 guarded Pixhawk1 line-follow staging을 담당한다.
-- `grid_mission_node`는 현재 grid arena snake mission SITL staging의 중심이다.
-- 최종 실행 파일 목표는 여전히 `uav_onboard`와 `uav_gcs`지만, 두 target은
-  아직 final mission/dashboard composition root가 아니다.
+- `astroquad-onboard`는 현재 grid arena snake mission의 온보드 메인
+  runtime이다.
+- `grid_mission_node`는 `astroquad-onboard`와 같은 entrypoint를 빌드하는
+  compatibility/staging alias다.
+- `astroquad-gcs`는 현재 GCS 메인 UI다.
 
 ## 2. 하드웨어 기준
 
@@ -67,10 +69,11 @@ Current executables:
 
 | Executable | Current role |
 |---|---|
-| `uav_onboard` | Basic telemetry sender; final onboard composition root target. |
+| `astroquad-onboard` | Current full grid-arena snake mission runtime. |
+| `grid_mission_node` | Compatibility/staging alias for `astroquad-onboard`. |
+| `uav-onboard-telem` | Basic telemetry sender / development probe. |
 | `vision_debug_node` | Vision/GCS bring-up and tuning. |
 | `line_follow_node` | Short line-follow SITL/guarded real Pixhawk1 staging. |
-| `grid_mission_node` | Current grid arena snake mission SITL staging. |
 | `mavlink_probe` | No-arm Pixhawk/MAVLink/local-estimate probe. |
 | `mavlink_motor_test` | Props-removed low-throttle motor command check. |
 | `video_streamer` | Raw MJPEG transport smoke tool. |
@@ -78,10 +81,16 @@ Current executables:
 Current grid mission command:
 
 ```bash
-./build/grid_mission_node --config config --target sitl --vision gazebo \
+./build/astroquad-onboard --config config --target sitl --vision gazebo \
   --world grid --line-mode dark_on_light --marker-count 4 \
   --video --gcs-ip <windows-gcs-ip>
 ```
+
+Current entrypoint structure:
+
+- `src/main.cpp` is a thin launcher for `onboard::app::AstroquadOnboardApp`.
+- `src/app/AstroquadOnboardApp.*` owns the grid mission composition root.
+- `src/app/GcsTelemetryPublisher.*` owns GCS telemetry/debug-video publishing.
 
 ### uav-gcs
 
@@ -99,16 +108,23 @@ Current executables:
 
 | Executable | Current role |
 |---|---|
-| `uav_gcs` | Basic telemetry receiver; final GCS composition root target. |
-| `uav_gcs_vision_debug` | Current primary monitoring UI. |
-| `uav_gcs_video` | Raw MJPEG viewer. |
+| `astroquad-gcs` | Current primary GCS UI: telemetry, video, overlays, grid/mission logs. |
+| `uav-gcs-telem` | Telemetry-only console receiver / development probe. |
+| `uav-gcs-video` | Raw MJPEG viewer. |
 | `mock_onboard`, `log_replayer` | Development tools. |
 
 Windows Ninja example:
 
 ```powershell
-.\build\uav_gcs_vision_debug.exe --config config
+.\build\astroquad-gcs.exe --config config
 ```
+
+Current entrypoint structure:
+
+- `src/main.cpp` is a thin launcher for `gcs::app::AstroquadGcsApp`.
+- `src/app/AstroquadGcsApp.*` owns GCS UI/log orchestration.
+- `src/app/TelemetryWorker.*` and `src/app/VideoReceiveWorker.*` own receive
+  worker threads.
 
 ## 4. 모듈 경계
 
@@ -126,7 +142,7 @@ FrameSource
 
 Support:
   SafetyMonitor observes Vision/Mission/Autopilot/GCS state
-  VisionDebugPublisher sends telemetry/debug video
+  GcsTelemetryPublisher sends telemetry/debug video
   GCS observes telemetry/video only
 ```
 
@@ -214,8 +230,9 @@ Current safety boundary:
 - `line_follow_node` has guarded Pixhawk1 serial support with no-arm smoke,
   RC/local-estimate gates, and explicit `--allow-arm-takeoff`.
 - `mavlink_probe` and `mavlink_motor_test` support bench verification.
-- `grid_mission_node --target pixhawk1` is not enabled for real arm/takeoff;
-  use `--no-arm` smoke only.
+- `astroquad-onboard --target ardupilot_serial --allow-arm-takeoff` has guarded
+  serial support and uses RC/local-estimate preflight gates.
+- `grid_mission_node` builds the same runtime as a compatibility alias.
 
 Fallback `ALT_HOLD + RC_CHANNELS_OVERRIDE` remains a design option, but current
 implemented mission paths use GUIDED velocity/local setpoints.
@@ -248,7 +265,8 @@ Important current telemetry:
 - `debug.note`
 
 `vision.grid_node` means the latest committed onboard grid node. In
-`grid_mission_node`, it is resent every frame for UDP loss tolerance.
+`astroquad-onboard`/`grid_mission_node`, it is resent every frame for UDP loss
+tolerance.
 
 ## 8. Gazebo/SITL 기준
 
@@ -263,12 +281,12 @@ Grid mission loop:
 
 ```bash
 # Windows
-.\build\uav_gcs_vision_debug.exe --config config
+.\build\astroquad-gcs.exe --config config
 
 # WSL
 WINDOWS_GCS_IP="$(ip route | awk '/default/ {print $3; exit}')"
 cd ~/astroquad/uav-onboard
-./build/grid_mission_node --config config --target sitl --vision gazebo \
+./build/astroquad-onboard --config config --target sitl --vision gazebo \
   --world grid --line-mode dark_on_light --marker-count 4 \
   --video --gcs-ip "$WINDOWS_GCS_IP"
 ```
@@ -292,16 +310,15 @@ Implemented:
 - MAVLink UDP and serial transports.
 - Pixhawk no-arm probe and props-removed motor test tools.
 - `line_follow_node` startup/flight/landing video path.
-- Grid arena Gazebo world and `grid_mission_node` SITL staging.
+- Grid arena Gazebo world and `astroquad-onboard` SITL mission runtime.
 - Grid mission entry centering, hop-distance gating, strict snake alternation,
   and sliding marker commit window.
 
 Staging / not final:
 
-- `uav_onboard` final mission composition root.
-- `uav_gcs` final dashboard composition root.
-- Grid mission real Pixhawk arm/takeoff.
-- Structured GCS mission-state telemetry from `grid_mission_node`.
+- `grid_mission_node` remains as compatibility/staging alias.
+- Full GCS dashboard framework and command sender.
+- Structured GCS mission-state telemetry from `astroquad-onboard`.
 - GCS command channel.
 - Marker reverse revisit.
 - Return-home and official coordinate conversion.
@@ -318,8 +335,8 @@ Before real autonomous flight:
 - Manual hover and RC takeover must be confirmed.
 - `line_follow_node --mavlink-smoke` and `mavlink_probe --strict-local-estimate`
   must pass.
-- `grid_mission_node` real arm/takeoff remains closed until SITL mission and
-  no-arm serial smoke are deliberately promoted.
+- `astroquad-onboard` real arm/takeoff requires `--allow-arm-takeoff` and must
+  remain behind the same RC/local-estimate/bench verification gates.
 
 ## 11. 문서 역할
 
