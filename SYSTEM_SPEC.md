@@ -82,7 +82,7 @@ Current grid mission command:
 
 ```bash
 ./build/astroquad-onboard --config config --target sitl --vision gazebo \
-  --world grid --line-mode dark_on_light --marker-count 4 \
+  --world grid --line-mode light_on_dark --marker-count 4 \
   --video --gcs-ip <windows-gcs-ip>
 ```
 
@@ -176,7 +176,7 @@ Current grid mission is designed for the Gazebo grid arena:
 
 - 3m x 3m vertiport at origin with ArUco ID 23.
 - No line from vertiport to grid.
-- 5 x 8 grid cells, 3m cell size, dark lines on light ground.
+- 5 x 8 grid cells, 3m cell size, white lines on grass.
 - Four grid ArUco markers expected by default.
 
 State flow:
@@ -287,7 +287,7 @@ Grid mission loop:
 WINDOWS_GCS_IP="$(ip route | awk '/default/ {print $3; exit}')"
 cd ~/astroquad/uav-onboard
 ./build/astroquad-onboard --config config --target sitl --vision gazebo \
-  --world grid --line-mode dark_on_light --marker-count 4 \
+  --world grid --line-mode light_on_dark --marker-count 4 \
   --video --gcs-ip "$WINDOWS_GCS_IP"
 ```
 
