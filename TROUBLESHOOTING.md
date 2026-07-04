@@ -2865,3 +2865,96 @@ EMA 필터와 독립적으로 기체 프레임 가속도를 제한한다. 기본
 - 오름차순 테스트 때만 `--revisit-order asc`를 명시.
 
 ---
+
+## 83. [백필] 2026-05-23 이후 공백 요약 — 하드웨어 전면 업그레이드와 플랫폼 정합화
+
+**배경**: 개발로그가 2026-05-23에 멈춘 사이 코드 저장소(`uav-onboard`)는
+2026-07-03까지 계속 진행됐다(실비행 EKF/GUIDED 브링업, safety, PI control,
+RC-override 실험). 이 엔트리는 그 공백과 2026-07-04 정합화 작업을 요약한다.
+
+**그 사이 일어난 일**:
+- 1차 예선 통과. 지원금으로 하드웨어 전면 교체:
+  Pixhawk 1(fmuv2) → **Pixhawk 6C Mini**, Pi 4 → **Pi 5 (4GB)**,
+  IMX519 → **IMX296 모노 글로벌셔터(고정초점 CS-mount)**,
+  3S/1.5kg → **4S/약 2.1kg** (S500 V2, X2212 980KV, 9450 프롭, 35A BLHeli_S
+  OPTO, BEC12S-PRO). MTF-01은 유지.
+- 경기장 확정: 실내, 잔디 위 10cm 흰 라인 3m 그리드 (= 시뮬 기본 월드와
+  동일 극성). 마커는 50cm, 흰 패드 위 배치.
+- 실기체에서 발견된 비전 문제: 잔디 위 ArUco 오검출, 마커 주변 흰 패드가
+  라인 contour로 유입. → 원인 분석 결과 (a) 절대 HSV 임계값(white_fill)의
+  조명 취약성, (b) 마커 차폐가 흰 패드(quiet zone)를 안 덮음, (c) ArUco
+  템플릿/밝은-blob 폴백 경로의 약한 수락 기준이 주범으로 특정됨.
+
+**2026-07-04 정합화 (코드/설정/문서)**:
+- 설정 우선순위 버그 수정: `AstroquadOnboardApp.cpp`의 하드코딩 게인 블록
+  삭제 → `mission.toml [line_controller]/[altitude_hold]`가 실제 소스가 됨
+  (우선순위: 컴파일 기본 < mission.toml < 런타임 프로파일 < CLI).
+- `config/pixhawk6c_indoor_flow.params` + `.expected.toml` 신규 작성
+  (구 fmuv2 파일은 SUPERSEDED 표기). 4S 배터리 임계값, ELRS CRSF 네이티브
+  RC(RC_CHANNELS 게이트), MTF-01 TELEM1, 컴퍼스 리스크 완화 절차 포함.
+- `vision.toml` IMX296 1단계 전환: 센서명/해상도(1456×1088), 포커스 제어
+  삭제, AE 잠금 절차 주석, `marker_size_mm` 80→500.
+- rpicam 디코드 `IMREAD_GRAYSCALE` 전환 + Gazebo L8 모노 패스스루 —
+  파이프라인 그레이 네이티브화(검출기는 1채널 이미 지원).
+- 아키텍처 결정 기록(`ARCHITECTURE_OVERVIEW.md`): GUIDED 단일 제어 경로,
+  RC-override 폐기, PX4/ROS 2/BT 마이그레이션 기각과 재검토 조건.
+- 문서 전면 갱신: README/PROJECT_SPEC×2/PROTOCOL v1.9×2/SYSTEM_SPEC/
+  sim README(SITL 역학 fidelity 주의).
+
+**남은 리스크 (신규 식별)**: 렌즈 FOV 미실측, Pi5 UART 경로 미확정,
+BEC 5V 전원 예산 미검증, 외장 컴퍼스 부재(최대 추정 리스크), AE 헌팅,
+마커 상실 후 패드 잔존 차폐, 재방문 순서 규정 확인 필요.
+
+---
+
+## 84. 비전 강건화 + 안전/구조 정리 (2026-07-04, 실촬영 데이터 확보 전 데스크 작업)
+
+**작업 내용**:
+
+1. **마커 차폐 확장 (`LineMaskBuilder`)** — 마커 주변 흰 패드(quiet zone)가
+   라인/교차점 검출 오염원이 되는 문제의 수정:
+   - 차폐 폴리곤을 중심 기준 `marker_occlusion_scale`(기본 1.7, vision.toml)로
+     팽창해 패드 링까지 소거.
+   - 차폐 입력을 프레임별 신규 검출에서 **stabilizer 유지 마커**(age ≤
+     detect_interval×2)로 교체 — ArUco 스킵 프레임(3프레임 간격)과 프레임
+     가장자리 이탈 직후에도 차폐 유지(TTL).
+   - 마커 폴리곤 차폐를 전 극성에 적용(기존엔 dark_on_light에서 통째 비활성).
+     휴리스틱 사각형 후보 검출기만 dark_on_light에서 계속 비활성.
+   - dark 마스크에도 차폐 적용(마커 검은 본체는 dark 마스크의 오염원).
+2. **ArUco 오검출 게이팅 (`ArucoDetector`)**:
+   - 템플릿 매칭 폴백과 밝은-blob ROI 스윕을 config 플래그 뒤로 이동,
+     **기본 off** (`template_fallback_enabled`, `bright_roi_fallback_enabled`).
+     잔디 텍스처 오검출의 주범. 실측 코퍼스에서 기본 검출기가 실마커를
+     놓칠 때만 재활성.
+   - 기본(primary) 검출 경로에 형태/명암 타당성 검사 추가
+     (`markerContrastLooksPlausible`: 종횡비 + 어두운 비트 비율 ≥0.35).
+     크기 밴드는 의도적으로 제외 — vertiport 마커는 호버 고도에서 프레임을
+     가득 채우므로 기존 `markerShapeLooksPlausible`의 max-size 검사를 primary에
+     그대로 적용하면 MARKER_LOCK_YAW가 깨짐.
+   - **잠복 버그 수정**: `isLiveFrameSize` 임계 1000 → 1200. IMX296 네이티브
+     1456×1088이 "recorded"로 오분류되면 무제한 폴백 스윕이 매 프레임 돌아
+     Pi에서 CPU 폭주였음.
+3. **line-lost 감시 재활성 시도 → 근거 기반 회귀(revert)**:
+   - SNAKE/REVISIT/RETURN 전진 상태에서 line-lost 타임아웃(2s)을 상태 인지형으로
+     강제해 봄 → SITL 2회 연속, 첫 홉 진입 ~2s 시점(t≈25.8s)에서 **결정적으로**
+     EMERGENCY_LAND. 그리드 홉은 설계상 `fwd_blind`(요 고정 + 블라인드 전진 +
+     기회적 라인 센터링)라 홉 초반 수 초의 라인 부재가 정상.
+   - 결론: 그리드 임무에서 라인 상실의 방어선은 hop-distance 페일세이프
+     (`hop_max_distance_m`)이며 line-lost 타임아웃은 연속 라인 추종 임무
+     전용. 강제는 되돌리고, "무언의 비활성"이던 것을 코드 주석으로 명시적
+     설계 결정으로 문서화.
+4. **죽은 코드 삭제**: `grid_mission_node`(바이트 동일 중복 바이너리) 제거,
+   `LineDetector.cpp`의 레거시 마스크 빌더 클러스터(`buildMasks` + 전용 헬퍼
+   ~160줄, LineMaskBuilder와 auto 모드 처리가 달랐던 중복 구현) 삭제.
+   마스크 구현은 LineMaskBuilder 단일화.
+5. **회귀 인프라**: `scripts/sitl_mission_regression.sh` 신규 — 헤드리스
+   Gazebo+SITL+onboard 전체 임무 자동 실행 + 기계 판정(MISSION_COMPLETE 도달,
+   EMERGENCY_LAND 0회, regids 완비, 정상 disarm). 단위 테스트
+   `test_line_mask_strategies` 신규(모노 white_fill 폴백, 조명 그래디언트에서
+   local_contrast 우위, 패드 차폐 스케일 검증). 총 18/18 통과.
+
+**중요 관찰 — SITL 회귀는 비결정적**: 동일 환경에서 클린 HEAD도 실패
+양상이 달랐음(런1: 51노드까지 진행 후 max_intersections + 마커 2,3 미발견 /
+런2: 첫 홉 hop_distance_exceeded). EKF 광류 드리프트·타이밍 변동이 원인으로
+추정. 단일 런 실패로 회귀 판정하지 말고 복수 런으로 비교할 것. GUI 환경
+(팀원 로컬)과 헤드리스 환경의 통과율 차이도 확인 필요.

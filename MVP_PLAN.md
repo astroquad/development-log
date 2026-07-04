@@ -2,6 +2,12 @@
 
 최종 업데이트: 2026-05-15
 
+> **주의 (2026-07-04)**: 이 문서는 구 플랫폼(Pixhawk 1 / Raspberry Pi 4 /
+> IMX519 / 3S 1.5kg) 기준으로 작성된 과거 계획이다. 1차 예선 통과 후
+> 하드웨어가 전면 교체되었다(Pixhawk 6C Mini / Pi 5 / IMX296 mono GS /
+> 4S 2.1kg). 현행 기준은 `SYSTEM_SPEC.md` §2와
+> `uav-onboard/config/pixhawk6c_indoor_flow.params`를 따른다.
+
 이 문서는 72시간 실기체 MVP와 1주일 기술개발계획서 작성 계획을 관리한다. 전체 시스템 기준은 `SYSTEM_SPEC.md`를 따른다.
 
 ## 1. 현재 MVP 범위

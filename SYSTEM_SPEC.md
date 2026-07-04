@@ -1,6 +1,6 @@
 # Astroquad System Spec
 
-최종 업데이트: 2026-05-23
+최종 업데이트: 2026-07-04 (1차 예선 통과 후 하드웨어 전면 업그레이드 반영)
 
 이 문서는 `uav-onboard`와 `uav-gcs`를 모두 포함하는 전체 시스템 기준
 문서다. Repo별 세부 책임과 실행 방법은 각 repo의 `PROJECT_SPEC.md`와
@@ -27,26 +27,31 @@ C++ 기반 시스템이다.
 현재 구현 기준:
 
 - Vision/GCS path는 재사용 가능한 라이브러리로 분리되어 있다.
-- `line_follow_node`는 SITL 및 guarded Pixhawk1 line-follow staging을 담당한다.
+- `line_follow_node`는 SITL 및 guarded ArduPilot serial line-follow staging을
+  담당한다 (RC-override 백엔드는 폐기됨 — 축소/은퇴 예정).
 - `astroquad-onboard`는 현재 grid arena snake mission의 온보드 메인
   runtime이다.
-- `grid_mission_node`는 `astroquad-onboard`와 같은 entrypoint를 빌드하는
-  compatibility/staging alias다.
 - `astroquad-gcs`는 현재 GCS 메인 UI다.
 
 ## 2. 하드웨어 기준
 
+2026-07 업그레이드 플랫폼 (1차 예선 통과 지원금으로 전면 교체, 이륙중량 약
+2.1 kg). FC 파라미터 타깃: `uav-onboard/config/pixhawk6c_indoor_flow.params`.
+구 플랫폼(Pixhawk 1 / Pi 4 / IMX519 / 3S / 1.5 kg)은 퇴역.
+
 | 모델/장치 | 연결 위치 | 역할 |
 |---|---|---|
-| Pixhawk1 | 기체 중앙 | 비행 제어기. 자세 안정화, 모터 출력, 센서 융합, 모드 관리 |
-| MicoAir MTF-01 Optical Flow & Range Sensor | Pixhawk TELEM2 또는 SERIAL4/5 | GPS 없이 수평 이동 추정 + 바닥 거리 측정 |
-| Raspberry Pi 4 | Pixhawk USB 또는 TELEM1 | OpenCV 비전, mission state, MAVLink command sender |
-| IMX519 Camera | Raspberry Pi CSI | 하향 영상 입력 |
-| Power Module | Pixhawk POWER | 배터리 전압/전류 측정 |
-| RC Receiver / RC path | Pixhawk RC IN 또는 운용 중인 RC 경로 | 수동 takeover, 비상 개입 |
-| ESC/Motor/PDB | Pixhawk MAIN OUT + 전원분배 | 실제 모터 구동 |
-| TFmini Plus | 기본 구성 제외 | MTF-01 range가 불안정할 때 예비 rangefinder |
-| External Compass | 제외 | 초기 기준은 Pixhawk 내부 compass/IMU |
+| Holybro Pixhawk 6C Mini (ArduCopter) | 기체 중앙 | 비행 제어기. 자세 안정화, 모터 출력, EKF3 센서 융합, 모드 관리 |
+| MicoAir MTF-01 Optical Flow & Range Sensor | FC TELEM1 (MAVLink) | GPS 없이 수평 속도 추정 + 바닥 거리 측정 (내장 TOF rangefinder 겸용) |
+| Raspberry Pi 5 (4 GB, Active Cooler) | FC USB 또는 UART | OpenCV 비전, mission state, MAVLink command sender |
+| Raspberry Pi Global Shutter Camera (IMX296 mono) | Raspberry Pi CSI | 하향 영상 입력. 모노 글로벌셔터, 고정초점 CS-mount (렌즈 FOV 실측 필요) |
+| Holybro S500 V2 frame kit + companion plate | — | 기체 프레임 |
+| Sunnysky X2212 980KV CW/CCW + Tarot 9450 folding props | FC MAIN OUT → ESC | 추진계. 2.1 kg에서 호버 스로틀 약 55–62% 예상 (호버 로그로 확인) |
+| GT-Drone 35A BLHeli_S OPTO ESC (2S–5S) | PDB | 모터 구동 (OPTO: ESC 텔레메트리 없음 → 노치필터는 스로틀 기반) |
+| 4S LiPo (Pollyttronics PT-B8000-FX35, XT90S) | PDB/Power Module | 주 전원. 저전압 기준 14.0V (BATT_LOW_VOLT), 아밍 최소 14.8V |
+| Matek BEC12S-PRO | 배터리 → Pi 5 | 컴패니언 5V 전원. Pi 5 + 카메라 피크 부하 검증 필요 (미검증 리스크) |
+| ELRS RC Receiver (BETAFPV Nano 2400, CRSF) | FC TELEM2 (SERIAL2_PROTOCOL=23) | 수동 takeover, 비상 개입. RC_CHANNELS 네이티브 인식 필수 |
+| External Compass | 미장착 (권장: 마스트 장착 검토) | 내장 컴퍼스는 4S PDB/ESC 인접 — COMPASS_MOT 캘리브레이션 + 경기장 현지 캘리브레이션 필수 |
 
 ## 3. Repo 역할
 
@@ -70,10 +75,9 @@ Current executables:
 | Executable | Current role |
 |---|---|
 | `astroquad-onboard` | Current full grid-arena snake mission runtime. |
-| `grid_mission_node` | Compatibility/staging alias for `astroquad-onboard`. |
 | `uav-onboard-telem` | Basic telemetry sender / development probe. |
 | `vision_debug_node` | Vision/GCS bring-up and tuning. |
-| `line_follow_node` | Short line-follow SITL/guarded real Pixhawk1 staging. |
+| `line_follow_node` | Short line-follow SITL/guarded ArduPilot serial staging (RC-override backend retired). |
 | `mavlink_probe` | No-arm Pixhawk/MAVLink/local-estimate probe. |
 | `mavlink_motor_test` | Props-removed low-throttle motor command check. |
 | `video_streamer` | Raw MJPEG transport smoke tool. |
@@ -82,7 +86,7 @@ Current grid mission command:
 
 ```bash
 ./build/astroquad-onboard --config config --target sitl --vision gazebo \
-  --world grid --line-mode dark_on_light --marker-count 4 \
+  --world grid --line-mode light_on_dark --marker-count 4 \
   --video --gcs-ip <windows-gcs-ip>
 ```
 
@@ -176,7 +180,8 @@ Current grid mission is designed for the Gazebo grid arena:
 
 - 3m x 3m vertiport at origin with ArUco ID 23.
 - No line from vertiport to grid.
-- 5 x 8 grid cells, 3m cell size, dark lines on light ground.
+- 5 x 8 grid cells, 3m cell size, white 10cm lines on grass (matches the
+  real-field polarity; the black-line variant is the edge-case world).
 - Four grid ArUco markers expected by default.
 
 State flow:
@@ -223,19 +228,20 @@ Primary:
 Implemented transports:
 
 - SITL/Gazebo: UDP MAVLink.
-- Real Pixhawk1 bench/line-follow: serial/USB serial MAVLink.
+- Real Pixhawk 6C Mini bench/flight: serial/USB serial MAVLink.
 
 Current safety boundary:
 
-- `line_follow_node` has guarded Pixhawk1 serial support with no-arm smoke,
+- `line_follow_node` has guarded ArduPilot serial support with no-arm smoke,
   RC/local-estimate gates, and explicit `--allow-arm-takeoff`.
 - `mavlink_probe` and `mavlink_motor_test` support bench verification.
 - `astroquad-onboard --target ardupilot_serial --allow-arm-takeoff` has guarded
   serial support and uses RC/local-estimate preflight gates.
-- `grid_mission_node` builds the same runtime as a compatibility alias.
 
-Fallback `ALT_HOLD + RC_CHANNELS_OVERRIDE` remains a design option, but current
-implemented mission paths use GUIDED velocity/local setpoints.
+`ALT_HOLD + RC_CHANNELS_OVERRIDE`는 2026-07 아키텍처 결정으로 **공식 폐기**
+(EKF 위치 안정화 우회, RC 페일세이프 충돌, 구 기체 전용 PWM 상수 의존).
+유일한 지원 제어 경로는 GUIDED body-frame velocity setpoint다. 상세 근거는
+`uav-onboard/ARCHITECTURE_OVERVIEW.md`의 아키텍처 결정 기록 참조.
 
 ## 7. 통신 구조
 
@@ -244,13 +250,13 @@ implemented mission paths use GUIDED velocity/local setpoints.
 - `uav-onboard/docs/PROTOCOL.md`
 - `uav-gcs/docs/PROTOCOL.md`
 
-현재 protocol document version은 v1.8이고 JSON top-level
+현재 protocol document version은 v1.9이고 JSON top-level
 `protocol_version`은 integer `1`이다.
 
 | Channel | Direction | Transport | Default port | Status |
 |---|---|---|---:|---|
 | Telemetry | onboard -> GCS | UDP JSON | 14550 | implemented |
-| Command | GCS -> onboard | TCP JSON | 14551 | planned |
+| Command | GCS -> onboard | TCP JSON | 14551 | documented only (미구현, 향후 과제) |
 | Video stream | onboard -> GCS | UDP MJPEG chunks | 5600 | implemented |
 | GCS discovery | GCS -> LAN broadcast | UDP text beacon | 5601 | implemented |
 
@@ -265,7 +271,7 @@ Important current telemetry:
 - `debug.note`
 
 `vision.grid_node` means the latest committed onboard grid node. In
-`astroquad-onboard`/`grid_mission_node`, it is resent every frame for UDP loss
+`astroquad-onboard`, it is resent every frame for UDP loss
 tolerance.
 
 ## 8. Gazebo/SITL 기준
@@ -287,7 +293,7 @@ Grid mission loop:
 WINDOWS_GCS_IP="$(ip route | awk '/default/ {print $3; exit}')"
 cd ~/astroquad/uav-onboard
 ./build/astroquad-onboard --config config --target sitl --vision gazebo \
-  --world grid --line-mode dark_on_light --marker-count 4 \
+  --world grid --line-mode light_on_dark --marker-count 4 \
   --video --gcs-ip "$WINDOWS_GCS_IP"
 ```
 
@@ -299,7 +305,7 @@ cd ~/astroquad/uav-onboard
 
 Implemented:
 
-- Pi 4 + IMX519 `rpicam-vid` MJPEG capture.
+- Pi 5 + IMX296 mono `rpicam-vid` MJPEG capture (grayscale end-to-end).
 - Fake/Gazebo/rpicam frame sources.
 - ArUco, line, intersection, marker stabilization.
 - Shared `VisionProcessor`.
@@ -316,7 +322,6 @@ Implemented:
 
 Staging / not final:
 
-- `grid_mission_node` remains as compatibility/staging alias.
 - Full GCS dashboard framework and command sender.
 - Structured GCS mission-state telemetry from `astroquad-onboard`.
 - GCS command channel.
