@@ -14,7 +14,7 @@
 bash ~/astroquad/uav-onboard/scripts/grid_arena_test.sh
 
 ./build/grid_mission_node --config config --target sitl --vision gazebo \
-  --world grid --line-mode dark_on_light --marker-count 4 \
+  --world grid --line-mode light_on_dark --marker-count 4 \
   --video --gcs-ip <windows-gcs-ip>
 ```
 
@@ -581,14 +581,14 @@ lookahead_y_ratio = 0.55
 
 ### 자연광/운동장 바닥에서의 예상
 
-실내 나무 바닥이나 태블릿 화면처럼 반사가 강한 표면은 밝은 라인 검출에 불리하다. 운동장 흙바닥은 일반적으로 정반사가 적기 때문에 `line3.png` 같은 넓은 하이라이트 문제는 줄어들 가능성이 크다.
+실내 나무 바닥이나 태블릿 화면처럼 반사가 강한 표면은 밝은 라인 검출에 불리하다. 최신 경기장 기준인 잔디밭은 일반적으로 정반사가 적기 때문에 `line3.png` 같은 넓은 하이라이트 문제는 줄어들 가능성이 크다.
 
 다만 자연광 환경도 완전히 안전하지는 않다.
 
 - 구름/햇빛 변화로 auto exposure가 흔들릴 수 있다.
 - UAV 그림자나 사람 그림자가 라인 근처에 생길 수 있다.
 - 라인 재질이 흰색 테이프처럼 반짝이면 특정 각도에서 glare가 생길 수 있다.
-- 흙바닥 색과 라인 색의 명암 차이가 작으면 grayscale threshold만으로는 불안정할 수 있다.
+- 잔디 색과 흰색 라인의 명암 차이는 크지만, 그림자와 노출 변화가 크면 grayscale threshold만으로는 불안정할 수 있다.
 
 현장에서는 먼저 `--line-mode auto`로 확인하고, 라인이 흰색/밝은 색이면 `--line-mode light_on_dark`, 검정/어두운 색이면 `--line-mode dark_on_light`로 고정해서 비교한다. 반사광이 계속 붙으면 `--line-threshold`를 올려 라인보다 어두운 하이라이트를 제외한다.
 
@@ -760,7 +760,7 @@ Raspberry Pi, ArUco와 라인 동시:
 
 1.3 테스트에서는 약 2m 고도에서도 검은 천 위 흰색 라인, 아이패드 격자, 흰색 진열장 테두리처럼 대비가 충분한 대상은 이전보다 잘 잡혔다. 특히 십자 교차와 L자 형태도 connected contour로 유지되는 방향이 확인됐다.
 
-반대로 방 바닥 위 휴지 라인은 여전히 잘 잡히지 않았다. 원인은 휴지 표면과 밝은 목재 바닥의 명도 차이가 작고, 바닥 반사와 카메라 자동 노출 때문에 라인과 배경의 local contrast가 약해지는 것으로 판단한다. 이 실내 테스트는 실제 운동장 흙바닥 대비 조건을 완전히 대표하지 못하므로, 경기장과 비슷한 흙색/무광 배경에서 별도 검증해야 한다.
+반대로 방 바닥 위 휴지 라인은 여전히 잘 잡히지 않았다. 원인은 휴지 표면과 밝은 목재 바닥의 명도 차이가 작고, 바닥 반사와 카메라 자동 노출 때문에 라인과 배경의 local contrast가 약해지는 것으로 판단한다. 이 실내 테스트는 실제 잔디밭 + 흰색 라인 대비 조건을 완전히 대표하지 못하므로, 경기장과 비슷한 잔디/무광 배경에서 별도 검증해야 한다.
 
 검은 천 위 흰색 라인은 검출되지만 contour가 내부 edge 중심으로 갈라지거나, 라인 폭 전체가 아니라 한쪽 edge만 얇게 잡히는 경우가 있었다. 또한 latency는 줄었지만 GCS 영상 displayed FPS가 낮아져 관제용 영상이 끊겨 보였고, Pi Zero 2 W 발열이 커졌다.
 
@@ -811,7 +811,7 @@ vcgencmd measure_temp
 vcgencmd get_throttled
 ```
 
-테스트 우선순위는 1) 실제 경기장과 비슷한 흙색 무광 배경, 2) 1.8-2.0m 고도, 3) 흰색 라인과 검정 라인 각각, 4) line-only와 ArUco+line 동시 실행 비교 순서다.
+테스트 우선순위는 1) 실제 경기장과 비슷한 잔디 배경, 2) 1.8-2.0m 고도, 3) 흰색 라인, 4) line-only와 ArUco+line 동시 실행 비교 순서다.
 
 ### 추가 판단
 
@@ -2572,6 +2572,8 @@ EMA 필터와 독립적으로 기체 프레임 가속도를 제한한다. 기본
 ---
 
 ## 63. ArUco 마커가 검정 grid line에 닿아 인식 불가
+
+> 이 항목은 과거 흰 배경 + 검정 라인 arena 기준 이슈다. 현재 Gazebo/대회 기준은 잔디밭 + 흰색 라인이다.
 
 **증상**: 흰 배경 + 검정 라인 arena로 변경 후 ArUco DICT_4X4_50 마커 외곽 검정 quiet zone과 라인이 시각적으로 이어져 OpenCV가 contour 분리 실패.
 
