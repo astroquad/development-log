@@ -254,7 +254,7 @@ Current safety boundary:
 - `uav-onboard/docs/PROTOCOL.md`
 - `uav-gcs/docs/PROTOCOL.md`
 
-현재 protocol document version은 v1.9이고 JSON top-level
+현재 protocol document version은 v1.10이고 JSON top-level
 `protocol_version`은 integer `1`이다.
 
 | Channel | Direction | Transport | Default port | Status |
