@@ -180,13 +180,13 @@ Current grid mission is designed for the Gazebo grid arena:
 
 - 3m x 3m vertiport at origin with ArUco ID 23.
 - No line from vertiport to grid.
-<<<<<<< HEAD
 - 5 x 8 grid cells, 3m cell size, white 10cm lines on grass (matches the
-  real-field polarity; the black-line variant is the edge-case world).
-=======
-- 5 x 8 grid cells, 3m cell size, white lines on grass.
->>>>>>> 48cae3b23e246e3ce0fbd29e03a6c88a1aa0f0ce
-- Four grid ArUco markers expected by default.
+  real-field polarity; the legacy black-line edge-case world was retired
+  2026-07).
+- Four grid ArUco markers expected by default, laid directly on grass as
+  printed cards with a thin 5cm-wide white ArUco quiet zone (0.60m card) but
+  no separate white mounting platform (matches the physical printed marker
+  sample; real-field geometry).
 
 State flow:
 
