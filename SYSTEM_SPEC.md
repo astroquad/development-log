@@ -1,6 +1,7 @@
 # Astroquad System Spec
 
-최종 업데이트: 2026-07-04 (1차 예선 통과 후 하드웨어 전면 업그레이드 반영)
+최종 업데이트: 2026-07-06 (Tailscale GCS 링크 복구: 방화벽/MTU 청킹/
+best-effort latch/비디오 스로틀/KnownHosts 반영)
 
 이 문서는 `uav-onboard`와 `uav-gcs`를 모두 포함하는 전체 시스템 기준
 문서다. Repo별 세부 책임과 실행 방법은 각 repo의 `PROJECT_SPEC.md`와
@@ -82,7 +83,18 @@ Current executables:
 | `mavlink_motor_test` | Props-removed low-throttle motor command check. |
 | `video_streamer` | Raw MJPEG transport smoke tool. |
 
-Current grid mission command:
+Current grid mission command (real-hardware/Tailscale — `--gcs-ip` no
+longer needs a literal IP; `config/network.toml`'s `gcs.ip = "gcs-laptop"`
+resolves through `src/common/KnownHosts.hpp`):
+
+```bash
+./build/astroquad-onboard --config config --target ardupilot_serial \
+  --line-mode light_on_dark --marker-count 4 --revisit-order asc \
+  --video --allow-arm-takeoff
+```
+
+SITL still needs an explicit destination (the WSL host IP is not the
+Tailscale address):
 
 ```bash
 ./build/astroquad-onboard --config config --target sitl --vision gazebo \
@@ -254,15 +266,46 @@ Current safety boundary:
 - `uav-onboard/docs/PROTOCOL.md`
 - `uav-gcs/docs/PROTOCOL.md`
 
-현재 protocol document version은 v1.10이고 JSON top-level
+현재 protocol document version은 **v1.11**이고 JSON top-level
 `protocol_version`은 integer `1`이다.
 
 | Channel | Direction | Transport | Default port | Status |
 |---|---|---|---:|---|
-| Telemetry | onboard -> GCS | UDP JSON | 14550 | implemented |
+| Telemetry | onboard -> GCS | UDP JSON (>1200B는 AQT1 청킹) | 14550 | implemented |
 | Command | GCS -> onboard | TCP JSON | 14551 | documented only (미구현, 향후 과제) |
 | Video stream | onboard -> GCS | UDP MJPEG chunks | 5600 | implemented |
 | GCS discovery | GCS -> LAN broadcast | UDP text beacon | 5601 | implemented |
+
+**목적지 해석 (Known Hosts)**: Tailscale IP는 사실상 고정이므로 양
+저장소 `src/common/KnownHosts.hpp`(byte-identical 유지)가 심볼릭 이름을
+IP로 해석한다 — `gcs-laptop`=100.85.239.73(노트북),
+`pi5`=100.101.84.47(이 Pi), `broadcast`=255.255.255.255(LAN/WSL 비컨
+디스커버리). 온보드 `config/network.toml`의 기본 `gcs.ip`가
+`"gcs-laptop"`이라 `--gcs-ip` 없이 실행해도 노트북으로 전송된다.
+`--gcs-ip <ip|name>`는 알려진 이름과 리터럴 IP를 모두 받는다. **온보드
+자신의 Tailscale IP(`pi5`)를 `--gcs-ip`에 넣는 실수를 주의** — GCS가
+아니라 자기 자신에게 전송되어 "송신은 성공하는데 GCS엔 안 잡히는"
+증상으로 나타난다.
+
+**MTU 안전 청킹 (AQT1, v1.11)**: 텔레메트리 JSON이 1200바이트를
+넘으면(전형적으로 2~5.5KB) 비디오와 동일한 28바이트 헤더 레이아웃을
+`AQT1` 매직으로 재사용해 청크 분할 전송한다 — 1280바이트 MTU인
+Tailscale/WireGuard 터널에서 IP 단편화에 의존하지 않기 위함.
+1200바이트 이하는 기존과 동일한 단일 bare-JSON 데이터그램(하위 호환).
+
+**Best-effort 보장**: `GcsTelemetryPublisher`의 송신 실패는 5초
+rate-limit 경고로만 표시되고 다음 프레임에서 무조건 재시도한다(과거엔
+한 번 실패하면 미션 종료까지 영구 중단되는 latch 버그가 있었음, 2026-07
+수정). 텔레메트리 소켓은 논블로킹이라 송신 큐 포화도 미션 루프를 막지
+않는다. 비디오는 다운스케일/재인코딩/청크 전송이 모두 별도 워커
+스레드에서 수행되어 미션/비전 스레드는 latest-wins 포인터 스왑 비용만
+낸다.
+
+**디버그 비디오 기본값**: 728x544 다운스케일(`send_width=728,
+send_height=0`), jpeg_quality=60, `send_fps=0`(=처리 프레임 전부 송신,
+~12fps 실측)이 디폴트다. `--fps <n>`은 이제 상한(cap)이며 camera fps로
+클램프된다. GCS 오버레이 좌표는 카메라 픽셀 공간(1456x1088) 기준으로
+전송되고 GCS가 수신 프레임 크기에 맞춰 스케일링한다.
 
 Important current telemetry:
 
@@ -323,6 +366,10 @@ Implemented:
 - Grid arena Gazebo world and `astroquad-onboard` SITL mission runtime.
 - Grid mission entry centering, hop-distance gating, strict snake alternation,
   and sliding marker commit window.
+- MTU-safe telemetry chunking (AQT1), best-effort non-latching GCS publish,
+  central Tailscale known-host mapping, downscaled/worker-thread debug video,
+  credit-based send-fps throttle, GCS overlay camera-space scaling (2026-07,
+  see `TROUBLESHOOTING.md` #85).
 
 Staging / not final:
 

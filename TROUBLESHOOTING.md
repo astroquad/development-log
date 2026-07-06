@@ -2960,3 +2960,93 @@ BEC 5V 전원 예산 미검증, 외장 컴퍼스 부재(최대 추정 리스크)
 런2: 첫 홉 hop_distance_exceeded). EKF 광류 드리프트·타이밍 변동이 원인으로
 추정. 단일 런 실패로 회귀 판정하지 말고 복수 런으로 비교할 것. GUI 환경
 (팀원 로컬)과 헤드리스 환경의 통과율 차이도 확인 필요.
+
+---
+
+## 85. Tailscale GCS 링크 복구 — 방화벽 + MTU 청킹 + best-effort latch + 비디오 스로틀 (2026-07-06)
+
+**증상**: Pi 5(`100.101.84.47`) ↔ Lenovo GCS 노트북(`100.85.239.73`)을
+Tailscale로 연결했을 때 텔레메트리/디버그 비디오가 전혀 수신되지 않음.
+LAN 및 WSL→Windows 환경에서는 정상 동작했음.
+
+**진단 과정**: Pi에서 UDP `sendto()` 테스트(600B~4000B 전 구간 성공,
+EMSGSIZE 없음)와 `tailscale0` TX 카운터로 패킷이 실제로 인터페이스를
+빠져나가는 것을 확인. `uav-gcs-video`는 소켓 에러 시 경고를 출력하는데
+사용자 화면에 경고가 전혀 없었음 → 패킷이 GCS 소켓까지 도달하지 못하는
+것으로 결론.
+
+**문제 1 — Windows 방화벽 (주원인)**: Windows Defender 인바운드 허용
+규칙이 기존 LAN(Private) 프로필에만 적용되어 있었고, Tailscale
+인터페이스는 보통 **Public** 프로필로 분류되어 인바운드 UDP가 조용히
+차단됨. 해결: `uav-gcs/scripts/setup_windows_firewall.ps1` 신규
+(UDP 14550/5600, `-Profile Domain,Private,Public` 전체 적용, 멱등). GCS
+README에 Tailscale 트러블슈팅 절 추가.
+
+**문제 2 — 텔레메트리 MTU 초과 (취약점)**: 텔레메트리 JSON(2~5.5KB)을
+단일 UDP 데이터그램으로 전송하고 있었음(`UdpTelemetrySender.cpp`). 1280
+바이트 MTU인 Tailscale/WireGuard 터널에서는 IP 단편화에 의존하게 되고,
+단편 하나만 유실돼도 메시지 전체가 손실되며 일부 경로는 단편화 UDP
+자체를 차단함. 해결: 앱 레벨 청킹 도입 (`AQT1`, PROTOCOL v1.11).
+1200바이트 이하는 기존처럼 단일 bare-JSON 데이터그램(하위 호환), 초과
+시 비디오와 동일한 28바이트 헤더 레이아웃을 재사용해 분할 전송
+(`frame_id` 필드를 `message_id`로 사용). 양 저장소에 `TelemetryChunker`
+(온보드)/`TelemetryReassembler`(GCS) 신규, `VideoPacket.cpp`를
+`onboard_core`/`gcs_core`로 이동해 텔레메트리 전용 빌드에서도 사용
+가능하게 함.
+
+**문제 3 — best-effort 위반 latch (치명 버그)**: `GcsTelemetryPublisher`는
+송신 실패 시 `last_error`를 세팅하고 **성공해도 절대 지우지 않는데**,
+`AstroquadOnboardApp.cpp`의 publish 가드가
+`if (publisher.lastError().empty() || first_frame)`였음 — 즉 미션 도중
+단 한 번이라도 송신이 실패하면(정확히 문제 2의 EMSGSIZE 케이스) 그
+순간부터 미션이 끝날 때까지 텔레메트리+비디오가 영구 중단됨. "통신
+실패 시에도 미션에 영향 없이 계속 시도한다"는 요구사항 정면 위반.
+해결: consume 방식 `takeLastError()` 도입, 가드 제거하고 매 프레임
+무조건 publish, 실패는 5초 rate-limit 경고 로그로만 표시. 텔레메트리
+소켓도 논블로킹화(`O_NONBLOCK`)해 송신 큐가 가득 차도 미션 루프가
+멈추지 않도록 함.
+
+**문제 4 — 디버그 비디오 스로틀 비트(beat) 버그**: 기존 스로틀은
+"마지막 송신 후 최소 주기(1/send_fps) 경과 시 송신"이었고 기준 시각을
+`last_sent = now`로 매번 리셋했음. 카메라 프레임 간격(83ms, 12fps)이
+송신 주기(100ms, 10fps 설정)보다 짧아 **한 프레임 걸러 하나씩 스킵**되는
+비트 현상 발생 → 실효 송신률이 설정값 10fps가 아니라 ~6fps로 요동
+(GCS `display_fps`가 2~8 사이를 오간 원인). 해결: 크레딧 기반 페이싱
+(`DebugVideoThrottle.hpp`) — 송신 시 `last_sent`를 `now`가 아니라 정확히
+한 주기만큼 전진시켜 나머지 시간을 다음 프레임으로 이월(정체 후 버스트
+방지를 위해 크레딧은 최대 1주기로 클램프). 실측: 240처리프레임 중
+198송신 = 9.9fps(설정 10fps 대비 오차 1%).
+
+**문제 5 — 처리 12fps vs 송신 fps 정책**: 기존 디폴트는
+`send_fps=5`(그 후 10)로, "처리하는 만큼 다 보내고 필요시에만 캡을
+건다"는 사용자 의도와 어긋남. 처리 12fps 자체는 Pi5 연산 한계가 아니라
+`[camera] fps=12` 캡처 설정 때문(프레임당 비전 처리 13ms, ArUco 도는
+프레임도 38ms로 83ms 예산에 여유 큼) — 다만 `intersection_decision`의
+`fps_assumption=12`, `cruise_window_frames` 등 여러 미션 파라미터가
+12fps 가정으로 튜닝돼 있어 캡처 fps 자체를 올리는 것은 별도 재튜닝
+작업으로 분리하기로 함. 해결: `send_fps=0`을 "처리 프레임 전부 송신"
+센티넬로 정의(`effectiveDebugVideoFps()`), 디폴트를 0으로 변경.
+`--fps <n>`은 이제 상한(cap) 역할이며 camera fps로 클램프됨. 실측:
+디폴트(every-frame) 180처리프레임 중 179송신=11.9fps, `--fps 6`
+지정 시 120처리프레임 중 59송신=5.9fps로 상한이 정확히 동작.
+
+**추가 정리**: 두 저장소 `src/common/KnownHosts.hpp`(byte-identical
+유지) 신규 — `gcs-laptop`=100.85.239.73, `pi5`=100.101.84.47,
+`broadcast`=255.255.255.255. `config/network.toml` 기본값을 심볼릭
+이름으로 변경해 `--gcs-ip` 없이 `./build/vision_debug_node --config
+config --line-mode light_on_dark --video`만으로 노트북까지 전송되도록
+함. **주의**: `--gcs-ip`에 실수로 `pi5`/`100.101.84.47`(온보드 자기
+자신의 Tailscale IP)을 넣으면 GCS가 아니라 파이 자신에게 전송되어
+"송신은 되는데 GCS엔 아무것도 안 잡히는" 증상이 재현됨 — 실제로 이
+세션에서 겪은 혼동. GCS 측 오버레이 좌표계(카메라 픽셀 공간 vs 디코딩된
+프레임 크기) 스케일링 버그도 함께 수정(`OverlayMapping.hpp`, Win32/OpenCV
+백엔드 양쪽) — 디버그 비디오 다운스케일(728x544) 도입 시 필수 전제였음.
+`uav-gcs-video`는 텔레메트리 수신기가 없어 설계상 오버레이를 그리지
+않는 원시 전송 확인용 도구이므로, 오버레이 확인은 `astroquad-gcs`로
+해야 한다는 점도 문서에 명시.
+
+**검증**: 온보드 21개 + GCS 8개 유닛 테스트 전부 통과. Pi 실카메라로
+루프백 E2E(청킹→재조립 결손 0), 실카메라 20초 연속 촬영으로 스로틀
+수정 전/후 실효 fps 측정. Windows 방화벽 스크립트 실행과 최종 노트북
+수신 확인은 사용자 환경 의존적이라 별도 확인 필요.
+
