@@ -1,7 +1,7 @@
 # Astroquad System Spec
 
-최종 업데이트: 2026-07-06 (Tailscale GCS 링크 복구: 방화벽/MTU 청킹/
-best-effort latch/비디오 스로틀/KnownHosts 반영)
+최종 업데이트: 2026-07-07 (실기 전환 리팩터: LTE-sized 전송 기본값,
+vision-stale 워치독 + per-state 행 가드, per-run 비행 로깅, 배터리 ingest)
 
 이 문서는 `uav-onboard`와 `uav-gcs`를 모두 포함하는 전체 시스템 기준
 문서다. Repo별 세부 책임과 실행 방법은 각 repo의 `PROJECT_SPEC.md`와
@@ -301,11 +301,24 @@ rate-limit 경고로만 표시되고 다음 프레임에서 무조건 재시도�
 스레드에서 수행되어 미션/비전 스레드는 latest-wins 포인터 스왑 비용만
 낸다.
 
-**디버그 비디오 기본값**: 728x544 다운스케일(`send_width=728,
-send_height=0`), jpeg_quality=60, `send_fps=0`(=처리 프레임 전부 송신,
-~12fps 실측)이 디폴트다. `--fps <n>`은 이제 상한(cap)이며 camera fps로
-클램프된다. GCS 오버레이 좌표는 카메라 픽셀 공간(1456x1088) 기준으로
-전송되고 GCS가 수신 프레임 크기에 맞춰 스케일링한다.
+**디버그 비디오/텔레메트리 기본값 (LTE-sized, 2026-07)**: 기본값이 LAN이
+아니라 실제 대회 LG U+ LTE 업링크(측정된 ~2.4 Mbit/s 청정 구간)에 맞춰져
+있다. `send_width=600, send_height=0`(=종횡비 유지), `jpeg_quality=55`,
+`send_fps=12`, `fec_group_size=4`이고 프레임 텔레메트리는 `send_fps=6`이다.
+FEC·텔레메트리 포함 ~2.1~2.2 Mbit/s로 실측된다. 따라서 `--video`만 붙여
+실행해도 링크-세이프하며, `--fps/--video-width/--video-quality/--telemetry-fps`는
+경로를 재측정한 뒤에만 재조정(상향/하향)한다. `--fps <n>`은 상한(cap)이며
+camera fps로 클램프된다. GCS 오버레이 좌표는 카메라 픽셀 공간(1456x1088)
+기준으로 전송되고 GCS가 수신 프레임 크기에 맞춰 스케일링한다.
+
+**비행 로깅 (per-run, 2026-07)**: `astroquad-onboard`는 SITL/실기 모두 매
+실행마다 `logs/flights/run_NNNN_<timestamp>/` 폴더를 생성한다(기본 활성).
+`meta.json`(argv/설정/시작 시각), `frames.csv`(~20Hz: 미션 상태·제어
+intent·grid 좌표/heading·라인/교차점 결정·ArUco·제어 명령·MAVLink 센서),
+`events.jsonl`(상태 전이·노드 커밋·마커 발견/재방문·안전 이벤트)를 남긴다.
+전용 writer 스레드 + 바운드 큐라서 20Hz 제어 루프를 절대 막지 않는다.
+설정은 `config/logging.toml`(base_dir/frame_log_hz/flush_interval_s),
+CLI는 `--no-flight-log`, `--flight-log-dir <dir>`. `logs/`는 gitignore.
 
 Important current telemetry:
 
@@ -370,6 +383,10 @@ Implemented:
   central Tailscale known-host mapping, downscaled/worker-thread debug video,
   credit-based send-fps throttle, GCS overlay camera-space scaling (2026-07,
   see `TROUBLESHOOTING.md` #85).
+- LTE-sized video/telemetry defaults (600px/q55/12fps + 6fps telemetry),
+  vision-stale flyaway watchdog (hold→LAND), per-state turn/stop hang guards,
+  per-run flight logging (`logs/flights/run_*`), background system telemetry,
+  SYS_STATUS battery ingest (2026-07).
 
 Staging / not final:
 
@@ -378,7 +395,8 @@ Staging / not final:
 - GCS command channel.
 - Marker reverse revisit.
 - Return-home and official coordinate conversion.
-- Persistent file logging/replay.
+- Replay tooling that consumes the per-run flight logs (logging itself is
+  implemented; a dedicated replayer is future work).
 
 ## 10. 실기체 전환 gate
 
