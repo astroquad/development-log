@@ -1,6 +1,15 @@
 # Research: uav-onboard grid mission state-machine work
 
-작성일: 2026-05-20
+작성일: 2026-05-20 / 결과 검토: 2026-07-18
+
+> **상태: 조사 완료된 역사 기록.** 조사 당시 중심이던
+> `tools/grid_mission_node.cpp`는 제거되었고 현재 composition root는
+> `src/app/AstroquadOnboardApp.*`, 실행 파일은 `astroquad-onboard`다.
+> 당시 제안한 marker-lock → blind entry → origin latch → hop-distance snake
+> 흐름, marker window, 재방문과 복귀는 현재 `GridMission`에 반영되어 있다.
+> 현재 구조는 `uav-onboard/ARCHITECTURE_OVERVIEW.md`, 실행·실비행 검증은
+> [REAL_FLIGHT_ONBOARDING.md](REAL_FLIGHT_ONBOARDING.md)를 우선한다. 아래 파일명,
+> 미연결 설정, 테스트 부족 평가는 2026-05-20 당시의 관찰로 보존한다.
 
 ## 읽은 문서와 코드
 

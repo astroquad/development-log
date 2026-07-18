@@ -1,12 +1,19 @@
 # Astroquad MVP Plan
 
-최종 업데이트: 2026-05-15
+원 계획 작성: 2026-05-15 / 상태 검토: 2026-07-18
 
 > **주의 (2026-07-04)**: 이 문서는 구 플랫폼(Pixhawk 1 / Raspberry Pi 4 /
 > IMX519 / 3S 1.5kg) 기준으로 작성된 과거 계획이다. 1차 예선 통과 후
 > 하드웨어가 전면 교체되었다(Pixhawk 6C Mini / Pi 5 / IMX296 mono GS /
 > 4S 2.1kg). 현행 기준은 `SYSTEM_SPEC.md` §2와
 > `uav-onboard/config/pixhawk6c_indoor_flow.params`를 따른다.
+
+> **현재 상태:** 이 문서의 72시간 MVP 범위는 완료된 과거 milestone이다.
+> native serial transport, RC/local-estimate gate, battery ingest,
+> `line_follow_node` staging, 풀 grid snake/revisit/return 상태 머신과 실행별
+> 비행 로그가 현재 구현되어 있다. 앞으로의 실행 계획은
+> [REAL_FLIGHT_ONBOARDING.md](REAL_FLIGHT_ONBOARDING.md)의 짧은 실비행 반복
+> 파이프라인을 따른다. 아래의 “남아 있다”는 표현은 당시 시점의 기록이다.
 
 이 문서는 72시간 실기체 MVP와 1주일 기술개발계획서 작성 계획을 관리한다. 전체 시스템 기준은 `SYSTEM_SPEC.md`를 따른다.
 
@@ -242,10 +249,10 @@ Control 입력:
 # ASTRO QUAD 2차 예선 준비 회의
 
 > **회의일:** 2026.06.24
-> 
-> 
+>
+>
 > **목표:** 2차 예선까지 실기체 라인트레이싱 및 ArUco 호버링 완성
-> 
+>
 
 ---
 
@@ -496,13 +503,13 @@ Camera
 전 팀원은 다음 영상 두 개를 다음 회의 전까지 시청한다.
 
 1. 자율비행을 위한 상태기계와 행동트리
-    
+
     https://youtu.be/LH6gZCrAeUg
-    
+
 2. 비전 기반 위치추정 기술
-    
+
     https://youtu.be/GQ1yCByOXVg
-    
+
 
 각 영상에서 현재 프로젝트에 적용할 수 있는 내용을 2개씩 정리한다.
 

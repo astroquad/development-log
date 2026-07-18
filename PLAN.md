@@ -2,6 +2,16 @@
 
 Date: 2026-05-22 KST
 
+> **Status update (2026-07-18): IMPLEMENTED.** This is the historical
+> implementation plan for marker revisit and return-to-vertiport. The runtime
+> was consolidated from the former `grid_mission_node` staging binary into
+> `astroquad-onboard`; the old alias has been removed. `GridMission` now
+> contains revisit, return-home, return-vertiport, landing, and mission-complete
+> states. Current commands and real-flight verification are in
+> [REAL_FLIGHT_ONBOARDING.md](REAL_FLIGHT_ONBOARDING.md). References below to
+> `grid_mission_node` describe the implementation-time name, not a runnable
+> current executable.
+
 ## Goal
 
 Extend the existing `grid_mission_node` flow. Do not create a new runtime

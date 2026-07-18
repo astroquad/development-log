@@ -1,19 +1,24 @@
 # Astroquad 트러블슈팅 및 개발 판단 로그
 
-최종 업데이트: 2026-05-21
+최종 기준선 검토: 2026-07-18
 
-범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석, 해결 방법, 설계 판단을 보고서용 개발로그로 정리한다. 현재 기본 장치는 Raspberry Pi 4 + IMX519-78이며, Raspberry Pi Zero 2 W 관련 내용은 이전 bring-up 단계의 이력으로 남긴다.
+범위: `uav-gcs`, `uav-onboard` bring-up 과정에서 실제로 발생한 문제, 원인 분석,
+해결 방법, 설계 판단을 보고서용 개발로그로 정리한다. **현재 기준 장치는 Pi 5 +
+IMX296 + Pixhawk 6C Mini + MTF-01 + 4S/S500 V2**다. Pi Zero 2 W, Pi 4,
+IMX519, Pixhawk 1, 3S 및 `grid_mission_node` 관련 항목은 삭제 대상이 아니라
+당시 증상과 판단을 보존한 역사 기록이다. 현재 실행 절차는
+[REAL_FLIGHT_ONBOARDING.md](REAL_FLIGHT_ONBOARDING.md)를 따른다.
 
-## 0. 현재 기준선: `grid_mission_node`와 grid arena snake mission
+## 0. 현재 기준선: `astroquad-onboard`와 실비행 반복 검증
 
 ### 현재 실행 기준
 
-최근 grid mission 개발의 기준 명령은 다음이다.
+현재 grid mission SITL 기준 명령은 다음이다.
 
 ```bash
 bash ~/astroquad/uav-onboard/scripts/grid_arena_test.sh
 
-./build/grid_mission_node --config config --target sitl --vision gazebo \
+./build/astroquad-onboard --config config --target sitl --vision gazebo \
   --world grid --line-mode light_on_dark --marker-count 4 \
   --video --gcs-ip <windows-gcs-ip>
 ```
@@ -24,10 +29,10 @@ custom fixture 또는 임시 world 테스트 때만 필요하다.
 
 ### 현재 state machine
 
-`grid_mission_node`는 `VisionProcessor`, `IntersectionDecisionEngine`,
+`astroquad-onboard`는 `VisionProcessor`, `IntersectionDecisionEngine`,
 `GridCoordinateTracker`, `GridMission`, `SnakePlanner`, `GridControlMapper`,
-`AutopilotMavlinkAdapter`, `VisionDebugPublisher`를 묶는 SITL staging
-composition root다.
+`AutopilotMavlinkAdapter`, `GcsTelemetryPublisher`를 묶는 SITL/full-mission
+composition root다. 과거 byte-identical alias `grid_mission_node`는 제거되었다.
 
 현재 grid mission 흐름:
 
@@ -44,7 +49,14 @@ ARM_TAKEOFF
   -> SNAKE_ADVANCE_ONE_CELL
   -> SNAKE_TURN_90_AGAIN
   -> SNAKE_COMPLETE
+  -> REVISIT_INIT / REVISIT_FORWARD / REVISIT_MARKER_HOVER
+  -> REVISIT_COMPLETE
+  -> RETURN_HOME_INIT / RETURN_HOME_FORWARD / RETURN_HOME_ALIGN_ORIGIN
+  -> RETURN_HOME_FACE_SOUTH
+  -> RETURN_VERTIPORT_FORWARD / RETURN_VERTIPORT_MARKER_HOVER
   -> LAND
+  -> MISSION_COMPLETE
+  -> DONE
 ```
 
 새 grid arena에는 vertiport에서 grid까지 이어지는 line이 없으므로
@@ -58,7 +70,7 @@ origin으로 확정하지 않고, `ENTRY_CENTER_ORIGIN`에서 X/Y 중심과 저�
 - LOCAL_NED는 짧은 hop 거리와 hover source로만 사용한다.
 - `GridCoordinateTracker::update()`는 peek-only이며, mission gate 통과 후
   `commitAdvance()`만 실제 좌표를 전진시킨다.
-- `grid_mission_node`는 GCS UDP loss에 대비해 최신 committed `grid_node`를
+- `astroquad-onboard`는 GCS UDP loss에 대비해 최신 committed `grid_node`를
   매 frame 다시 보낸다. GCS는 node id/coordinate로 dedup한다.
 - Cell 사이 이동은 yaw locked `ForwardBlind`가 기본이고, line following은
   `hop_align_start_m..hop_align_end_m`의 짧은 mid-cell alignment window에서만
@@ -71,13 +83,17 @@ origin으로 확정하지 않고, `ENTRY_CENTER_ORIGIN`에서 X/Y 중심과 저�
 
 ### 현재 남은 범위
 
-- `grid_mission_node --target pixhawk1` real arm/takeoff는 열려 있지 않다.
-  현재는 `--no-arm` smoke만 허용한다.
-- Marker ID 역순 재방문, 출발점 복귀, official coordinate conversion은 아직
-  미구현이다.
-- GCS protocol에는 richer mission object가 준비되어 있지만,
-  `VisionDebugPublisher` path는 아직 grid mission state를 구조화해서 채우지
-  않는다. 현재 상세 state 확인은 `grid_mission_node` console log가 기준이다.
+- `astroquad-onboard --target ardupilot_serial --allow-arm-takeoff` 경로는
+  구현되어 있지만, 실제 Pixhawk 장치 경로와 RC/local-estimate/battery/수동
+  hover gate를 통과한 뒤에만 사용한다.
+- marker 재방문과 vertiport 복귀는 구현되어 있다. 남은 핵심은 실제 경기장
+  반복 비행으로 파라미터와 상태 전이를 검증하는 일이다.
+- onboard는 구조화된 `mission` telemetry와 실행별 flight log를 보낸다.
+  GCS는 관제 도구이며 command sender와 persistent disk logger는 아직 없다.
+- official coordinate conversion과 flight-log 전용 replay 도구는 후속 범위다.
+
+현재 실기체 명령, 안전 gate, 로그 분석 순서는
+[REAL_FLIGHT_ONBOARDING.md](REAL_FLIGHT_ONBOARDING.md)를 단일 진입점으로 삼는다.
 
 ## 1. GCS가 온보드 telemetry를 수신하지 못함
 

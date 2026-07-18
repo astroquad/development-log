@@ -1,7 +1,7 @@
 # Astroquad System Spec
 
-최종 업데이트: 2026-07-07 (실기 전환 리팩터: LTE-sized 전송 기본값,
-vision-stale 워치독 + per-state 행 가드, per-run 비행 로깅, 배터리 ingest)
+최종 검증: 2026-07-18 (현재 풀 미션 상태 머신, protocol v1.13,
+실행별 비행 로깅, 실비행 인수 절차 기준으로 문서 정합화)
 
 이 문서는 `uav-onboard`와 `uav-gcs`를 모두 포함하는 전체 시스템 기준
 문서다. Repo별 세부 책임과 실행 방법은 각 repo의 `PROJECT_SPEC.md`와
@@ -215,7 +215,14 @@ ARM_TAKEOFF
   -> SNAKE_ADVANCE_ONE_CELL
   -> SNAKE_TURN_90_AGAIN
   -> SNAKE_COMPLETE
+  -> REVISIT_INIT / REVISIT_FORWARD / REVISIT_MARKER_HOVER
+  -> REVISIT_COMPLETE
+  -> RETURN_HOME_INIT / RETURN_HOME_FORWARD / RETURN_HOME_ALIGN_ORIGIN
+  -> RETURN_HOME_FACE_SOUTH
+  -> RETURN_VERTIPORT_FORWARD / RETURN_VERTIPORT_MARKER_HOVER
   -> LAND
+  -> MISSION_COMPLETE
+  -> DONE
 ```
 
 Important rules:
@@ -230,8 +237,12 @@ Important rules:
   yaw remains locked and forward velocity is blind.
 - Boundary turns use strict snake alternation. Missing expected branch completes
   the snake rather than silently backtracking.
-- Current mission lands after expected markers are found or snake completes.
-  Marker reverse revisit and return-home remain future work.
+- Snake가 끝나면 발견한 grid marker를 `revisit_order`(`desc` 기본,
+  `asc` 선택) 순서로 재방문한다.
+- 재방문 후 grid `(0,0)`으로 복귀해 south를 향하고, vertiport marker를
+  다시 찾아 중심 정렬한 뒤 착륙한다.
+- 이 경로는 현재 구현되어 있으나, SITL 성공만으로 실기체 튜닝 완료를
+  의미하지 않는다. 차기 단계는 실비행 반복 검증이다.
 
 ## 6. 제어 전략
 
@@ -266,7 +277,7 @@ Current safety boundary:
 - `uav-onboard/docs/PROTOCOL.md`
 - `uav-gcs/docs/PROTOCOL.md`
 
-현재 protocol document version은 **v1.11**이고 JSON top-level
+현재 protocol document version은 **v1.13**이고 JSON top-level
 `protocol_version`은 integer `1`이다.
 
 | Channel | Direction | Transport | Default port | Status |
@@ -388,13 +399,12 @@ Implemented:
   per-run flight logging (`logs/flights/run_*`), background system telemetry,
   SYS_STATUS battery ingest (2026-07).
 
-Staging / not final:
+실비행 검증/운용 단계에서 남은 범위:
 
 - Full GCS dashboard framework and command sender.
-- Structured GCS mission-state telemetry from `astroquad-onboard`.
 - GCS command channel.
-- Marker reverse revisit.
-- Return-home and official coordinate conversion.
+- 실제 경기장 반복 비행을 통한 snake/revisit/return 파라미터 튜닝과 회귀.
+- Official coordinate conversion (현재 미션은 local grid 좌표 사용).
 - Replay tooling that consumes the per-run flight logs (logging itself is
   implemented; a dedicated replayer is future work).
 
@@ -419,6 +429,8 @@ Before real autonomous flight:
   targets, build/test.
 - `uav-onboard/README.md`: current onboard runbook.
 - `uav-onboard/sim/gazebo/README.md`: Gazebo worlds/models/run commands.
+- `REAL_FLIGHT_ONBOARDING.md`: 신규 팀의 Tailscale/SSH/GCS/실비행/로그/Codex
+  반복 디버깅 절차.
 - `uav-gcs/PROJECT_SPEC.md`: GCS responsibilities, modules, status.
 - `uav-gcs/README.md`: current GCS build/run/test guide.
 - `docs/PROTOCOL.md`: telemetry/video/discovery wire-format spec.
